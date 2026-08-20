@@ -1,0 +1,6 @@
+packages:
+  # pnpm 9+ rejects a workspace file without a package selector before Vitest starts.
+  - "."
+
+allowBuilds:
+  esbuild: false

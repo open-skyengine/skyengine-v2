@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "name": "sky-engine",
+  "type": "module",
+  "scripts": {
+    "test:e2e": "vitest run test/e2e"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
