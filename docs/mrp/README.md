@@ -6,9 +6,10 @@
 
 1. [容器格式](container-format.md)：MRP 头部、目录、数据记录和压缩方式。
 2. [执行模型](execution-model.md)：`start.mr`、`cfunction.ext`、`game.ext` 以及事件循环之间的关系。
-3. [ARM ABI](arm-abi.md)：ARM/Thumb、寄存器约定、静态基址和 `MRPGCMAP`。
-4. [平台表](platform-table.md)：一套广泛使用的 150 槽 Mythroad 平台 ABI。
-5. [事件与常量](events-and-values.md)：返回值、事件、按键和文件打开标志。
+3. [MR 语言与虚拟机](mr-language-vm.md)：文本方言、预编译 chunk、寄存器 VM 和应用回调。
+4. [ARM ABI](arm-abi.md)：ARM/Thumb、寄存器约定、静态基址和 `MRPGCMAP`。
+5. [平台表](platform-table.md)：一套广泛使用的 150 槽 Mythroad 平台 ABI。
+6. [事件与常量](events-and-values.md)：返回值、事件、按键和文件打开标志。
 
 ## 证据等级
 
@@ -30,7 +31,7 @@
 
 以下内容不应混为一谈：
 
-- **MRP 互操作事实**：魔数、字段偏移、目录编码、入口协议、寄存器和平台表槽位。
+- **MRP 互操作事实**：魔数、字段偏移、目录编码、MR 方言与 chunk 识别、入口协议、寄存器和平台表槽位。
 - **项目实现选择**：虚拟地址、宿主对象模型、缓存策略、特定游戏补丁以及未被 ABI 要求的兼容技巧。
 - **受独立权利约束的材料**：具体实现源码、文档的原始表达、MRP 包内的程序、美术、声音和字体。
 
