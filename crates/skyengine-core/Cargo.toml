@@ -1,0 +1,12 @@
+[package]
+name = "skyengine-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true
+flate2.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+

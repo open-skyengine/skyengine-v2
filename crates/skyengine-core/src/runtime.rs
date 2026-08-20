@@ -1,0 +1,153 @@
+use std::{fs, path::PathBuf, sync::Arc};
+
+use crate::{
+    DisplayEvent, Error, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result,
+    mr::{MrVm, value::Value},
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeState {
+    Created,
+    Loaded,
+    Running,
+    Paused,
+    Stopping,
+    Stopped,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub app_path: PathBuf,
+    pub entry: Vec<u8>,
+    pub work_dir: PathBuf,
+    pub font_path: PathBuf,
+    pub screen_width: u16,
+    pub screen_height: u16,
+    pub limits: ResourceLimits,
+}
+
+impl RuntimeConfig {
+    pub fn for_app(app_path: impl Into<PathBuf>) -> Self {
+        Self {
+            app_path: app_path.into(),
+            entry: b"start.mr".to_vec(),
+            work_dir: PathBuf::from("."),
+            font_path: PathBuf::from("test/fixtures/fonts/gb16.uc2"),
+            screen_width: 240,
+            screen_height: 320,
+            limits: ResourceLimits::default(),
+        }
+    }
+}
+
+pub struct Runtime {
+    state: RuntimeState,
+    entry: Vec<u8>,
+    vm: MrVm,
+}
+
+impl Runtime {
+    pub fn load(config: RuntimeConfig, display: Box<dyn PlatformDisplay>) -> Result<Self> {
+        let package = Arc::new(Package::open(&config.app_path, config.limits.clone())?);
+        package.find_unique(&config.entry)?;
+
+        let font = fs::read(&config.font_path).map_err(|source| Error::Io {
+            path: config.font_path.clone(),
+            source,
+        })?;
+        const GB16_BYTES: usize = 65_536 * 32;
+        if font.len() < GB16_BYTES {
+            return Err(Error::Config(format!(
+                "font {} is {} bytes; gb16.uc2 needs at least {GB16_BYTES}",
+                config.font_path.display(),
+                font.len()
+            )));
+        }
+        let framebuffer = Framebuffer::new(config.screen_width, config.screen_height)?;
+        let vm = MrVm::new(
+            package,
+            framebuffer,
+            display,
+            config.work_dir,
+            font.into(),
+            config.limits,
+        );
+        Ok(Self {
+            state: RuntimeState::Loaded,
+            entry: config.entry,
+            vm,
+        })
+    }
+
+    pub fn state(&self) -> RuntimeState {
+        self.state
+    }
+
+    pub fn framebuffer(&self) -> &Framebuffer {
+        self.vm.framebuffer()
+    }
+
+    pub fn start(&mut self) -> Result<()> {
+        if self.state != RuntimeState::Loaded {
+            return Err(Error::MrFault(format!(
+                "cannot start runtime in {:?}",
+                self.state
+            )));
+        }
+        self.vm.run_entry(&self.entry)?;
+        self.state = RuntimeState::Running;
+        Ok(())
+    }
+
+    pub fn run(&mut self) -> Result<()> {
+        self.start()?;
+        while matches!(self.state, RuntimeState::Running | RuntimeState::Paused) {
+            while let Some(event) = self.vm.display_mut().poll_event()? {
+                self.dispatch(event)?;
+                if self.state == RuntimeState::Stopping {
+                    break;
+                }
+            }
+            if self.state == RuntimeState::Stopping {
+                break;
+            }
+            self.vm.display_mut().wait_timeout(10);
+        }
+        self.state = RuntimeState::Stopped;
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        if !matches!(self.state, RuntimeState::Stopping | RuntimeState::Stopped) {
+            self.state = RuntimeState::Stopping;
+        }
+    }
+
+    fn dispatch(&mut self, event: DisplayEvent) -> Result<()> {
+        match event {
+            DisplayEvent::Quit => self.stop(),
+            DisplayEvent::Key { code, pressed } if self.state == RuntimeState::Running => {
+                self.vm.call_global(
+                    b"dealevent",
+                    vec![
+                        Value::Number(if pressed { 0.0 } else { 1.0 }),
+                        Value::Number(f64::from(code)),
+                        Value::Number(0.0),
+                    ],
+                )?;
+            }
+            DisplayEvent::Pointer { x, y, pressed } if self.state == RuntimeState::Running => {
+                self.vm.call_global(
+                    b"dealevent",
+                    vec![
+                        Value::Number(if pressed { 2.0 } else { 3.0 }),
+                        Value::Number(f64::from(x)),
+                        Value::Number(f64::from(y)),
+                    ],
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
