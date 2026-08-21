@@ -590,6 +590,12 @@ struct PackageServices<'a> {
     display: &'a mut dyn PlatformDisplay,
 }
 
+impl PackageServices<'_> {
+    fn file_path(&self, name: &[u8]) -> Option<PathBuf> {
+        native_file_path(&self.work_dir, self.package.path(), name)
+    }
+}
+
 impl NativeServices for PackageServices<'_> {
     fn read_package_file(&mut self, name: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.package.read_named(name) {
@@ -600,7 +606,7 @@ impl NativeServices for PackageServices<'_> {
     }
 
     fn file_info(&mut self, name: &[u8]) -> Result<i32> {
-        let Some(path) = safe_work_path(&self.work_dir, name) else {
+        let Some(path) = self.file_path(name) else {
             return Ok(0);
         };
         match fs::metadata(path) {
@@ -611,7 +617,7 @@ impl NativeServices for PackageServices<'_> {
     }
 
     fn open_file(&mut self, name: &[u8], mode: u32) -> Result<i32> {
-        let Some(path) = safe_work_path(&self.work_dir, name) else {
+        let Some(path) = self.file_path(name) else {
             return Ok(-1);
         };
         let file = match mode {
@@ -731,6 +737,14 @@ fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
     Some(work_dir.join(path))
 }
 
+fn native_file_path(work_dir: &Path, package_path: &Path, bytes: &[u8]) -> Option<PathBuf> {
+    let path = std::str::from_utf8(bytes).ok().map(Path::new)?;
+    if path.components().count() == 1 && package_path.file_name() == Some(path.as_os_str()) {
+        return Some(package_path.to_path_buf());
+    }
+    safe_work_path(work_dir, bytes)
+}
+
 fn blit(framebuffer: &mut Framebuffer, bitmap: &Bitmap, region: BlitRegion) {
     for row in 0..region.height {
         for column in 0..region.width {
@@ -829,4 +843,45 @@ fn value_bytes(value: Option<&Value>) -> Result<Arc<[u8]>> {
 
 fn bytes(value: &[u8]) -> Value {
     Value::Bytes(Arc::from(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_the_current_package_name_to_its_installed_path() {
+        assert_eq!(
+            native_file_path(
+                Path::new("device"),
+                Path::new("device/mythroad/app.mrp"),
+                b"app.mrp",
+            ),
+            Some(PathBuf::from("device/mythroad/app.mrp"))
+        );
+    }
+
+    #[test]
+    fn resolves_other_relative_files_from_the_work_directory() {
+        assert_eq!(
+            native_file_path(
+                Path::new("device"),
+                Path::new("device/mythroad/app.mrp"),
+                b"app/data.dat",
+            ),
+            Some(PathBuf::from("device/app/data.dat"))
+        );
+    }
+
+    #[test]
+    fn rejects_parent_paths_for_native_files() {
+        assert_eq!(
+            native_file_path(
+                Path::new("device"),
+                Path::new("device/mythroad/app.mrp"),
+                b"../app.mrp",
+            ),
+            None
+        );
+    }
 }
