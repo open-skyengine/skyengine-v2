@@ -48,13 +48,14 @@ impl MrVm {
         display: Box<dyn PlatformDisplay>,
         work_dir: PathBuf,
         font: Arc<[u8]>,
+        memory_limit: u32,
         limits: ResourceLimits,
     ) -> Self {
         let globals = Table::new();
         let mut vm = Self {
             globals,
             frames: Vec::new(),
-            host: MrHost::new(package, framebuffer, display, work_dir, font),
+            host: MrHost::new(package, framebuffer, display, work_dir, font, memory_limit),
             limits,
             instruction_count: 0,
             final_values: Vec::new(),
@@ -872,7 +873,7 @@ impl MrVm {
 
         let string = Table::new();
         for name in [
-            "byte", "char", "len", "clen", "cstr", "sub", "find", "format", "rep", "lower",
+            "byte", "char", "len", "clen", "cstr", "sub", "subV", "find", "format", "rep", "lower",
             "upper", "pack", "unpack",
         ] {
             string
@@ -1018,6 +1019,7 @@ impl MrVm {
             "clen" => string_clen(args),
             "cstr" => string_cstr(args),
             "sub" => string_sub(args),
+            "subV" => string_sub_value(args),
             "find" => string_find(args),
             "format" => string_format(args),
             "rep" => string_rep(args),
@@ -1309,6 +1311,29 @@ fn string_sub(args: &[Value]) -> Result<Vec<Value>> {
     })])
 }
 
+fn string_sub_value(args: &[Value]) -> Result<Vec<Value>> {
+    let bits = match args.first().unwrap_or(&Value::Nil) {
+        Value::Number(value) => value.to_bits(),
+        Value::Bytes(value) => {
+            let mut raw = [0_u8; 8];
+            let len = value.len().min(raw.len());
+            raw[..len].copy_from_slice(&value[..len]);
+            u64::from_le_bytes(raw)
+        }
+        Value::Boolean(value) => u64::from(*value),
+        Value::Nil => 0,
+        other => {
+            return Err(crate::Error::MrFault(format!(
+                "string.subV cannot encode {other:?}"
+            )));
+        }
+    };
+    Ok(vec![
+        Value::Number(f64::from(bits as u32)),
+        Value::Number(f64::from((bits >> 32) as u32)),
+    ])
+}
+
 fn string_find(args: &[Value]) -> Result<Vec<Value>> {
     let haystack = value_bytes(args.first())?;
     let needle = value_bytes(args.get(1))?;
@@ -1587,5 +1612,17 @@ mod tests {
             Some(3.0)
         );
         assert!(string_cstr(&[value]).unwrap()[0].raw_equal(&bytes(b"abc")));
+    }
+
+    #[test]
+    fn sub_value_splits_numbers_and_byte_strings_into_little_endian_words() {
+        let number_bits = 0x1122_3344_aabb_ccdd_u64;
+        let number = string_sub_value(&[Value::Number(f64::from_bits(number_bits))]).unwrap();
+        assert_eq!(number[0].number(), Some(0xaabb_ccdd_u32 as f64));
+        assert_eq!(number[1].number(), Some(0x1122_3344_u32 as f64));
+
+        let string = string_sub_value(&[bytes(b"unknow")]).unwrap();
+        assert_eq!(string[0].number(), Some(0x6e6b_6e75_u32 as f64));
+        assert_eq!(string[1].number(), Some(0x0000_776f_u32 as f64));
     }
 }

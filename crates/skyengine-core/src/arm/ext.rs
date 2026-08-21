@@ -23,10 +23,12 @@ const INTERNAL_TABLE_DATA: GuestAddr = GuestAddr(0x0100_1900);
 const APPLICATION_STATE_DATA: GuestAddr = GuestAddr(0x0100_1980);
 const LIFECYCLE_CALLBACK_DATA: GuestAddr = GuestAddr(0x0100_1984);
 const TIMER_ACTIVE_DATA: GuestAddr = GuestAddr(0x0100_1988);
+const INTERNAL_APPLICATION_STATE_OFFSETS: [u32; 2] = [8, 44];
 const MODULE_BASE: u32 = 0x1000_0000;
 const MODULE_STRIDE: u32 = 0x0010_0000;
 const HEAP_BASE: GuestAddr = GuestAddr(0x2000_0000);
-const HEAP_LEN: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+const DEFAULT_HEAP_LEN: usize = 4 * 1024 * 1024;
 const STACK_BASE: GuestAddr = GuestAddr(0x3000_0000);
 const STACK_LEN: usize = 256 * 1024;
 const SCREEN_BASE: GuestAddr = GuestAddr(0x4000_0000);
@@ -38,10 +40,14 @@ const PLATFORM_SLOT_COUNT: u32 = 150;
 const INSTRUCTION_BUDGET: u64 = 20_000_000;
 
 pub(crate) trait NativeServices {
-    fn read_package_file(&mut self, name: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn read_package_file(&mut self, package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>>;
     fn file_info(&mut self, name: &[u8]) -> Result<i32>;
+    fn remove_file(&mut self, name: &[u8]) -> Result<i32>;
+    fn create_dir(&mut self, name: &[u8]) -> Result<i32>;
+    fn remove_dir(&mut self, name: &[u8]) -> Result<i32>;
     fn open_file(&mut self, name: &[u8], mode: u32) -> Result<i32>;
     fn close_file(&mut self, handle: i32) -> Result<i32>;
+    fn write_file(&mut self, handle: i32, bytes: &[u8]) -> Result<Option<usize>>;
     fn read_file(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>>;
     fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<bool>;
     fn file_len(&mut self, handle: i32) -> Result<Option<u64>>;
@@ -103,6 +109,7 @@ pub(crate) struct ExtRuntime {
     modules: Vec<ModuleContext>,
     active_helper: Option<GuestFunction>,
     heap_cursor: u32,
+    heap_len: usize,
     random_state: u32,
     glyphs: BTreeMap<(u32, u32), GuestGlyph>,
     clock_origin: Instant,
@@ -115,7 +122,17 @@ impl ExtRuntime {
         screen_height: u16,
         package_name: &[u8],
         entry_name: &[u8],
+        heap_len: u32,
     ) -> Result<Self> {
+        let heap_len = usize::try_from(heap_len)
+            .map_err(|_| Error::ArmFault("guest heap length does not fit the host".into()))?;
+        if heap_len == 0 {
+            return Err(Error::ArmFault("guest heap length must be non-zero".into()));
+        }
+        let heap_end = HEAP_BASE
+            .0
+            .checked_add(heap_len as u32)
+            .ok_or_else(|| Error::ArmFault("guest heap end overflow".into()))?;
         let mut memory = GuestMemory::new();
         memory.map(
             PLATFORM_TABLE,
@@ -129,7 +146,7 @@ impl ExtRuntime {
             Permissions::READ_WRITE,
             "platform data",
         )?;
-        memory.map(HEAP_BASE, HEAP_LEN, Permissions::READ_WRITE, "guest heap")?;
+        memory.map(HEAP_BASE, heap_len, Permissions::READ_WRITE, "guest heap")?;
         memory.map(STACK_BASE, STACK_LEN, Permissions::READ_WRITE, "EXT stack")?;
         let screen_len = usize::from(screen_width)
             .checked_mul(usize::from(screen_height))
@@ -163,10 +180,12 @@ impl ExtRuntime {
         memory.write_u32(table_slot_address(103), PREVIOUS_START_NAME_DATA.0)?;
         memory.write_u32(table_slot_address(144), CURRENT_ENTRY_DATA.0)?;
         memory.write_u32(table_slot_address(23), INTERNAL_TABLE_DATA.0)?;
-        memory.write_u32(
-            INTERNAL_TABLE_DATA.checked_add(8)?,
-            APPLICATION_STATE_DATA.0,
-        )?;
+        for offset in INTERNAL_APPLICATION_STATE_OFFSETS {
+            memory.write_u32(
+                INTERNAL_TABLE_DATA.checked_add(offset)?,
+                APPLICATION_STATE_DATA.0,
+            )?;
+        }
         memory.write_u32(
             INTERNAL_TABLE_DATA.checked_add(16)?,
             LIFECYCLE_CALLBACK_DATA.0,
@@ -191,15 +210,16 @@ impl ExtRuntime {
         memory.write_u32(data_slot_address(106), 1)?;
         memory.write_u32(data_slot_address(107), 1)?;
         memory.write_u32(data_slot_address(108), HEAP_BASE.0)?;
-        memory.write_u32(data_slot_address(109), HEAP_LEN as u32)?;
-        memory.write_u32(data_slot_address(110), HEAP_BASE.0 + HEAP_LEN as u32)?;
-        memory.write_u32(data_slot_address(111), HEAP_LEN as u32)?;
+        memory.write_u32(data_slot_address(109), heap_len as u32)?;
+        memory.write_u32(data_slot_address(110), heap_end)?;
+        memory.write_u32(data_slot_address(111), heap_len as u32)?;
 
         Ok(Self {
             memory,
             modules: Vec::new(),
             active_helper: None,
             heap_cursor: HEAP_BASE.0,
+            heap_len,
             random_state: 1,
             glyphs: BTreeMap::new(),
             clock_origin: Instant::now(),
@@ -328,7 +348,7 @@ impl ExtRuntime {
         let output = if output_address == 0 || output_len == 0 {
             Vec::new()
         } else {
-            if output_len > HEAP_LEN {
+            if output_len > self.heap_len {
                 return Err(Error::Abi(format!(
                     "EXT helper returned {output_len} output bytes"
                 )));
@@ -510,7 +530,7 @@ impl ExtRuntime {
                     .checked_mul(height)
                     .and_then(|pixels| pixels.checked_mul(2))
                     .ok_or_else(|| Error::Abi("mr_drawBitmap dimensions overflow".into()))?;
-                if byte_len > HEAP_LEN {
+                if byte_len > self.heap_len {
                     return Err(Error::Abi(format!(
                         "mr_drawBitmap source is {byte_len} bytes"
                     )));
@@ -601,6 +621,19 @@ impl ExtRuntime {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
                 cpu.set_register(0, services.file_info(&name)? as u32);
             }
+            43 => {
+                let handle = cpu.register(0) as i32;
+                let bytes = self
+                    .memory
+                    .read(GuestAddr(cpu.register(1)), cpu.register(2) as usize)?;
+                cpu.set_register(
+                    0,
+                    services
+                        .write_file(handle, &bytes)?
+                        .and_then(|written| u32::try_from(written).ok())
+                        .unwrap_or(u32::MAX),
+                );
+            }
             44 => {
                 let handle = cpu.register(0) as i32;
                 let destination = GuestAddr(cpu.register(1));
@@ -629,6 +662,19 @@ impl ExtRuntime {
                         .and_then(|len| u32::try_from(len).ok())
                         .unwrap_or(u32::MAX),
                 );
+            }
+            47 => {
+                let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                cpu.set_register(0, services.remove_file(&name)? as u32);
+            }
+            49 | 50 => {
+                let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                let result = if slot == 49 {
+                    services.create_dir(&name)?
+                } else {
+                    services.remove_dir(&name)?
+                };
+                cpu.set_register(0, result as u32);
             }
             61 => {
                 // No carrier/network identity provider is configured.
@@ -689,7 +735,7 @@ impl ExtRuntime {
                     .checked_mul(height)
                     .and_then(|pixels| pixels.checked_mul(2))
                     .ok_or_else(|| Error::Abi("bitmap source byte count overflow".into()))?;
-                if byte_len > HEAP_LEN {
+                if byte_len > self.heap_len {
                     return Err(Error::Abi(format!(
                         "bitmap source region requires {byte_len} bytes"
                     )));
@@ -786,7 +832,8 @@ impl ExtRuntime {
                 let ram_address = self.memory.read_u32(data_slot_address(104))?;
                 let ram_len = self.memory.read_u32(data_slot_address(105))? as usize;
                 let bytes = if ram_address == 0 && ram_len == 0 {
-                    services.read_package_file(&name)?
+                    let package_name = self.read_c_string(PACKAGE_NAME_DATA, 256)?;
+                    services.read_package_file(&package_name, &name)?
                 } else {
                     if ram_address == 0 || ram_len == 0 {
                         return Err(Error::Abi(format!(
@@ -931,7 +978,7 @@ impl ExtRuntime {
             .checked_add(7)
             .map(|len| len & !7)
             .ok_or_else(|| Error::Abi("compact RAM MRP output alignment overflow".into()))?;
-        let heap_end = HEAP_BASE.0 + HEAP_LEN as u32;
+        let heap_end = HEAP_BASE.0 + self.heap_len as u32;
         let mut candidates = Vec::new();
         for descriptor_len_address in (HEAP_BASE.0 + 4..heap_end).step_by(4) {
             let recorded_len = self.memory.read_u32(GuestAddr(descriptor_len_address))?;
@@ -1096,7 +1143,7 @@ impl ExtRuntime {
         let pixel_count = width
             .checked_mul(height)
             .ok_or_else(|| Error::Abi("transformed bitmap region dimensions overflow".into()))?;
-        if pixel_count > HEAP_LEN / 2 {
+        if pixel_count > self.heap_len / 2 {
             return Err(Error::Abi(format!(
                 "transformed bitmap region requires {pixel_count} pixels"
             )));
@@ -1314,14 +1361,14 @@ impl ExtRuntime {
                     "compact RAM MRP payload 0x18..{payload_end:#x} exceeds declared length {declared_len}"
                 )));
             }
-            return expand_ram_payload(&image[24..payload_end]).map(Some);
+            return expand_ram_payload(&image[24..payload_end], self.heap_len).map(Some);
         }
 
         let limits = ResourceLimits {
-            max_package_len: HEAP_LEN,
-            max_stored_file_len: HEAP_LEN,
-            max_expanded_file_len: HEAP_LEN,
-            max_total_expanded_len: HEAP_LEN,
+            max_package_len: self.heap_len,
+            max_stored_file_len: self.heap_len,
+            max_expanded_file_len: self.heap_len,
+            max_total_expanded_len: self.heap_len,
             ..ResourceLimits::default()
         };
         let package = Package::parse(
@@ -1377,9 +1424,8 @@ impl ExtRuntime {
             }
             6 => {
                 let destination = GuestAddr(cpu.register(0));
-                let source =
-                    self.read_c_string(GuestAddr(cpu.register(1)), cpu.register(2) as usize)?;
                 let len = cpu.register(2) as usize;
+                let source = self.read_c_string_bounded(GuestAddr(cpu.register(1)), len)?;
                 let mut bytes = vec![0; len];
                 let copied = source.len().min(len);
                 bytes[..copied].copy_from_slice(&source[..copied]);
@@ -1389,10 +1435,14 @@ impl ExtRuntime {
             7 | 8 => {
                 let destination = GuestAddr(cpu.register(0));
                 let destination_len = self.read_c_string(destination, 1024 * 1024)?.len();
-                let mut source = self.read_c_string(GuestAddr(cpu.register(1)), 1024 * 1024)?;
-                if slot == 8 {
-                    source.truncate(cpu.register(2) as usize);
-                }
+                let source = if slot == 8 {
+                    self.read_c_string_bounded(
+                        GuestAddr(cpu.register(1)),
+                        cpu.register(2) as usize,
+                    )?
+                } else {
+                    self.read_c_string(GuestAddr(cpu.register(1)), 1024 * 1024)?
+                };
                 let append_at = destination.checked_add(destination_len as u32)?;
                 self.memory.write(append_at, &source)?;
                 self.memory
@@ -1412,10 +1462,8 @@ impl ExtRuntime {
             }
             11 => {
                 let limit = cpu.register(2) as usize;
-                let mut left = self.read_c_string(GuestAddr(cpu.register(0)), limit)?;
-                let mut right = self.read_c_string(GuestAddr(cpu.register(1)), limit)?;
-                left.truncate(limit);
-                right.truncate(limit);
+                let left = self.read_c_string_bounded(GuestAddr(cpu.register(0)), limit)?;
+                let right = self.read_c_string_bounded(GuestAddr(cpu.register(1)), limit)?;
                 cpu.set_register(0, compare_bytes(&left, &right) as u32);
             }
             13 => {
@@ -1565,14 +1613,15 @@ impl ExtRuntime {
                 Error::ArmFault(format!("guest allocation length {len} does not fit u32"))
             })?)
             .ok_or_else(|| Error::ArmFault("guest heap allocation overflow".into()))?;
-        if end > HEAP_BASE.0 + HEAP_LEN as u32 {
+        let heap_end = HEAP_BASE.0 + self.heap_len as u32;
+        if end > heap_end {
             return Err(Error::ArmFault(format!(
                 "guest heap exhausted while allocating {len} bytes"
             )));
         }
         self.heap_cursor = end;
         self.memory
-            .write_u32(data_slot_address(111), HEAP_BASE.0 + HEAP_LEN as u32 - end)?;
+            .write_u32(data_slot_address(111), heap_end - end)?;
         Ok(GuestAddr(start))
     }
 
@@ -1589,6 +1638,17 @@ impl ExtRuntime {
             "guest C string at {:#010x} exceeds {limit} bytes",
             address.0
         )))
+    }
+
+    fn read_c_string_bounded(&self, address: GuestAddr, limit: usize) -> Result<Vec<u8>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut bytes = self.memory.read(address, limit)?;
+        if let Some(nul) = bytes.iter().position(|byte| *byte == 0) {
+            bytes.truncate(nul);
+        }
+        Ok(bytes)
     }
 
     fn read_wide_string_be(&self, address: GuestAddr, limit: usize) -> Result<Vec<u16>> {
@@ -1703,18 +1763,18 @@ fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
-fn expand_ram_payload(stored: &[u8]) -> Result<Vec<u8>> {
+fn expand_ram_payload(stored: &[u8], limit: usize) -> Result<Vec<u8>> {
     if !stored.starts_with(&[0x1f, 0x8b, 0x08]) {
         return Ok(stored.to_vec());
     }
-    let mut decoder = GzDecoder::new(stored).take((HEAP_LEN as u64).saturating_add(1));
+    let mut decoder = GzDecoder::new(stored).take((limit as u64).saturating_add(1));
     let mut output = Vec::new();
     decoder
         .read_to_end(&mut output)
         .map_err(|error| Error::Package(format!("invalid RAM MRP gzip payload: {error}")))?;
-    if output.len() > HEAP_LEN {
+    if output.len() > limit {
         return Err(Error::ResourceLimit(format!(
-            "expanded RAM MRP payload exceeds {HEAP_LEN} bytes"
+            "expanded RAM MRP payload exceeds {limit} bytes"
         )));
     }
     Ok(output)
@@ -1774,12 +1834,28 @@ mod tests {
     struct StubServices;
 
     impl NativeServices for StubServices {
-        fn read_package_file(&mut self, _name: &[u8]) -> Result<Option<Vec<u8>>> {
+        fn read_package_file(
+            &mut self,
+            _package_name: &[u8],
+            _name: &[u8],
+        ) -> Result<Option<Vec<u8>>> {
             Ok(None)
         }
 
         fn file_info(&mut self, _name: &[u8]) -> Result<i32> {
             Ok(-1)
+        }
+
+        fn remove_file(&mut self, _name: &[u8]) -> Result<i32> {
+            Ok(0)
+        }
+
+        fn create_dir(&mut self, _name: &[u8]) -> Result<i32> {
+            Ok(0)
+        }
+
+        fn remove_dir(&mut self, _name: &[u8]) -> Result<i32> {
+            Ok(0)
         }
 
         fn open_file(&mut self, _name: &[u8], _mode: u32) -> Result<i32> {
@@ -1788,6 +1864,10 @@ mod tests {
 
         fn close_file(&mut self, _handle: i32) -> Result<i32> {
             Ok(0)
+        }
+
+        fn write_file(&mut self, _handle: i32, _bytes: &[u8]) -> Result<Option<usize>> {
+            Ok(None)
         }
 
         fn read_file(&mut self, _handle: i32, _len: usize) -> Result<Option<Vec<u8>>> {
@@ -1840,7 +1920,8 @@ mod tests {
 
     #[test]
     fn transformed_bitmap_copy_snapshots_overlapping_source_pixels() {
-        let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr").unwrap();
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let bitmap = runtime.allocate(16, 2).unwrap();
         for (index, color) in [1_u16, 2, 3, 4, 5, 6, 7, 8].into_iter().enumerate() {
             runtime
@@ -1886,8 +1967,32 @@ mod tests {
     }
 
     #[test]
+    fn strncmp_compares_a_bounded_prefix_without_requiring_a_nul() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let left = runtime.allocate(8, 1).unwrap();
+        let right = runtime.allocate(8, 1).unwrap();
+        runtime.memory.write(left, b"MRPleft!").unwrap();
+        runtime.memory.write(right, b"MRQright").unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, left.0);
+        cpu.set_register(1, right.0);
+        cpu.set_register(2, 2);
+        runtime.dispatch_libc(11, &mut cpu).unwrap();
+        assert_eq!(cpu.register(0), 0);
+
+        cpu.set_register(0, left.0);
+        cpu.set_register(1, right.0);
+        cpu.set_register(2, 3);
+        runtime.dispatch_libc(11, &mut cpu).unwrap();
+        assert_eq!(cpu.register(0) as i32, -1);
+    }
+
+    #[test]
     fn transformed_bitmap_copy_normalizes_a_quarter_turn() {
-        let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr").unwrap();
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let source = runtime.allocate(12, 2).unwrap();
         let destination = runtime.allocate(12, 2).unwrap();
         for (index, color) in [1_u16, 2, 3, 4, 5, 6].into_iter().enumerate() {
@@ -1935,7 +2040,8 @@ mod tests {
 
     #[test]
     fn transformed_bitmap_trap_treats_r0_as_the_source() {
-        let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr").unwrap();
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let source = runtime.allocate(4, 2).unwrap();
         let destination = runtime.allocate(4, 2).unwrap();
         runtime.memory.write_u16(source, 0x1234).unwrap();
@@ -2018,7 +2124,8 @@ mod tests {
         image[20..24].copy_from_slice(&(stored.len() as u32).to_le_bytes());
         image[24..].copy_from_slice(&stored);
 
-        let mut runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let mut runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let address = runtime.allocate(image.len(), 8).unwrap();
         runtime.memory.write(address, &image).unwrap();
 
@@ -2038,7 +2145,8 @@ mod tests {
 
     #[test]
     fn initializes_the_internal_runtime_state_subtable() {
-        let runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let internal_table = runtime.memory.read_u32(table_slot_address(23)).unwrap();
 
         assert_eq!(internal_table, INTERNAL_TABLE_DATA.0);
@@ -2050,6 +2158,13 @@ mod tests {
             APPLICATION_STATE_DATA.0
         );
         assert_eq!(runtime.memory.read_u32(APPLICATION_STATE_DATA).unwrap(), 1);
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(INTERNAL_TABLE_DATA.checked_add(44).unwrap())
+                .unwrap(),
+            APPLICATION_STATE_DATA.0
+        );
         assert_eq!(
             runtime
                 .memory
@@ -2067,8 +2182,32 @@ mod tests {
     }
 
     #[test]
+    fn exposes_the_configured_heap_to_the_guest() {
+        let heap_len = 2 * 1024 * 1024;
+        let runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", heap_len).unwrap();
+
+        assert_eq!(
+            runtime.memory.read_u32(data_slot_address(108)).unwrap(),
+            HEAP_BASE.0
+        );
+        assert_eq!(
+            runtime.memory.read_u32(data_slot_address(109)).unwrap(),
+            heap_len
+        );
+        assert_eq!(
+            runtime.memory.read_u32(data_slot_address(110)).unwrap(),
+            HEAP_BASE.0 + heap_len
+        );
+        assert_eq!(
+            runtime.memory.read_u32(data_slot_address(111)).unwrap(),
+            heap_len
+        );
+    }
+
+    #[test]
     fn initializes_the_screen_bitmap_resource() {
-        let runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let bitmap_table = GuestAddr(runtime.memory.read_u32(table_slot_address(95)).unwrap());
         let screen_bitmap = bitmap_table
             .checked_add(SCREEN_BITMAP_ID * BITMAP_ENTRY_SIZE)
@@ -2115,7 +2254,8 @@ mod tests {
         image[16..20].copy_from_slice(b"abc\0");
         image[20..24].copy_from_slice(&1_u32.to_le_bytes());
 
-        let mut runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let mut runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let address = runtime.allocate(image.len(), 8).unwrap();
         runtime.memory.write(address, &image).unwrap();
         let error = runtime

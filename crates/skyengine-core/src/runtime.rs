@@ -25,6 +25,7 @@ pub struct RuntimeConfig {
     pub entry: Vec<u8>,
     pub work_dir: PathBuf,
     pub font_path: PathBuf,
+    pub memory_limit: u32,
     pub screen_width: u16,
     pub screen_height: u16,
     pub limits: ResourceLimits,
@@ -37,6 +38,7 @@ impl RuntimeConfig {
             entry: b"start.mr".to_vec(),
             work_dir: PathBuf::from("."),
             font_path: PathBuf::from("mythroad/system/gb16.uc2"),
+            memory_limit: 1024 * 1024,
             screen_width: 240,
             screen_height: 320,
             limits: ResourceLimits::default(),
@@ -75,6 +77,7 @@ impl Runtime {
             display,
             config.work_dir,
             font.into(),
+            config.memory_limit,
             config.limits,
         );
         Ok(Self {

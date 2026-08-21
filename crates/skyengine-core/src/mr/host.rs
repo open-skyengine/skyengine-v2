@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -47,6 +47,7 @@ pub(crate) struct MrHost {
     pub display: Box<dyn PlatformDisplay>,
     pub work_dir: PathBuf,
     font: Arc<[u8]>,
+    memory_limit: u32,
     bitmaps: BTreeMap<i32, Bitmap>,
     directory_searches: BTreeMap<i32, DirectorySearch>,
     next_directory_handle: i32,
@@ -63,6 +64,7 @@ impl MrHost {
         display: Box<dyn PlatformDisplay>,
         work_dir: PathBuf,
         font: Arc<[u8]>,
+        memory_limit: u32,
     ) -> Self {
         Self {
             package,
@@ -70,6 +72,7 @@ impl MrHost {
             display,
             work_dir,
             font,
+            memory_limit,
             bitmaps: BTreeMap::new(),
             directory_searches: BTreeMap::new(),
             next_directory_handle: 1,
@@ -425,6 +428,7 @@ impl MrHost {
                         self.framebuffer.height(),
                         &package_name,
                         b"start.mr",
+                        self.memory_limit,
                     )?,
                 };
                 let package = self.package.clone();
@@ -592,13 +596,46 @@ struct PackageServices<'a> {
 
 impl PackageServices<'_> {
     fn file_path(&self, name: &[u8]) -> Option<PathBuf> {
-        native_file_path(&self.work_dir, self.package.path(), name)
+        native_file_path(
+            &self.work_dir,
+            self.package.path(),
+            &self.package.header().internal_name,
+            name,
+        )
+    }
+
+    fn is_root_package(&self, package_name: &[u8]) -> bool {
+        package_name == self.package.header().internal_name
+            || self
+                .package
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| package_name == name.as_bytes())
     }
 }
 
 impl NativeServices for PackageServices<'_> {
-    fn read_package_file(&mut self, name: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.package.read_named(name) {
+    fn read_package_file(&mut self, package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>> {
+        let nested_package;
+        let package = if self.is_root_package(package_name) {
+            self.package.as_ref()
+        } else {
+            let Some(path) = self.file_path(package_name) else {
+                return Ok(None);
+            };
+            nested_package = match Package::open(path, self.package.limits().clone()) {
+                Ok(package) => package,
+                Err(crate::Error::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            &nested_package
+        };
+        match package.read_named(name) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(crate::Error::EntryNotFound(_)) => Ok(None),
             Err(error) => Err(error),
@@ -616,18 +653,46 @@ impl NativeServices for PackageServices<'_> {
         }
     }
 
+    fn remove_file(&mut self, name: &[u8]) -> Result<i32> {
+        let Some(path) = self.file_path(name) else {
+            return Ok(-1);
+        };
+        Ok(if fs::remove_file(path).is_ok() { 0 } else { -1 })
+    }
+
+    fn create_dir(&mut self, name: &[u8]) -> Result<i32> {
+        let Some(path) = self.file_path(name) else {
+            return Ok(-1);
+        };
+        Ok(if fs::create_dir(path).is_ok() { 0 } else { -1 })
+    }
+
+    fn remove_dir(&mut self, name: &[u8]) -> Result<i32> {
+        let Some(path) = self.file_path(name) else {
+            return Ok(-1);
+        };
+        Ok(if fs::remove_dir(path).is_ok() { 0 } else { -1 })
+    }
+
     fn open_file(&mut self, name: &[u8], mode: u32) -> Result<i32> {
         let Some(path) = self.file_path(name) else {
             return Ok(-1);
         };
-        let file = match mode {
-            1 => OpenOptions::new().read(true).open(path),
-            _ => {
-                return Err(crate::Error::Abi(format!(
-                    "unsupported native file open mode {mode}"
-                )));
-            }
-        };
+        if mode & !0x3f != 0 {
+            return Err(crate::Error::Abi(format!(
+                "unsupported native file open mode {mode}"
+            )));
+        }
+        let read = mode & 1 != 0 || mode & 4 != 0;
+        let write = mode & 2 != 0 || mode & 4 != 0;
+        if !read && !write {
+            return Ok(-1);
+        }
+        let file = OpenOptions::new()
+            .read(read)
+            .write(write)
+            .create(mode & 8 != 0)
+            .open(path);
         let Ok(file) = file else {
             return Ok(-1);
         };
@@ -653,6 +718,13 @@ impl NativeServices for PackageServices<'_> {
         } else {
             -1
         })
+    }
+
+    fn write_file(&mut self, handle: i32, bytes: &[u8]) -> Result<Option<usize>> {
+        let Some(file) = self.files.get_mut(&handle) else {
+            return Ok(None);
+        };
+        Ok(file.write(bytes).ok())
     }
 
     fn read_file(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>> {
@@ -737,7 +809,15 @@ fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
     Some(work_dir.join(path))
 }
 
-fn native_file_path(work_dir: &Path, package_path: &Path, bytes: &[u8]) -> Option<PathBuf> {
+fn native_file_path(
+    work_dir: &Path,
+    package_path: &Path,
+    package_internal_name: &[u8],
+    bytes: &[u8],
+) -> Option<PathBuf> {
+    if !package_internal_name.is_empty() && bytes == package_internal_name {
+        return Some(package_path.to_path_buf());
+    }
     let path = std::str::from_utf8(bytes).ok().map(Path::new)?;
     if path.components().count() == 1 && package_path.file_name() == Some(path.as_os_str()) {
         return Some(package_path.to_path_buf());
@@ -855,9 +935,23 @@ mod tests {
             native_file_path(
                 Path::new("device"),
                 Path::new("device/mythroad/app.mrp"),
+                b"installed.mrp",
                 b"app.mrp",
             ),
             Some(PathBuf::from("device/mythroad/app.mrp"))
+        );
+    }
+
+    #[test]
+    fn resolves_the_internal_package_name_to_its_installed_path() {
+        assert_eq!(
+            native_file_path(
+                Path::new("device"),
+                Path::new("device/mythroad/app-v2.mrp"),
+                b"app.mrp",
+                b"app.mrp",
+            ),
+            Some(PathBuf::from("device/mythroad/app-v2.mrp"))
         );
     }
 
@@ -867,6 +961,7 @@ mod tests {
             native_file_path(
                 Path::new("device"),
                 Path::new("device/mythroad/app.mrp"),
+                b"installed.mrp",
                 b"app/data.dat",
             ),
             Some(PathBuf::from("device/app/data.dat"))
@@ -879,6 +974,7 @@ mod tests {
             native_file_path(
                 Path::new("device"),
                 Path::new("device/mythroad/app.mrp"),
+                b"installed.mrp",
                 b"../app.mrp",
             ),
             None

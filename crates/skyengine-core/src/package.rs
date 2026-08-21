@@ -251,6 +251,10 @@ impl Package {
         &self.entries
     }
 
+    pub fn limits(&self) -> &ResourceLimits {
+        &self.limits
+    }
+
     pub fn find_unique(&self, name: &[u8]) -> Result<&PackageEntry> {
         let mut matches = self.entries.iter().filter(|entry| entry.name == name);
         let entry = matches

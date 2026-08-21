@@ -89,6 +89,7 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     let work_dir = take_option(&mut args, "--work-dir")?.unwrap_or_else(|| ".".into());
     let font = take_option(&mut args, "--font")?;
     let screen = take_option(&mut args, "--screen")?.unwrap_or_else(|| "240x320".into());
+    let memory = take_option(&mut args, "--memory")?.unwrap_or_else(|| "1M".into());
     let frame_output = take_option(&mut args, "--frame-output")?;
     let headless = take_flag(&mut args, "--headless") || frame_output.is_some();
     if args.len() != 1 {
@@ -97,6 +98,7 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
         ));
     }
     let (width, height) = parse_screen(&screen)?;
+    let memory_limit = parse_memory(&memory)?;
     let mut config = RuntimeConfig::for_app(PathBuf::from(&args[0]));
     config.entry = entry.as_bytes().to_vec();
     config.work_dir = PathBuf::from(work_dir);
@@ -105,6 +107,7 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     }
     config.screen_width = width;
     config.screen_height = height;
+    config.memory_limit = memory_limit;
 
     if headless {
         let mut runtime = Runtime::load(config, Box::new(HeadlessDisplay))?;
@@ -183,6 +186,23 @@ fn parse_screen(value: &str) -> Result<(u16, u16)> {
     Ok((width, height))
 }
 
+fn parse_memory(value: &str) -> Result<u32> {
+    let mebibytes = match value {
+        "1M" => 1,
+        "2M" => 2,
+        "4M" => 4,
+        "6M" => 6,
+        "8M" => 8,
+        "16M" => 16,
+        _ => {
+            return Err(skyengine_core::Error::Config(format!(
+                "invalid memory size {value:?}; expected 1M, 2M, 4M, 6M, 8M, or 16M"
+            )));
+        }
+    };
+    Ok(mebibytes * 1024 * 1024)
+}
+
 fn write_ppm(path: &Path, framebuffer: &Framebuffer) -> Result<()> {
     let file = File::create(path).map_err(|source| skyengine_core::Error::Io {
         path: path.to_path_buf(),
@@ -239,11 +259,44 @@ fn print_help() {
          Usage:\n  \
          skyengine inspect [--json] <app.mrp>\n  \
          skyengine run [--entry NAME] [--work-dir DIR] [--font FILE]\n  \
-                       [--screen WIDTHxHEIGHT] [--headless]\n  \
+                       [--screen WIDTHxHEIGHT] [--memory SIZE] [--headless]\n  \
                        [--frame-output FILE.ppm] <app.mrp>\n  \
          skyengine [run options] <app.mrp>\n\n\
          --work-dir is the device root; installed MRP files live in mythroad/.\n  \
          Relative font paths are resolved from --work-dir.\n  \
+         Memory SIZE is one of 1M, 2M, 4M, 6M, 8M, or 16M.\n  \
          The default font is mythroad/system/gb16.uc2."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_memory_profiles() {
+        for (profile, expected_mebibytes) in [
+            ("1M", 1),
+            ("2M", 2),
+            ("4M", 4),
+            ("6M", 6),
+            ("8M", 8),
+            ("16M", 16),
+        ] {
+            assert_eq!(
+                parse_memory(profile).unwrap(),
+                expected_mebibytes * 1024 * 1024
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_memory_sizes() {
+        let error = parse_memory("2048K").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected 1M, 2M, 4M, 6M, 8M, or 16M")
+        );
+    }
 }
