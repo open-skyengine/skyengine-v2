@@ -23,6 +23,16 @@ const INTERNAL_TABLE_DATA: GuestAddr = GuestAddr(0x0100_1900);
 const APPLICATION_STATE_DATA: GuestAddr = GuestAddr(0x0100_1980);
 const LIFECYCLE_CALLBACK_DATA: GuestAddr = GuestAddr(0x0100_1984);
 const TIMER_ACTIVE_DATA: GuestAddr = GuestAddr(0x0100_1988);
+const PLATFORM_SIM_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a00);
+const PLATFORM_SIM_INFO_LEN: usize = 12;
+const PLATFORM_STORAGE_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a10);
+const PLATFORM_STORAGE_INFO_LEN: usize = 16;
+const PLATFORM_STORAGE_DRIVE_DATA: GuestAddr = GuestAddr(0x0100_1a20);
+const PLATFORM_STORAGE_DRIVE_LEN: usize = 2;
+const PLATFORM_USER_INFO_LEN: usize = 64;
+const PLATFORM_USER_INFO_VERSION: u32 = 1_001;
+const PLATFORM_STORAGE_BLOCK_SIZE: u32 = 4 * 1024;
+const PLATFORM_STORAGE_AVAILABLE_BLOCKS: u32 = 4 * 1024;
 const INTERNAL_APPLICATION_STATE_OFFSETS: [u32; 2] = [8, 44];
 const MODULE_BASE: u32 = 0x1000_0000;
 const MODULE_STRIDE: u32 = 0x0010_0000;
@@ -53,6 +63,9 @@ pub(crate) trait NativeServices {
     fn read_file(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>>;
     fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<bool>;
     fn file_len(&mut self, name: &[u8]) -> Result<Option<u64>>;
+    fn find_start(&mut self, directory: &[u8]) -> Result<Option<(i32, Vec<u8>)>>;
+    fn find_next(&mut self, handle: i32) -> Result<Option<Vec<u8>>>;
+    fn find_stop(&mut self, handle: i32) -> Result<bool>;
     fn char_bitmap(&mut self, codepoint: u32, font: u32) -> Result<Option<(Vec<u8>, u32, u32)>>;
     fn draw_bitmap(
         &mut self,
@@ -240,6 +253,22 @@ impl ExtRuntime {
         memory.write_u32(data_slot_address(109), heap_len as u32)?;
         memory.write_u32(data_slot_address(110), heap_end)?;
         memory.write_u32(data_slot_address(111), heap_len as u32)?;
+        memory.write(PLATFORM_SIM_INFO_DATA, &[0; PLATFORM_SIM_INFO_LEN])?;
+        for (index, value) in [
+            PLATFORM_STORAGE_AVAILABLE_BLOCKS * 2,
+            PLATFORM_STORAGE_AVAILABLE_BLOCKS,
+            PLATFORM_STORAGE_BLOCK_SIZE,
+            PLATFORM_STORAGE_AVAILABLE_BLOCKS,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            memory.write_u32(
+                PLATFORM_STORAGE_INFO_DATA.checked_add((index * 4) as u32)?,
+                value,
+            )?;
+        }
+        memory.write(PLATFORM_STORAGE_DRIVE_DATA, b"C\0")?;
 
         Ok(Self {
             memory,
@@ -622,16 +651,7 @@ impl ExtRuntime {
                 let y = cpu.register(2) as i32;
                 let width = cpu.register(3) as usize;
                 let height = self.memory.read_u32(GuestAddr(cpu.register(13)))? as usize;
-                let byte_len = width
-                    .checked_mul(height)
-                    .and_then(|pixels| pixels.checked_mul(2))
-                    .ok_or_else(|| Error::Abi("mr_drawBitmap dimensions overflow".into()))?;
-                if byte_len > self.heap_len {
-                    return Err(Error::Abi(format!(
-                        "mr_drawBitmap source is {byte_len} bytes"
-                    )));
-                }
-                let pixels = self.memory.read(source, byte_len)?;
+                let pixels = self.read_platform_draw_pixels(source, x, y, width, height)?;
                 services.draw_bitmap(&pixels, x, y, width, height)?;
                 cpu.set_register(0, 0);
             }
@@ -645,6 +665,8 @@ impl ExtRuntime {
                     Some(glyph) => Some(glyph),
                     None => match services.char_bitmap(codepoint, font)? {
                         Some((bitmap, width, height)) => {
+                            let bitmap =
+                                bitmap.into_iter().map(u8::reverse_bits).collect::<Vec<_>>();
                             let address = self.allocate(bitmap.len(), 4)?;
                             self.memory.write(address, &bitmap)?;
                             let glyph = GuestGlyph {
@@ -694,13 +716,32 @@ impl ExtRuntime {
                 cpu.set_register(0, 0);
             }
             35 => {
-                // No device identity provider is configured. Callers treat -1
-                // as an unavailable optional user-info record.
-                cpu.set_register(0, u32::MAX);
+                let output = GuestAddr(cpu.register(0));
+                if output.0 == 0 {
+                    cpu.set_register(0, u32::MAX);
+                } else {
+                    self.memory.write(output, &platform_user_info())?;
+                    cpu.set_register(0, 0);
+                }
+            }
+            36 => {
+                // The outer runtime owns scheduling; acknowledge guest sleeps
+                // without blocking the event and control loops.
+                cpu.set_register(0, 0);
             }
             37 => match (cpu.register(0), cpu.register(1)) {
                 // Baseline SDK initialization notification; the return value is ignored.
                 (1_106, 0) => cpu.set_register(0, 0),
+                // Report the normal storage profile. 1002 denotes USB mass-storage
+                // mode, in which applications must not access their regular volume.
+                (1_218, 0) => cpu.set_register(0, 1_001),
+                // Network request compatibility version used by message.ext.
+                (1_205, 0) => cpu.set_register(0, 1_001),
+                // Optional dual-SIM selection probe. A false result keeps the
+                // guest on its default network selection path.
+                (1_327, 0) => cpu.set_register(0, u32::MAX),
+                // No explicit SIM/network selection is configured.
+                (1_328, 0) => cpu.set_register(0, u32::MAX),
                 (command, argument) => {
                     return Err(Error::Abi(format!(
                         "unsupported platform slot 37 command ({command}, {argument}) called by module {module}"
@@ -715,13 +756,42 @@ impl ExtRuntime {
                 // Releases an arena returned by command 1014. The ABI carries
                 // the 32-bit guest address as a four-byte input buffer.
                 1_015 => self.release_platform_memory_extension(cpu)?,
-                // Optional device identifier query. No device-info provider is configured.
-                1_204 => cpu.set_register(0, u32::MAX),
+                // Resolve the logical application storage volume to a drive.
+                1_204 => self.return_platform_storage_drive(cpu)?,
                 // Optional platform metadata query. No metadata provider is configured.
                 1_222 => self.return_unavailable_platform_extension(cpu)?,
+                // Optional device metadata blob used to enrich network requests.
+                1_116 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
+                    self.return_unavailable_platform_extension(cpu)?
+                }
+                // Returns the available SIM slots. The headless baseline has no
+                // carrier provider, so expose a valid empty result structure.
+                1_307 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
+                    self.return_platform_sim_info(cpu)?
+                }
+                // Disk geometry used by the guest's startup space check.
+                1_305 if cpu.register(2) == 1 => self.return_platform_storage_info(cpu)?,
                 // Optional platform control/query without input or output buffers.
                 1_223 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
                     cpu.set_register(0, u32::MAX)
+                }
+                // Optional vendor capability probe. The baseline headless profile
+                // does not provide it, so report the ABI failure value.
+                0x0009_0003
+                    if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 =>
+                {
+                    cpu.set_register(0, u32::MAX)
+                }
+                // Observed optional vendor extension with an opaque input record
+                // and no output buffer. This profile does not provide it.
+                0x0009_0004
+                    if cpu.register(1) != 0 && cpu.register(2) != 0 && cpu.register(3) == 0 =>
+                {
+                    cpu.set_register(0, u32::MAX)
+                }
+                // Optional vendor capability structure.
+                0x0007_0001 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
+                    self.return_unavailable_platform_extension(cpu)?
                 }
                 command => {
                     return Err(Error::Abi(format!(
@@ -801,6 +871,37 @@ impl ExtRuntime {
                 };
                 cpu.set_register(0, result as u32);
             }
+            51 => {
+                let directory = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                let output = GuestAddr(cpu.register(1));
+                let output_len = cpu.register(2) as usize;
+                match services.find_start(&directory)? {
+                    Some((handle, entry))
+                        if self.write_directory_entry(output, output_len, &entry)? =>
+                    {
+                        cpu.set_register(0, handle as u32);
+                    }
+                    Some((handle, _)) => {
+                        services.find_stop(handle)?;
+                        cpu.set_register(0, u32::MAX);
+                    }
+                    None => cpu.set_register(0, u32::MAX),
+                }
+            }
+            52 => {
+                let handle = cpu.register(0) as i32;
+                let output = GuestAddr(cpu.register(1));
+                let output_len = cpu.register(2) as usize;
+                let succeeded = match services.find_next(handle)? {
+                    Some(entry) => self.write_directory_entry(output, output_len, &entry)?,
+                    None => false,
+                };
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            53 => {
+                let succeeded = services.find_stop(cpu.register(0) as i32)?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
             54 => {
                 self.exit_requested = true;
                 cpu.set_register(0, 0);
@@ -811,8 +912,9 @@ impl ExtRuntime {
                 cpu.set_register(0, 0);
             }
             61 => {
-                // No carrier/network identity provider is configured.
-                cpu.set_register(0, u32::MAX);
+                // The offline profile still exposes a deterministic default
+                // network identity; connectivity is reported by socket calls.
+                cpu.set_register(0, 0);
             }
             69 => {
                 let title = self.read_wide_string_be(GuestAddr(cpu.register(0)), 1024)?;
@@ -849,6 +951,34 @@ impl ExtRuntime {
                 self.memory.write_u32(info, width)?;
                 self.memory.write_u32(info.checked_add(4)?, height)?;
                 cpu.set_register(0, 0);
+            }
+            81 => {
+                // Initializing the network service does not imply that a link is
+                // available. Later DNS/socket operations report connectivity.
+                cpu.set_register(0, 0);
+            }
+            82 => {
+                // Closing an unavailable or already closed network service is
+                // intentionally idempotent.
+                cpu.set_register(0, 0);
+            }
+            84 => {
+                // No socket provider is configured in the deterministic offline profile.
+                cpu.set_register(0, u32::MAX);
+            }
+            85 => {
+                cpu.set_register(0, u32::MAX);
+            }
+            86 => {
+                cpu.set_register(0, u32::MAX);
+            }
+            87 => {
+                cpu.set_register(0, u32::MAX);
+            }
+            89 => {
+                let len = cpu.register(2) as usize;
+                self.memory.read(GuestAddr(cpu.register(1)), len)?;
+                cpu.set_register(0, u32::MAX);
             }
             113 => {
                 self.md5_init(GuestAddr(cpu.register(0)))?;
@@ -983,10 +1113,10 @@ impl ExtRuntime {
             }
             123 => {
                 let stack = GuestAddr(cpu.register(13));
-                let style = self.memory.read_u32(stack.checked_add(12)?)?;
-                if style != 0 {
+                let flags = self.memory.read_u32(stack.checked_add(12)?)?;
+                if flags > 2 {
                     return Err(Error::Abi(format!(
-                        "unsupported text drawing style {style} called by module {module}"
+                        "unsupported text drawing flags {flags} called by module {module}"
                     )));
                 }
                 let text = self.read_wide_string_be(GuestAddr(cpu.register(0)), 64 * 1024)?;
@@ -1223,6 +1353,75 @@ impl ExtRuntime {
         Ok(())
     }
 
+    fn return_platform_sim_info(&mut self, cpu: &mut ArmCpu) -> Result<()> {
+        let output = GuestAddr(cpu.register(3));
+        if output.0 == 0 {
+            return Err(Error::Abi(
+                "platform SIM query has a null output pointer".into(),
+            ));
+        }
+        let output_len = GuestAddr(self.memory.read_u32(GuestAddr(cpu.register(13)))?);
+        if output_len.0 == 0 {
+            return Err(Error::Abi(
+                "platform SIM query has a null output-length pointer".into(),
+            ));
+        }
+        self.memory.write_u32(output, PLATFORM_SIM_INFO_DATA.0)?;
+        self.memory
+            .write_u32(output_len, PLATFORM_SIM_INFO_LEN as u32)?;
+        cpu.set_register(0, 0);
+        Ok(())
+    }
+
+    fn return_platform_storage_info(&mut self, cpu: &mut ArmCpu) -> Result<()> {
+        self.memory.read(GuestAddr(cpu.register(1)), 1)?;
+        let output = GuestAddr(cpu.register(3));
+        if output.0 == 0 {
+            return Err(Error::Abi(
+                "platform storage query has a null output pointer".into(),
+            ));
+        }
+        let output_len = GuestAddr(self.memory.read_u32(GuestAddr(cpu.register(13)))?);
+        if output_len.0 == 0 {
+            return Err(Error::Abi(
+                "platform storage query has a null output-length pointer".into(),
+            ));
+        }
+        self.memory
+            .write_u32(output, PLATFORM_STORAGE_INFO_DATA.0)?;
+        self.memory
+            .write_u32(output_len, PLATFORM_STORAGE_INFO_LEN as u32)?;
+        cpu.set_register(0, 0);
+        Ok(())
+    }
+
+    fn return_platform_storage_drive(&mut self, cpu: &mut ArmCpu) -> Result<()> {
+        let input_len = cpu.register(2) as usize;
+        let input = self.memory.read(GuestAddr(cpu.register(1)), input_len)?;
+        if input != b"Y" {
+            cpu.set_register(0, u32::MAX);
+            return Ok(());
+        }
+        let output = GuestAddr(cpu.register(3));
+        if output.0 == 0 {
+            return Err(Error::Abi(
+                "platform storage drive query has a null output pointer".into(),
+            ));
+        }
+        let output_len = GuestAddr(self.memory.read_u32(GuestAddr(cpu.register(13)))?);
+        if output_len.0 == 0 {
+            return Err(Error::Abi(
+                "platform storage drive query has a null output-length pointer".into(),
+            ));
+        }
+        self.memory
+            .write_u32(output, PLATFORM_STORAGE_DRIVE_DATA.0)?;
+        self.memory
+            .write_u32(output_len, PLATFORM_STORAGE_DRIVE_LEN as u32)?;
+        cpu.set_register(0, 0);
+        Ok(())
+    }
+
     fn allocate_platform_memory_extension(&mut self, cpu: &mut ArmCpu) -> Result<()> {
         let requested_len = cpu.register(2) as usize;
         if requested_len == 0 {
@@ -1422,6 +1621,57 @@ impl ExtRuntime {
         services.draw_bitmap(&pixels, 0, 0, width as usize, height as usize)
     }
 
+    fn read_platform_draw_pixels(
+        &self,
+        source: GuestAddr,
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<u8>> {
+        let byte_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or_else(|| Error::Abi("mr_drawBitmap dimensions overflow".into()))?;
+        if byte_len > self.heap_len {
+            return Err(Error::Abi(format!(
+                "mr_drawBitmap source is {byte_len} bytes"
+            )));
+        }
+        if source != SCREEN_BASE {
+            return self.memory.read(source, byte_len);
+        }
+
+        let (screen_width, screen_height) = self.screen_dimensions()?;
+        let region_width = i64::try_from(width)
+            .map_err(|_| Error::Abi("mr_drawBitmap width exceeds i64".into()))?;
+        let region_height = i64::try_from(height)
+            .map_err(|_| Error::Abi("mr_drawBitmap height exceeds i64".into()))?;
+        let region_end_x = i64::from(x) + region_width;
+        let region_end_y = i64::from(y) + region_height;
+        if x < 0
+            || y < 0
+            || region_end_x > i64::from(screen_width)
+            || region_end_y > i64::from(screen_height)
+        {
+            return Err(Error::Abi(format!(
+                "mr_drawBitmap screen region ({x}, {y}) {width}x{height} exceeds {screen_width}x{screen_height}"
+            )));
+        }
+
+        let row_byte_len = width
+            .checked_mul(2)
+            .ok_or_else(|| Error::Abi("mr_drawBitmap row size overflow".into()))?;
+        let mut pixels = Vec::with_capacity(byte_len);
+        for row in 0..height {
+            let row = i32::try_from(row)
+                .map_err(|_| Error::Abi("mr_drawBitmap row exceeds i32".into()))?;
+            let row_address = self.screen_address(x, y + row, screen_width)?;
+            pixels.extend(self.memory.read(row_address, row_byte_len)?);
+        }
+        Ok(pixels)
+    }
+
     fn compact_ram_output_target(
         &self,
         package_address: GuestAddr,
@@ -1458,7 +1708,7 @@ impl ExtRuntime {
             let Some(candidate_end) = candidate.checked_add(output_len) else {
                 continue;
             };
-            if candidate & 7 != 0 || candidate < HEAP_BASE.0 || candidate_end > heap_end {
+            if candidate & 3 != 0 || candidate < HEAP_BASE.0 || candidate_end > heap_end {
                 continue;
             }
             let candidate = GuestAddr(candidate);
@@ -2107,6 +2357,24 @@ impl ExtRuntime {
         )))
     }
 
+    fn write_directory_entry(
+        &mut self,
+        output: GuestAddr,
+        output_len: usize,
+        entry: &[u8],
+    ) -> Result<bool> {
+        let Some(required) = entry.len().checked_add(1) else {
+            return Ok(false);
+        };
+        if output.0 == 0 || required > output_len {
+            return Ok(false);
+        }
+        self.memory.write(output, entry)?;
+        self.memory
+            .write_u8(output.checked_add(entry.len() as u32)?, 0)?;
+        Ok(true)
+    }
+
     fn read_c_string_bounded(&self, address: GuestAddr, limit: usize) -> Result<Vec<u8>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -2377,6 +2645,16 @@ fn expand_ram_payload(stored: &[u8], limit: usize) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+fn platform_user_info() -> [u8; PLATFORM_USER_INFO_LEN] {
+    let mut info = [0_u8; PLATFORM_USER_INFO_LEN];
+    info[..16].copy_from_slice(b"000000000000000\0");
+    info[16..32].copy_from_slice(b"460001234567890\0");
+    info[32..40].copy_from_slice(b"SkyEng\0\0");
+    info[40..48].copy_from_slice(b"SE-V2\0\0\0");
+    info[48..52].copy_from_slice(&PLATFORM_USER_INFO_VERSION.to_le_bytes());
+    info
+}
+
 fn trap_slot(address: u32) -> Option<u32> {
     let offset = address.checked_sub(TRAP_BASE)?;
     (offset % 4 == 0 && offset / 4 < PLATFORM_SLOT_COUNT).then_some(offset / 4)
@@ -2483,12 +2761,24 @@ mod tests {
             Ok(None)
         }
 
+        fn find_start(&mut self, _directory: &[u8]) -> Result<Option<(i32, Vec<u8>)>> {
+            Ok(Some((7, b"entry.dat".to_vec())))
+        }
+
+        fn find_next(&mut self, _handle: i32) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn find_stop(&mut self, handle: i32) -> Result<bool> {
+            Ok(handle == 7)
+        }
+
         fn char_bitmap(
             &mut self,
-            _codepoint: u32,
-            _font: u32,
+            codepoint: u32,
+            font: u32,
         ) -> Result<Option<(Vec<u8>, u32, u32)>> {
-            Ok(None)
+            Ok((codepoint == 0x2603 && font == 7).then(|| (vec![0x01, 0x80, 0x96, 0x4b], 9, 2)))
         }
 
         fn draw_bitmap(
@@ -2728,6 +3018,107 @@ mod tests {
     }
 
     #[test]
+    fn guest_character_bitmap_uses_lsb_first_bytes() {
+        let mut runtime =
+            ExtRuntime::new(16, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let width_out = runtime.allocate(4, 4).unwrap();
+        let height_out = runtime.allocate(4, 4).unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 0x2603);
+        cpu.set_register(1, 7);
+        cpu.set_register(2, width_out.0);
+        cpu.set_register(3, height_out.0);
+
+        runtime
+            .dispatch(30, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        let bitmap = GuestAddr(cpu.register(0));
+        assert_ne!(bitmap.0, 0);
+        assert_eq!(
+            runtime.memory.read(bitmap, 4).unwrap(),
+            [0x80, 0x01, 0x69, 0xd2]
+        );
+        assert_eq!(runtime.memory.read_u32(width_out).unwrap(), 9);
+        assert_eq!(runtime.memory.read_u32(height_out).unwrap(), 2);
+    }
+
+    #[test]
+    fn host_text_drawing_keeps_msb_first_glyph_bytes() {
+        let mut runtime =
+            ExtRuntime::new(16, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+
+        runtime
+            .draw_text_to_screen(&[0x2603], 0, 0, 0xffff, 7, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .memory
+                .read_u16(runtime.screen_address(7, 0, 16).unwrap())
+                .unwrap(),
+            0xffff
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read_u16(runtime.screen_address(8, 0, 16).unwrap())
+                .unwrap(),
+            0xffff
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read_u16(runtime.screen_address(0, 0, 16).unwrap())
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn user_info_returns_the_deterministic_virtual_device_profile() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let output = runtime.allocate(PLATFORM_USER_INFO_LEN, 4).unwrap();
+        runtime
+            .memory
+            .write(output, &[0xaa; PLATFORM_USER_INFO_LEN])
+            .unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, output.0);
+
+        runtime
+            .dispatch(35, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(
+            runtime.memory.read(output, PLATFORM_USER_INFO_LEN).unwrap(),
+            platform_user_info()
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(output.checked_add(48).unwrap())
+                .unwrap(),
+            PLATFORM_USER_INFO_VERSION
+        );
+    }
+
+    #[test]
+    fn user_info_rejects_a_null_output_pointer() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let mut cpu = ArmCpu::new();
+
+        runtime
+            .dispatch(35, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0) as i32, -1);
+    }
+
+    #[test]
     fn headless_audio_stop_is_idempotent() {
         let mut runtime =
             ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -2739,6 +3130,157 @@ mod tests {
             .unwrap();
 
         assert_eq!(cpu.register(0), 0);
+    }
+
+    #[test]
+    fn headless_network_lifecycle_succeeds_but_socket_operations_fail() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 0x1000_0009);
+
+        runtime
+            .dispatch(81, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 0);
+
+        runtime
+            .dispatch(82, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0);
+
+        runtime
+            .dispatch(84, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0) as i32, -1);
+
+        for slot in [85, 86, 87] {
+            runtime
+                .dispatch(slot, 0, &mut cpu, &mut StubServices)
+                .unwrap();
+            assert_eq!(cpu.register(0) as i32, -1, "slot {slot}");
+        }
+
+        let payload = runtime.allocate(4, 1).unwrap();
+        runtime.memory.write(payload, b"test").unwrap();
+        cpu.set_register(1, payload.0);
+        cpu.set_register(2, 4);
+        runtime
+            .dispatch(89, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0) as i32, -1);
+    }
+
+    #[test]
+    fn platform_storage_query_reports_normal_mode() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 1_218);
+
+        runtime
+            .dispatch(37, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 1_001);
+    }
+
+    #[test]
+    fn platform_storage_info_reports_sufficient_available_space() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let drive = runtime.allocate(1, 1).unwrap();
+        runtime.memory.write(drive, b"C").unwrap();
+        let output = runtime.allocate(4, 4).unwrap();
+        let output_len = runtime.allocate(4, 4).unwrap();
+        let stack = runtime.allocate(4, 4).unwrap();
+        runtime.memory.write_u32(stack, output_len.0).unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 1_305);
+        cpu.set_register(1, drive.0);
+        cpu.set_register(2, 1);
+        cpu.set_register(3, output.0);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        let info = GuestAddr(runtime.memory.read_u32(output).unwrap());
+        let block_size = runtime
+            .memory
+            .read_u32(info.checked_add(8).unwrap())
+            .unwrap();
+        let available_blocks = runtime
+            .memory
+            .read_u32(info.checked_add(12).unwrap())
+            .unwrap();
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 16);
+        assert_eq!(block_size, PLATFORM_STORAGE_BLOCK_SIZE);
+        assert_eq!(available_blocks, PLATFORM_STORAGE_AVAILABLE_BLOCKS);
+        assert!(u64::from(block_size) * u64::from(available_blocks) / 1024 > 2048);
+    }
+
+    #[test]
+    fn platform_storage_drive_query_resolves_the_application_volume() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let volume = runtime.allocate(1, 1).unwrap();
+        runtime.memory.write(volume, b"Y").unwrap();
+        let output = runtime.allocate(4, 4).unwrap();
+        let output_len = runtime.allocate(4, 4).unwrap();
+        let stack = runtime.allocate(4, 4).unwrap();
+        runtime.memory.write_u32(stack, output_len.0).unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 1_204);
+        cpu.set_register(1, volume.0);
+        cpu.set_register(2, 1);
+        cpu.set_register(3, output.0);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        let drive = GuestAddr(runtime.memory.read_u32(output).unwrap());
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 2);
+        assert_eq!(runtime.memory.read(drive, 2).unwrap(), b"C\0");
+    }
+
+    #[test]
+    fn text_drawing_accepts_the_baseline_wide_text_flags() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let text = runtime.allocate(4, 2).unwrap();
+        runtime.memory.write(text, &[0, b'A', 0, 0]).unwrap();
+        let stack = runtime.allocate(16, 4).unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(13, stack.0);
+        for flags in 0..=2 {
+            runtime
+                .memory
+                .write_u32(stack.checked_add(12).unwrap(), flags)
+                .unwrap();
+            cpu.set_register(0, text.0);
+            runtime
+                .dispatch(123, 0, &mut cpu, &mut StubServices)
+                .unwrap();
+            assert_eq!(cpu.register(0), 0);
+        }
+
+        runtime
+            .memory
+            .write_u32(stack.checked_add(12).unwrap(), 3)
+            .unwrap();
+        assert!(matches!(
+            runtime.dispatch(123, 0, &mut cpu, &mut StubServices),
+            Err(Error::Abi(message))
+                if message == "unsupported text drawing flags 3 called by module 0"
+        ));
     }
 
     #[test]
@@ -2890,6 +3432,58 @@ mod tests {
             .dispatch(38, 0, &mut cpu, &mut StubServices)
             .unwrap();
         assert_eq!(cpu.register(0) as i32, -1);
+
+        cpu.set_register(0, 0x0009_0003);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0) as i32, -1);
+
+        let event = runtime.allocate(35, 1).unwrap();
+        cpu.set_register(0, 0x0009_0004);
+        cpu.set_register(1, event.0);
+        cpu.set_register(2, 35);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0) as i32, -1);
+    }
+
+    #[test]
+    fn platform_sim_query_returns_a_valid_empty_slot_list() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let output = runtime.allocate(4, 4).unwrap();
+        let output_len = runtime.allocate(4, 4).unwrap();
+        let stack = runtime.allocate(4, 4).unwrap();
+        runtime.memory.write_u32(output, 0xaaaa_aaaa).unwrap();
+        runtime.memory.write_u32(output_len, 0xbbbb_bbbb).unwrap();
+        runtime.memory.write_u32(stack, output_len.0).unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 1_307);
+        cpu.set_register(3, output.0);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(
+            runtime.memory.read_u32(output).unwrap(),
+            PLATFORM_SIM_INFO_DATA.0
+        );
+        assert_eq!(
+            runtime.memory.read_u32(output_len).unwrap(),
+            PLATFORM_SIM_INFO_LEN as u32
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read(PLATFORM_SIM_INFO_DATA, PLATFORM_SIM_INFO_LEN)
+                .unwrap(),
+            vec![0; PLATFORM_SIM_INFO_LEN]
+        );
     }
 
     #[test]
@@ -3016,6 +3610,77 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn compact_ram_package_writes_into_four_and_eight_byte_aligned_wrappers() {
+        let expected = b"MRPGCMAPguest module";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(expected).unwrap();
+        let stored = encoder.finish().unwrap();
+        let mut image = vec![0_u8; 24 + stored.len()];
+        let image_len = image.len() as u32;
+        image[..4].copy_from_slice(b"MRPG");
+        image[4..8].copy_from_slice(&4_u32.to_le_bytes());
+        image[8..12].copy_from_slice(&image_len.to_le_bytes());
+        image[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        image[16..20].copy_from_slice(b"abc\0");
+        image[20..24].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+        image[24..].copy_from_slice(&stored);
+
+        for alignment in [4, 8] {
+            let mut runtime =
+                ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32)
+                    .unwrap();
+            if alignment == 4 {
+                runtime.allocate(4, 4).unwrap();
+            }
+            let aligned_len = (expected.len() + 7) & !7;
+            let prepared = runtime.allocate(aligned_len, alignment).unwrap();
+            assert_eq!(prepared.0 % 8, if alignment == 4 { 4 } else { 0 });
+            runtime.memory.write_u32(prepared, 0).unwrap();
+            runtime
+                .memory
+                .write_u32(prepared.checked_add(4).unwrap(), aligned_len as u32)
+                .unwrap();
+
+            let package = runtime.allocate(image.len(), 8).unwrap();
+            runtime.memory.write(package, &image).unwrap();
+            let descriptor = runtime.allocate(8, 4).unwrap();
+            runtime.memory.write_u32(descriptor, prepared.0).unwrap();
+            runtime
+                .memory
+                .write_u32(descriptor.checked_add(4).unwrap(), aligned_len as u32)
+                .unwrap();
+            runtime
+                .memory
+                .write_u32(data_slot_address(104), package.0)
+                .unwrap();
+            runtime
+                .memory
+                .write_u32(data_slot_address(105), image.len() as u32)
+                .unwrap();
+
+            let name = runtime.allocate(4, 1).unwrap();
+            runtime.memory.write(name, b"abc\0").unwrap();
+            let output_len = runtime.allocate(4, 4).unwrap();
+            let mut cpu = ArmCpu::new();
+            cpu.set_register(0, name.0);
+            cpu.set_register(1, output_len.0);
+            runtime
+                .dispatch(125, 0, &mut cpu, &mut StubServices)
+                .unwrap();
+
+            assert_eq!(cpu.register(0), prepared.0);
+            assert_eq!(
+                runtime.memory.read_u32(output_len).unwrap(),
+                expected.len() as u32
+            );
+            assert_eq!(
+                runtime.memory.read(prepared, expected.len()).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3158,6 +3823,28 @@ mod tests {
                 .unwrap(),
             SCREEN_BASE.0
         );
+    }
+
+    #[test]
+    fn platform_draw_reads_screen_updates_with_the_screen_stride() {
+        let mut runtime =
+            ExtRuntime::new(4, 3, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        for (index, color) in (1_u16..=12).enumerate() {
+            runtime
+                .memory
+                .write_u16(SCREEN_BASE.checked_add((index * 2) as u32).unwrap(), color)
+                .unwrap();
+        }
+
+        let pixels = runtime
+            .read_platform_draw_pixels(SCREEN_BASE, 1, 1, 2, 2)
+            .unwrap();
+        let colors = pixels
+            .chunks_exact(2)
+            .map(|pixel| u16::from_le_bytes([pixel[0], pixel[1]]))
+            .collect::<Vec<_>>();
+
+        assert_eq!(colors, vec![6, 7, 10, 11]);
     }
 
     #[test]

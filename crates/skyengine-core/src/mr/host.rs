@@ -508,6 +508,8 @@ impl MrHost {
                 let mut services = PackageServices {
                     package,
                     work_dir: self.work_dir.clone(),
+                    directory_searches: &mut self.directory_searches,
+                    next_directory_handle: &mut self.next_directory_handle,
                     files: &mut self.native_files,
                     next_file_handle: &mut self.next_native_file_handle,
                     font: &self.font,
@@ -571,6 +573,8 @@ impl MrHost {
             let mut services = PackageServices {
                 package,
                 work_dir: self.work_dir.clone(),
+                directory_searches: &mut self.directory_searches,
+                next_directory_handle: &mut self.next_directory_handle,
                 files: &mut self.native_files,
                 next_file_handle: &mut self.next_native_file_handle,
                 font: &self.font,
@@ -660,6 +664,8 @@ impl MrHost {
 struct PackageServices<'a> {
     package: Arc<Package>,
     work_dir: PathBuf,
+    directory_searches: &'a mut BTreeMap<i32, DirectorySearch>,
+    next_directory_handle: &'a mut i32,
     files: &'a mut BTreeMap<i32, NativeFile>,
     next_file_handle: &'a mut i32,
     font: &'a [u8],
@@ -892,6 +898,63 @@ impl NativeServices for PackageServices<'_> {
         Ok(self
             .read_current_package_file(name)?
             .and_then(|bytes| u64::try_from(bytes.len()).ok()))
+    }
+
+    fn find_start(&mut self, directory: &[u8]) -> Result<Option<(i32, Vec<u8>)>> {
+        let Some(path) = safe_work_path(&self.work_dir, directory) else {
+            return Ok(None);
+        };
+        let Ok(entries) = fs::read_dir(path) else {
+            return Ok(None);
+        };
+        let mut names = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let (encoded, _, _) = GBK.encode(&name);
+                Arc::<[u8]>::from(encoded.as_ref())
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+
+        let start = *self.next_directory_handle;
+        let handle = loop {
+            let handle = *self.next_directory_handle;
+            *self.next_directory_handle = self.next_directory_handle.checked_add(1).unwrap_or(1);
+            if !self.directory_searches.contains_key(&handle) {
+                break handle;
+            }
+            if *self.next_directory_handle == start {
+                return Err(crate::Error::ResourceLimit(
+                    "no directory search handles available".into(),
+                ));
+            }
+        };
+        let first = names.first().map_or_else(Vec::new, |name| name.to_vec());
+        self.directory_searches.insert(
+            handle,
+            DirectorySearch {
+                entries: names,
+                next: 1,
+            },
+        );
+        Ok(Some((handle, first)))
+    }
+
+    fn find_next(&mut self, handle: i32) -> Result<Option<Vec<u8>>> {
+        let Some(search) = self.directory_searches.get_mut(&handle) else {
+            return Ok(None);
+        };
+        let Some(name) = search.entries.get(search.next) else {
+            return Ok(None);
+        };
+        search.next += 1;
+        Ok(Some(name.to_vec()))
+    }
+
+    fn find_stop(&mut self, handle: i32) -> Result<bool> {
+        Ok(self.directory_searches.remove(&handle).is_some())
     }
 
     fn char_bitmap(&mut self, codepoint: u32, _font: u32) -> Result<Option<(Vec<u8>, u32, u32)>> {
