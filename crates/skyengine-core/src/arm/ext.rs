@@ -1064,6 +1064,12 @@ impl ExtRuntime {
                 self.native_sockets.clear();
                 cpu.set_register(0, 0);
             }
+            83 => {
+                // DNS completion is asynchronous in the guest ABI. The baseline
+                // profile has no resolver/event provider, so fail the request
+                // immediately and let the caller select its offline path.
+                cpu.set_register(0, u32::MAX);
+            }
             84 => {
                 let socket_type = cpu.register(0);
                 let protocol = cpu.register(1);
@@ -1163,14 +1169,6 @@ impl ExtRuntime {
                         )));
                     }
                 };
-                let source_end_x = source_x
-                    .checked_add(width)
-                    .ok_or_else(|| Error::Abi("bitmap source width overflow".into()))?;
-                if source_end_x > source_stride {
-                    return Err(Error::Abi(format!(
-                        "bitmap source region ends at {source_end_x}, beyond stride {source_stride}"
-                    )));
-                }
                 let source_end_y = source_y
                     .checked_add(height)
                     .ok_or_else(|| Error::Abi("bitmap source height overflow".into()))?;
@@ -3415,6 +3413,42 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_trap_accepts_a_linear_source_offset_at_the_stride_boundary() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let source = runtime.allocate(24 * 2, 2).unwrap();
+        for (index, color) in (1_u16..=24).enumerate() {
+            runtime
+                .memory
+                .write_u16(source.checked_add((index * 2) as u32).unwrap(), color)
+                .unwrap();
+        }
+        let stack = runtime.allocate(24, 4).unwrap();
+        for (index, value) in [2_u32, 2, 0, 4, 1, 4].into_iter().enumerate() {
+            runtime
+                .memory
+                .write_u32(stack.checked_add((index * 4) as u32).unwrap(), value)
+                .unwrap();
+        }
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, source.0);
+        cpu.set_register(1, 0);
+        cpu.set_register(2, 0);
+        cpu.set_register(3, 4);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(120, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        let first_row = read_bitmap_pixels(&runtime, SCREEN_BASE, 8, 1);
+        let second_row =
+            read_bitmap_pixels(&runtime, SCREEN_BASE.checked_add(8 * 2).unwrap(), 8, 1);
+        assert_eq!(&first_row[..4], [9, 10, 11, 12]);
+        assert_eq!(&second_row[..4], [13, 14, 15, 16]);
+    }
+
+    #[test]
     fn strncmp_compares_a_bounded_prefix_without_requiring_a_nul() {
         let mut runtime =
             ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -3694,6 +3728,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(cpu.register(0), 0);
+    }
+
+    #[test]
+    fn dns_fails_deterministically_without_a_resolver_provider() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let mut cpu = ArmCpu::new();
+
+        runtime
+            .dispatch(83, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0) as i32, -1);
     }
 
     #[test]

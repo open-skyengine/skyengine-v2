@@ -1032,10 +1032,18 @@ fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
     if path.starts_with('/') || path.starts_with('\\') {
         return None;
     }
+    let components = path
+        .split(['/', '\\'])
+        .filter(|component| !matches!(*component, "" | "."))
+        .collect::<Vec<_>>();
     let mut resolved = work_dir.to_path_buf();
-    for component in path.split(['/', '\\']) {
+    resolved.push("mythroad");
+    let components = match components.as_slice() {
+        ["mythroad", tail @ ..] => tail,
+        components => components,
+    };
+    for &component in components {
         match component {
-            "" | "." => continue,
             ".." => return None,
             component if component.contains('\0') || component.contains(':') => return None,
             component => resolved.push(component),
@@ -1216,19 +1224,19 @@ mod tests {
                 b"installed.mrp",
                 b"app/data.dat",
             ),
-            Some(PathBuf::from("device/app/data.dat"))
+            Some(PathBuf::from("device/mythroad/app/data.dat"))
         );
     }
 
     #[test]
-    fn normalizes_device_path_separators_inside_the_work_directory() {
+    fn resolves_device_files_inside_the_mythroad_directory() {
         assert_eq!(
             safe_work_path(Path::new("device"), b"gxdzc\\res.temp"),
-            Some(PathBuf::from("device/gxdzc/res.temp"))
+            Some(PathBuf::from("device/mythroad/gxdzc/res.temp"))
         );
         assert_eq!(
-            safe_work_path(Path::new("device"), b"gxdzc/res.pak"),
-            Some(PathBuf::from("device/gxdzc/res.pak"))
+            safe_work_path(Path::new("device"), b"mythroad/gxdzc/res.pak"),
+            Some(PathBuf::from("device/mythroad/gxdzc/res.pak"))
         );
     }
 
