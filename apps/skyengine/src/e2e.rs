@@ -41,8 +41,16 @@ struct CaptureState {
 
 enum ControlMessage {
     Event(DisplayEvent),
-    Key { code: i32, hold: Duration },
-    Pointer { x: i32, y: i32, hold: Duration },
+    Key {
+        code: i32,
+        hold: Duration,
+        accepted: Sender<u64>,
+    },
+    Pointer {
+        x: i32,
+        y: i32,
+        hold: Duration,
+    },
 }
 
 pub(crate) struct E2eDisplay {
@@ -157,11 +165,22 @@ impl PlatformDisplay for E2eDisplay {
         }
         match self.commands.try_recv() {
             Ok(ControlMessage::Event(event)) => Ok(Some(event)),
-            Ok(ControlMessage::Key { code, hold }) => {
+            Ok(ControlMessage::Key {
+                code,
+                hold,
+                accepted,
+            }) => {
                 let deadline = Instant::now()
                     .checked_add(hold)
                     .unwrap_or_else(Instant::now);
                 self.key_releases.push((deadline, code));
+                let draw_count = self
+                    .state
+                    .data
+                    .lock()
+                    .map_err(|_| Error::Platform("E2E capture state is poisoned".into()))?
+                    .draw_count;
+                let _ = accepted.send(draw_count);
                 Ok(Some(DisplayEvent::Key {
                     code,
                     pressed: true,
@@ -292,13 +311,18 @@ fn handle_command(
         if arguments.next().is_some() {
             return Err("invalid_key".into());
         }
+        let (accepted, acceptance) = mpsc::channel();
         sender
             .send(ControlMessage::Key {
                 code: key_code(name)?,
                 hold,
+                accepted,
             })
             .map_err(|_| "runtime_exited".to_string())?;
-        return Ok("OK key".into());
+        let draw_count = acceptance
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| "key_accept_timeout".to_string())?;
+        return Ok(format!("OK key draw_count {draw_count}"));
     }
     if let Some(arguments) = command.strip_prefix("CLICK ") {
         let mut arguments = arguments.split_whitespace();

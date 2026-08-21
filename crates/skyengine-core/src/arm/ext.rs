@@ -757,6 +757,11 @@ impl ExtRuntime {
                 (1_218, 0) => cpu.set_register(0, 1_001),
                 // Network request compatibility version used by message.ext.
                 (1_205, 0) => cpu.set_register(0, 1_001),
+                // Native audio wrappers use a five-step multimedia volume. The
+                // deterministic profile has no output device, but still accepts
+                // and acknowledges valid gain changes so guest audio state can
+                // advance independently of the host sink.
+                (1_302, volume) if volume <= 5 => cpu.set_register(0, 0),
                 // Optional dual-SIM selection probe. A false result keeps the
                 // guest on its default network selection path.
                 (1_327, 0) => cpu.set_register(0, u32::MAX),
@@ -764,7 +769,10 @@ impl ExtRuntime {
                 (1_328, 0) => cpu.set_register(0, u32::MAX),
                 (command, argument) => {
                     return Err(Error::Abi(format!(
-                        "unsupported platform slot 37 command ({command}, {argument}) called by module {module}"
+                        "unsupported platform slot 37 command ({command}, {argument}) called by module {module} at LR {:#010x} (r2={:#010x}, r3={:#010x})",
+                        cpu.register(14),
+                        cpu.register(2),
+                        cpu.register(3),
                     )));
                 }
             },
@@ -3211,6 +3219,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(cpu.register(0), 1_001);
+    }
+
+    #[test]
+    fn platform_audio_volume_accepts_supported_levels() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let mut cpu = ArmCpu::new();
+
+        for volume in 0..=5 {
+            cpu.set_register(0, 1_302);
+            cpu.set_register(1, volume);
+            runtime
+                .dispatch(37, 0, &mut cpu, &mut StubServices)
+                .unwrap();
+            assert_eq!(cpu.register(0), 0, "volume {volume}");
+        }
+
+        cpu.set_register(0, 1_302);
+        cpu.set_register(1, 6);
+        assert!(matches!(
+            runtime.dispatch(37, 0, &mut cpu, &mut StubServices),
+            Err(Error::Abi(message)) if message.contains("command (1302, 6)")
+        ));
     }
 
     #[test]

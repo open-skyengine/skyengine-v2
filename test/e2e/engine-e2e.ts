@@ -181,9 +181,9 @@ export class SkyEngineE2e {
    * ENTER/SELECT, ESC/ESCAPE/POWER, SOFTLEFT/LEFT_SOFT, SOFTRIGHT/RIGHT_SOFT,
    * UP, DOWN, LEFT, RIGHT, SEND, STAR/*, POUND/HASH/#, digits 0-9, letters A-Z.
    *
-   * holdMs: 显式物理按住时长(毫秒),覆盖 VMRP_E2E_KEY_HOLD_MS。省略时由
-   * 主线程在首个后续 guest timer 返回时闭环 KEYUP；显式时长可表达重复键或
-   * 长按菜单。点击和粘贴使用独立的 VMRP_E2E_HOLD_MS。
+   * holdMs: 显式物理按住时长(毫秒),覆盖 VMRP_E2E_KEY_HOLD_MS；显式时长可
+   * 表达重复键或长按菜单。KEY 响应携带运行时线程取走 KEYDOWN 时的 draw
+   * baseline，避免把排队期间无关的 timer 帧误当作按键结果。
    */
   async key(
     name: KeyName,
@@ -195,12 +195,14 @@ export class SkyEngineE2e {
       : { timeoutMs: 2_000, waitForDraw: true, ...optionsOrTimeout };
     const previous = options.waitForDraw ? await this.drawCount() : undefined;
     const response = await this.command(options.holdMs != null ? `KEY ${name} ${options.holdMs}` : `KEY ${name}`);
+    const accepted = /^OK key draw_count (\d+)$/.exec(response);
+    const drawBaseline = accepted ? Number(accepted[1]) : previous;
     // editCreate and other valid state-only actions do not submit a bitmap.  Let
     // callers express that contract instead of accepting an unrelated timer draw.
     // A key may also complete by intentionally terminating the runtime; the server
     // reports that terminal state explicitly because no later draw can exist.
-    if (previous != null && !response.endsWith(" exited")) {
-      await this.waitDrawAfter(previous, options.timeoutMs);
+    if (drawBaseline != null && !response.endsWith(" exited")) {
+      await this.waitDrawAfter(drawBaseline, options.timeoutMs);
     }
   }
 
