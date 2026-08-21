@@ -16,6 +16,7 @@ use skyengine_core::{DisplayEvent, Error, Framebuffer, PlatformDisplay, Result};
 
 const FRAME_HISTORY_LIMIT: usize = 128;
 const DEFAULT_KEY_HOLD_MS: u64 = 80;
+const DEFAULT_POINTER_HOLD_MS: u64 = 80;
 
 #[derive(Clone)]
 struct CapturedFrame {
@@ -41,6 +42,7 @@ struct CaptureState {
 enum ControlMessage {
     Event(DisplayEvent),
     Key { code: i32, hold: Duration },
+    Pointer { x: i32, y: i32, hold: Duration },
 }
 
 pub(crate) struct E2eDisplay {
@@ -48,15 +50,29 @@ pub(crate) struct E2eDisplay {
     commands: Receiver<ControlMessage>,
     queued_events: VecDeque<DisplayEvent>,
     key_releases: Vec<(Instant, i32)>,
+    pointer_releases: Vec<(Instant, i32, i32)>,
 }
 
 impl E2eDisplay {
-    pub(crate) fn new(socket_path: PathBuf) -> Result<Self> {
+    pub(crate) fn new(socket_path: PathBuf, width: u16, height: u16) -> Result<Self> {
         let listener = UnixListener::bind(&socket_path).map_err(|source| Error::Io {
             path: socket_path,
             source,
         })?;
-        let state = Arc::new(CaptureState::default());
+        let initial = CapturedFrame {
+            width,
+            height,
+            pixels: vec![0; usize::from(width) * usize::from(height)],
+        };
+        let mut data = CaptureData {
+            latest: Some(initial.clone()),
+            ..CaptureData::default()
+        };
+        data.history.push_back((0, initial));
+        let state = Arc::new(CaptureState {
+            data: Mutex::new(data),
+            changed: Condvar::new(),
+        });
         let (sender, commands) = mpsc::channel();
         let server_state = Arc::clone(&state);
         thread::Builder::new()
@@ -68,10 +84,11 @@ impl E2eDisplay {
             commands,
             queued_events: VecDeque::new(),
             key_releases: Vec::new(),
+            pointer_releases: Vec::new(),
         })
     }
 
-    fn queue_due_key_releases(&mut self) {
+    fn queue_due_releases(&mut self) {
         let now = Instant::now();
         let mut index = 0;
         while index < self.key_releases.len() {
@@ -79,6 +96,19 @@ impl E2eDisplay {
                 let (_, code) = self.key_releases.swap_remove(index);
                 self.queued_events.push_back(DisplayEvent::Key {
                     code,
+                    pressed: false,
+                });
+            } else {
+                index += 1;
+            }
+        }
+        let mut index = 0;
+        while index < self.pointer_releases.len() {
+            if self.pointer_releases[index].0 <= now {
+                let (_, x, y) = self.pointer_releases.swap_remove(index);
+                self.queued_events.push_back(DisplayEvent::Pointer {
+                    x,
+                    y,
                     pressed: false,
                 });
             } else {
@@ -121,7 +151,7 @@ impl PlatformDisplay for E2eDisplay {
     }
 
     fn poll_event(&mut self) -> Result<Option<DisplayEvent>> {
-        self.queue_due_key_releases();
+        self.queue_due_releases();
         if let Some(event) = self.queued_events.pop_front() {
             return Ok(Some(event));
         }
@@ -137,6 +167,17 @@ impl PlatformDisplay for E2eDisplay {
                     pressed: true,
                 }))
             }
+            Ok(ControlMessage::Pointer { x, y, hold }) => {
+                let deadline = Instant::now()
+                    .checked_add(hold)
+                    .unwrap_or_else(Instant::now);
+                self.pointer_releases.push((deadline, x, y));
+                Ok(Some(DisplayEvent::Pointer {
+                    x,
+                    y,
+                    pressed: true,
+                }))
+            }
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Ok(Some(DisplayEvent::Quit)),
         }
@@ -149,6 +190,11 @@ impl PlatformDisplay for E2eDisplay {
             .key_releases
             .iter()
             .map(|(deadline, _)| deadline.saturating_duration_since(now))
+            .chain(
+                self.pointer_releases
+                    .iter()
+                    .map(|(deadline, _, _)| deadline.saturating_duration_since(now)),
+            )
             .min();
         thread::sleep(until_release.map_or(requested, |delay| delay.min(requested)));
     }
@@ -254,6 +300,26 @@ fn handle_command(
             .map_err(|_| "runtime_exited".to_string())?;
         return Ok("OK key".into());
     }
+    if let Some(arguments) = command.strip_prefix("CLICK ") {
+        let mut arguments = arguments.split_whitespace();
+        let x = parse_i32(arguments.next(), "pointer_x")?;
+        let y = parse_i32(arguments.next(), "pointer_y")?;
+        let hold = match arguments.next() {
+            Some(value) => Duration::from_millis(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid_pointer_hold".to_string())?,
+            ),
+            None => Duration::from_millis(default_pointer_hold_ms()),
+        };
+        if arguments.next().is_some() {
+            return Err("invalid_click".into());
+        }
+        sender
+            .send(ControlMessage::Pointer { x, y, hold })
+            .map_err(|_| "runtime_exited".to_string())?;
+        return Ok("OK click".into());
+    }
     if command == "QUIT" {
         sender
             .send(ControlMessage::Event(DisplayEvent::Quit))
@@ -317,11 +383,25 @@ fn parse_u64(value: Option<&str>, label: &str) -> std::result::Result<u64, Strin
         .map_err(|_| format!("invalid_{label}"))
 }
 
+fn parse_i32(value: Option<&str>, label: &str) -> std::result::Result<i32, String> {
+    value
+        .ok_or_else(|| format!("missing_{label}"))?
+        .parse::<i32>()
+        .map_err(|_| format!("invalid_{label}"))
+}
+
 fn default_key_hold_ms() -> u64 {
     std::env::var("VMRP_E2E_KEY_HOLD_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_KEY_HOLD_MS)
+}
+
+fn default_pointer_hold_ms() -> u64 {
+    std::env::var("VMRP_E2E_HOLD_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_POINTER_HOLD_MS)
 }
 
 fn key_code(name: &str) -> std::result::Result<i32, String> {

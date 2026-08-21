@@ -38,11 +38,13 @@ const TRAP_BASE: u32 = 0xff00_0000;
 const RETURN_SENTINEL: u32 = 0xffff_ff00;
 const PLATFORM_SLOT_COUNT: u32 = 150;
 const INSTRUCTION_BUDGET: u64 = 20_000_000;
+const MD5_BUFFER_OFFSET: u32 = 24;
 
 pub(crate) trait NativeServices {
     fn read_package_file(&mut self, package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>>;
     fn file_info(&mut self, name: &[u8]) -> Result<i32>;
     fn remove_file(&mut self, name: &[u8]) -> Result<i32>;
+    fn rename_file(&mut self, source: &[u8], destination: &[u8]) -> Result<i32>;
     fn create_dir(&mut self, name: &[u8]) -> Result<i32>;
     fn remove_dir(&mut self, name: &[u8]) -> Result<i32>;
     fn open_file(&mut self, name: &[u8], mode: u32) -> Result<i32>;
@@ -50,7 +52,7 @@ pub(crate) trait NativeServices {
     fn write_file(&mut self, handle: i32, bytes: &[u8]) -> Result<Option<usize>>;
     fn read_file(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>>;
     fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<bool>;
-    fn file_len(&mut self, handle: i32) -> Result<Option<u64>>;
+    fn file_len(&mut self, name: &[u8]) -> Result<Option<u64>>;
     fn char_bitmap(&mut self, codepoint: u32, font: u32) -> Result<Option<(Vec<u8>, u32, u32)>>;
     fn draw_bitmap(
         &mut self,
@@ -130,6 +132,7 @@ pub(crate) struct ExtRuntime {
     active_helper: Option<GuestFunction>,
     heap_cursor: u32,
     heap_len: usize,
+    platform_memory_extensions: BTreeMap<u32, (usize, u32)>,
     random_state: u32,
     glyphs: BTreeMap<(u32, u32), GuestGlyph>,
     dialogs: BTreeMap<u32, PlatformDialog>,
@@ -244,6 +247,7 @@ impl ExtRuntime {
             active_helper: None,
             heap_cursor: HEAP_BASE.0,
             heap_len,
+            platform_memory_extensions: BTreeMap::new(),
             random_state: 1,
             glyphs: BTreeMap::new(),
             dialogs: BTreeMap::new(),
@@ -679,6 +683,16 @@ impl ExtRuntime {
             33 => {
                 cpu.set_register(0, self.clock_origin.elapsed().as_millis() as u32);
             }
+            34 => {
+                let output = GuestAddr(cpu.register(0));
+                self.memory.write_u16(output, 2012)?;
+                self.memory.write(
+                    output.checked_add(2)?,
+                    // month, day, hour, minute, second, weekday (Sunday = 0)
+                    &[6, 20, 0, 0, 0, 3],
+                )?;
+                cpu.set_register(0, 0);
+            }
             35 => {
                 // No device identity provider is configured. Callers treat -1
                 // as an unavailable optional user-info record.
@@ -694,10 +708,21 @@ impl ExtRuntime {
                 }
             },
             38 => match cpu.register(0) {
+                // Requests an additional guest-memory arena. The requested byte
+                // count is carried in input_len even though input is null; the
+                // returned arena follows the normal mr_platEx output convention.
+                1_014 if cpu.register(1) == 0 => self.allocate_platform_memory_extension(cpu)?,
+                // Releases an arena returned by command 1014. The ABI carries
+                // the 32-bit guest address as a four-byte input buffer.
+                1_015 => self.release_platform_memory_extension(cpu)?,
                 // Optional device identifier query. No device-info provider is configured.
                 1_204 => cpu.set_register(0, u32::MAX),
                 // Optional platform metadata query. No metadata provider is configured.
                 1_222 => self.return_unavailable_platform_extension(cpu)?,
+                // Optional platform control/query without input or output buffers.
+                1_223 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
+                    cpu.set_register(0, u32::MAX)
+                }
                 command => {
                     return Err(Error::Abi(format!(
                         "unsupported platform slot 38 command {command} called by module {module}"
@@ -749,7 +774,8 @@ impl ExtRuntime {
                 cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
             }
             46 => {
-                let result = services.file_len(cpu.register(0) as i32)?;
+                let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                let result = services.file_len(&name)?;
                 cpu.set_register(
                     0,
                     result
@@ -760,6 +786,11 @@ impl ExtRuntime {
             47 => {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
                 cpu.set_register(0, services.remove_file(&name)? as u32);
+            }
+            48 => {
+                let source = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                let destination = self.read_c_string(GuestAddr(cpu.register(1)), 1024)?;
+                cpu.set_register(0, services.rename_file(&source, &destination)? as u32);
             }
             49 | 50 => {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
@@ -772,6 +803,11 @@ impl ExtRuntime {
             }
             54 => {
                 self.exit_requested = true;
+                cpu.set_register(0, 0);
+            }
+            58 => {
+                // The headless profile uses an explicit no-output audio sink.
+                // Stopping an absent or completed sound remains idempotent.
                 cpu.set_register(0, 0);
             }
             61 => {
@@ -812,6 +848,22 @@ impl ExtRuntime {
                 let height = self.memory.read_u32(data_slot_address(93))?;
                 self.memory.write_u32(info, width)?;
                 self.memory.write_u32(info.checked_add(4)?, height)?;
+                cpu.set_register(0, 0);
+            }
+            113 => {
+                self.md5_init(GuestAddr(cpu.register(0)))?;
+                cpu.set_register(0, 0);
+            }
+            114 => {
+                let context = GuestAddr(cpu.register(0));
+                let input = self
+                    .memory
+                    .read(GuestAddr(cpu.register(1)), cpu.register(2) as usize)?;
+                self.md5_append(context, &input)?;
+                cpu.set_register(0, 0);
+            }
+            115 => {
+                self.md5_finish(GuestAddr(cpu.register(0)), GuestAddr(cpu.register(1)))?;
                 cpu.set_register(0, 0);
             }
             119 => {
@@ -1081,6 +1133,83 @@ impl ExtRuntime {
         Ok(())
     }
 
+    fn md5_init(&mut self, context: GuestAddr) -> Result<()> {
+        self.memory.write_u32(context, 0)?;
+        self.memory.write_u32(context.checked_add(4)?, 0)?;
+        for (index, value) in [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
+            .into_iter()
+            .enumerate()
+        {
+            self.memory
+                .write_u32(context.checked_add(8 + index as u32 * 4)?, value)?;
+        }
+        self.memory
+            .write(context.checked_add(MD5_BUFFER_OFFSET)?, &[0; 64])
+    }
+
+    fn md5_append(&mut self, context: GuestAddr, input: &[u8]) -> Result<()> {
+        let total = u64::from(self.memory.read_u32(context)?)
+            | (u64::from(self.memory.read_u32(context.checked_add(4)?)?) << 32);
+        let next_total = total
+            .checked_add(input.len() as u64)
+            .ok_or_else(|| Error::Abi("MD5 byte count overflow".into()))?;
+        let mut state = [0_u32; 4];
+        for (index, value) in state.iter_mut().enumerate() {
+            *value = self
+                .memory
+                .read_u32(context.checked_add(8 + index as u32 * 4)?)?;
+        }
+        let mut buffer: [u8; 64] = self
+            .memory
+            .read(context.checked_add(MD5_BUFFER_OFFSET)?, 64)?
+            .try_into()
+            .expect("checked MD5 buffer length");
+        md5_consume(&mut state, &mut buffer, (total % 64) as usize, input);
+
+        self.memory.write_u32(context, next_total as u32)?;
+        self.memory
+            .write_u32(context.checked_add(4)?, (next_total >> 32) as u32)?;
+        for (index, value) in state.into_iter().enumerate() {
+            self.memory
+                .write_u32(context.checked_add(8 + index as u32 * 4)?, value)?;
+        }
+        self.memory
+            .write(context.checked_add(MD5_BUFFER_OFFSET)?, &buffer)
+    }
+
+    fn md5_finish(&mut self, context: GuestAddr, output: GuestAddr) -> Result<()> {
+        let total = u64::from(self.memory.read_u32(context)?)
+            | (u64::from(self.memory.read_u32(context.checked_add(4)?)?) << 32);
+        let mut state = [0_u32; 4];
+        for (index, value) in state.iter_mut().enumerate() {
+            *value = self
+                .memory
+                .read_u32(context.checked_add(8 + index as u32 * 4)?)?;
+        }
+        let mut buffer: [u8; 64] = self
+            .memory
+            .read(context.checked_add(MD5_BUFFER_OFFSET)?, 64)?
+            .try_into()
+            .expect("checked MD5 buffer length");
+        let buffered = (total % 64) as usize;
+        let padding_len = if buffered < 56 {
+            56 - buffered
+        } else {
+            120 - buffered
+        };
+        let mut padding = vec![0; padding_len + 8];
+        padding[0] = 0x80;
+        padding[padding_len..].copy_from_slice(&total.wrapping_mul(8).to_le_bytes());
+        let remaining = md5_consume(&mut state, &mut buffer, buffered, &padding);
+        debug_assert_eq!(remaining, 0);
+
+        let mut digest = [0_u8; 16];
+        for (chunk, value) in digest.chunks_exact_mut(4).zip(state) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        self.memory.write(output, &digest)
+    }
+
     fn return_unavailable_platform_extension(&mut self, cpu: &mut ArmCpu) -> Result<()> {
         let output = GuestAddr(cpu.register(3));
         if output.0 != 0 {
@@ -1091,6 +1220,74 @@ impl ExtRuntime {
             self.memory.write_u32(output_len, 0)?;
         }
         cpu.set_register(0, u32::MAX);
+        Ok(())
+    }
+
+    fn allocate_platform_memory_extension(&mut self, cpu: &mut ArmCpu) -> Result<()> {
+        let requested_len = cpu.register(2) as usize;
+        if requested_len == 0 {
+            return Err(Error::Abi(
+                "platform memory extension requested zero bytes".into(),
+            ));
+        }
+        let output = GuestAddr(cpu.register(3));
+        if output.0 == 0 {
+            return Err(Error::Abi(
+                "platform memory extension has a null output pointer".into(),
+            ));
+        }
+        let output_len = GuestAddr(self.memory.read_u32(GuestAddr(cpu.register(13)))?);
+        if output_len.0 == 0 {
+            return Err(Error::Abi(
+                "platform memory extension has a null output-length pointer".into(),
+            ));
+        }
+
+        let previous_heap_cursor = self.heap_cursor;
+        let arena = self.allocate(requested_len, 8)?;
+        self.memory.write(arena, &vec![0; requested_len])?;
+        self.platform_memory_extensions
+            .insert(arena.0, (requested_len, previous_heap_cursor));
+        self.memory.write_u32(output, arena.0)?;
+        self.memory.write_u32(output_len, cpu.register(2))?;
+        cpu.set_register(0, 0);
+        Ok(())
+    }
+
+    fn release_platform_memory_extension(&mut self, cpu: &mut ArmCpu) -> Result<()> {
+        let arena = GuestAddr(cpu.register(1));
+        if cpu.register(2) != 4 {
+            return Err(Error::Abi(format!(
+                "platform memory extension release input is {} bytes, expected 4",
+                cpu.register(2)
+            )));
+        }
+        let (len, previous_heap_cursor) = self
+            .platform_memory_extensions
+            .remove(&arena.0)
+            .ok_or_else(|| {
+                Error::Abi(format!(
+                    "platform memory extension release references unknown arena {:#010x}",
+                    arena.0
+                ))
+            })?;
+        self.memory.write(arena, &vec![0; len])?;
+
+        let end = arena
+            .0
+            .checked_add(u32::try_from(len).map_err(|_| {
+                Error::Abi(format!(
+                    "platform memory extension length {len} exceeds u32"
+                ))
+            })?)
+            .ok_or_else(|| Error::Abi("platform memory extension end overflow".into()))?;
+        if end == self.heap_cursor {
+            self.heap_cursor = previous_heap_cursor;
+            let heap_end = HEAP_BASE.0 + self.heap_len as u32;
+            self.memory
+                .write_u32(data_slot_address(111), heap_end - self.heap_cursor)?;
+        }
+        cpu.set_register(0, 0);
         Ok(())
     }
 
@@ -1944,6 +2141,136 @@ impl ExtRuntime {
     }
 }
 
+fn md5_consume(
+    state: &mut [u32; 4],
+    buffer: &mut [u8; 64],
+    mut buffered: usize,
+    mut input: &[u8],
+) -> usize {
+    if buffered != 0 {
+        let copied = (64 - buffered).min(input.len());
+        buffer[buffered..buffered + copied].copy_from_slice(&input[..copied]);
+        buffered += copied;
+        input = &input[copied..];
+        if buffered == 64 {
+            md5_transform(state, buffer);
+            buffered = 0;
+        }
+    }
+    while input.len() >= 64 {
+        let block: &[u8; 64] = input[..64].try_into().expect("checked MD5 block length");
+        md5_transform(state, block);
+        input = &input[64..];
+    }
+    if !input.is_empty() {
+        buffer[..input.len()].copy_from_slice(input);
+        buffered = input.len();
+    }
+    buffered
+}
+
+fn md5_transform(state: &mut [u32; 4], block: &[u8; 64]) {
+    const SHIFTS: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const CONSTANTS: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+
+    let mut words = [0_u32; 16];
+    for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
+        *word = u32::from_le_bytes(bytes.try_into().expect("four-byte MD5 word"));
+    }
+    let [mut a, mut b, mut c, mut d] = *state;
+    for index in 0..64 {
+        let (function, word) = match index {
+            0..=15 => ((b & c) | (!b & d), index),
+            16..=31 => ((d & b) | (!d & c), (5 * index + 1) % 16),
+            32..=47 => (b ^ c ^ d, (3 * index + 5) % 16),
+            _ => (c ^ (b | !d), (7 * index) % 16),
+        };
+        let next = b.wrapping_add(
+            a.wrapping_add(function)
+                .wrapping_add(CONSTANTS[index])
+                .wrapping_add(words[word])
+                .rotate_left(SHIFTS[index]),
+        );
+        a = d;
+        d = c;
+        c = b;
+        b = next;
+    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+}
+
 impl BitmapTransform {
     fn apply(self, x: i64, y: i64) -> (i64, i64) {
         (
@@ -2120,6 +2447,10 @@ mod tests {
             Ok(0)
         }
 
+        fn rename_file(&mut self, _source: &[u8], _destination: &[u8]) -> Result<i32> {
+            Ok(0)
+        }
+
         fn create_dir(&mut self, _name: &[u8]) -> Result<i32> {
             Ok(0)
         }
@@ -2148,7 +2479,7 @@ mod tests {
             Ok(false)
         }
 
-        fn file_len(&mut self, _handle: i32) -> Result<Option<u64>> {
+        fn file_len(&mut self, _name: &[u8]) -> Result<Option<u64>> {
             Ok(None)
         }
 
@@ -2378,6 +2709,157 @@ mod tests {
     }
 
     #[test]
+    fn datetime_uses_the_deterministic_headless_baseline() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let output = runtime.allocate(8, 2).unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, output.0);
+
+        runtime
+            .dispatch(34, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(
+            runtime.memory.read(output, 8).unwrap(),
+            [0xdc, 0x07, 6, 20, 0, 0, 0, 3]
+        );
+    }
+
+    #[test]
+    fn headless_audio_stop_is_idempotent() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 7);
+
+        runtime
+            .dispatch(58, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 0);
+    }
+
+    #[test]
+    fn md5_slots_support_incremental_and_cross_block_inputs() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let context = runtime.allocate(88, 4).unwrap();
+        let digest = runtime.allocate(16, 4).unwrap();
+        let input = runtime.allocate(80, 4).unwrap();
+        let bytes = (0_u8..80).collect::<Vec<_>>();
+        runtime.memory.write(input, &bytes).unwrap();
+        let mut cpu = ArmCpu::new();
+
+        cpu.set_register(0, context.0);
+        runtime
+            .dispatch(113, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        cpu.set_register(0, context.0);
+        cpu.set_register(1, input.0);
+        cpu.set_register(2, 17);
+        runtime
+            .dispatch(114, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        cpu.set_register(0, context.0);
+        cpu.set_register(1, input.checked_add(17).unwrap().0);
+        cpu.set_register(2, 63);
+        runtime
+            .dispatch(114, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        cpu.set_register(0, context.0);
+        cpu.set_register(1, digest.0);
+        runtime
+            .dispatch(115, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        let incremental = runtime.memory.read(digest, 16).unwrap();
+
+        cpu.set_register(0, context.0);
+        runtime
+            .dispatch(113, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        cpu.set_register(0, context.0);
+        cpu.set_register(1, input.0);
+        cpu.set_register(2, 80);
+        runtime
+            .dispatch(114, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        cpu.set_register(0, context.0);
+        cpu.set_register(1, digest.0);
+        runtime
+            .dispatch(115, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(runtime.memory.read(digest, 16).unwrap(), incremental);
+
+        cpu.set_register(0, context.0);
+        runtime
+            .dispatch(113, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        cpu.set_register(0, context.0);
+        cpu.set_register(1, digest.0);
+        runtime
+            .dispatch(115, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(
+            runtime.memory.read(digest, 16).unwrap(),
+            [
+                0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+                0x42, 0x7e,
+            ]
+        );
+    }
+
+    #[test]
+    fn platform_memory_extension_returns_a_zeroed_guest_arena() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let output = runtime.allocate(4, 4).unwrap();
+        let output_len = runtime.allocate(4, 4).unwrap();
+        let stack = runtime.allocate(4, 4).unwrap();
+        runtime.memory.write_u32(stack, output_len.0).unwrap();
+        let heap_cursor_before = runtime.heap_cursor;
+        let free_before = runtime.memory.read_u32(data_slot_address(111)).unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 1_014);
+        cpu.set_register(2, 32);
+        cpu.set_register(3, output.0);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        let arena = GuestAddr(runtime.memory.read_u32(output).unwrap());
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(arena.0 % 8, 0);
+        assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 32);
+        assert_eq!(runtime.memory.read(arena, 32).unwrap(), vec![0; 32]);
+
+        runtime.memory.write_u32(arena, 0xaaaa_aaaa).unwrap();
+        cpu.set_register(0, 1_015);
+        cpu.set_register(1, arena.0);
+        cpu.set_register(2, 4);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(runtime.heap_cursor, heap_cursor_before);
+        assert_eq!(
+            runtime.memory.read_u32(data_slot_address(111)).unwrap(),
+            free_before
+        );
+        assert_eq!(runtime.memory.read(arena, 32).unwrap(), vec![0; 32]);
+        cpu.set_register(0, 1_015);
+        assert!(matches!(
+            runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
+            Err(Error::Abi(message)) if message.contains("unknown arena")
+        ));
+    }
+
+    #[test]
     fn unavailable_platform_extension_clears_its_output_fields() {
         let mut runtime =
             ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -2399,6 +2881,15 @@ mod tests {
         assert_eq!(cpu.register(0) as i32, -1);
         assert_eq!(runtime.memory.read_u32(output).unwrap(), 0);
         assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0);
+
+        cpu.set_register(0, 1_223);
+        cpu.set_register(1, 0);
+        cpu.set_register(2, 0);
+        cpu.set_register(3, 0);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0) as i32, -1);
     }
 
     #[test]

@@ -126,7 +126,7 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     if let Some(socket_path) = env::var_os("SKYENGINE_E2E_SOCKET") {
         #[cfg(unix)]
         {
-            let display = e2e::E2eDisplay::new(PathBuf::from(socket_path))?;
+            let display = e2e::E2eDisplay::new(PathBuf::from(socket_path), width, height)?;
             return Runtime::load(config, Box::new(display))?.run();
         }
         #[cfg(not(unix))]

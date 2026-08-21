@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -41,6 +41,11 @@ struct DirectorySearch {
     next: usize,
 }
 
+enum NativeFile {
+    Host(File),
+    Package(Cursor<Vec<u8>>),
+}
+
 pub(crate) struct MrHost {
     pub package: Arc<Package>,
     pub framebuffer: Framebuffer,
@@ -51,7 +56,7 @@ pub(crate) struct MrHost {
     bitmaps: BTreeMap<i32, Bitmap>,
     directory_searches: BTreeMap<i32, DirectorySearch>,
     next_directory_handle: i32,
-    native_files: BTreeMap<i32, File>,
+    native_files: BTreeMap<i32, NativeFile>,
     next_native_file_handle: i32,
     sdk_key: Option<i32>,
     current_entry: Vec<u8>,
@@ -655,7 +660,7 @@ impl MrHost {
 struct PackageServices<'a> {
     package: Arc<Package>,
     work_dir: PathBuf,
-    files: &'a mut BTreeMap<i32, File>,
+    files: &'a mut BTreeMap<i32, NativeFile>,
     next_file_handle: &'a mut i32,
     font: &'a [u8],
     framebuffer: &'a mut Framebuffer,
@@ -680,6 +685,26 @@ impl PackageServices<'_> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| package_name == name.as_bytes())
+    }
+
+    fn read_current_package_file(&self, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.package.read_named(name) {
+            Ok(bytes) => return Ok(Some(bytes)),
+            Err(crate::Error::EntryNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let Some(entry_name) = package_entry_path(&self.package.header().internal_name, name)
+        else {
+            return Ok(None);
+        };
+        if entry_name == name {
+            return Ok(None);
+        }
+        match self.package.read_named(&entry_name) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(crate::Error::EntryNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -717,7 +742,12 @@ impl NativeServices for PackageServices<'_> {
         match fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => Ok(1),
             Ok(metadata) if metadata.is_dir() => Ok(2),
-            Ok(_) | Err(_) => Ok(0),
+            Ok(_) => Ok(0),
+            Err(_) => Ok(if self.read_current_package_file(name)?.is_some() {
+                1
+            } else {
+                0
+            }),
         }
     }
 
@@ -726,6 +756,19 @@ impl NativeServices for PackageServices<'_> {
             return Ok(-1);
         };
         Ok(if fs::remove_file(path).is_ok() { 0 } else { -1 })
+    }
+
+    fn rename_file(&mut self, source: &[u8], destination: &[u8]) -> Result<i32> {
+        let (Some(source), Some(destination)) =
+            (self.file_path(source), self.file_path(destination))
+        else {
+            return Ok(-1);
+        };
+        Ok(if fs::rename(source, destination).is_ok() {
+            0
+        } else {
+            -1
+        })
     }
 
     fn create_dir(&mut self, name: &[u8]) -> Result<i32> {
@@ -756,13 +799,20 @@ impl NativeServices for PackageServices<'_> {
         if !read && !write {
             return Ok(-1);
         }
-        let file = OpenOptions::new()
+        let host_file = OpenOptions::new()
             .read(read)
             .write(write)
             .create(mode & 8 != 0)
             .open(path);
-        let Ok(file) = file else {
-            return Ok(-1);
+        let file = match host_file {
+            Ok(file) => NativeFile::Host(file),
+            Err(_) if read && !write && mode & 8 == 0 => {
+                let Some(bytes) = self.read_current_package_file(name)? else {
+                    return Ok(-1);
+                };
+                NativeFile::Package(Cursor::new(bytes))
+            }
+            Err(_) => return Ok(-1),
         };
         let start = *self.next_file_handle;
         loop {
@@ -792,7 +842,10 @@ impl NativeServices for PackageServices<'_> {
         let Some(file) = self.files.get_mut(&handle) else {
             return Ok(None);
         };
-        Ok(file.write(bytes).ok())
+        Ok(match file {
+            NativeFile::Host(file) => file.write(bytes).ok(),
+            NativeFile::Package(_) => None,
+        })
     }
 
     fn read_file(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>> {
@@ -800,7 +853,11 @@ impl NativeServices for PackageServices<'_> {
             return Ok(None);
         };
         let mut bytes = vec![0; len];
-        match file.read(&mut bytes) {
+        let result = match file {
+            NativeFile::Host(file) => file.read(&mut bytes),
+            NativeFile::Package(file) => file.read(&mut bytes),
+        };
+        match result {
             Ok(read) => {
                 bytes.truncate(read);
                 Ok(Some(bytes))
@@ -819,14 +876,22 @@ impl NativeServices for PackageServices<'_> {
             2 => SeekFrom::End(i64::from(offset)),
             _ => return Ok(false),
         };
-        Ok(file.seek(position).is_ok())
+        Ok(match file {
+            NativeFile::Host(file) => file.seek(position).is_ok(),
+            NativeFile::Package(file) => file.seek(position).is_ok(),
+        })
     }
 
-    fn file_len(&mut self, handle: i32) -> Result<Option<u64>> {
-        let Some(file) = self.files.get(&handle) else {
+    fn file_len(&mut self, name: &[u8]) -> Result<Option<u64>> {
+        let Some(path) = self.file_path(name) else {
             return Ok(None);
         };
-        Ok(file.metadata().ok().map(|metadata| metadata.len()))
+        if let Ok(metadata) = fs::metadata(path) {
+            return Ok(metadata.is_file().then_some(metadata.len()));
+        }
+        Ok(self
+            .read_current_package_file(name)?
+            .and_then(|bytes| u64::try_from(bytes.len()).ok()))
     }
 
     fn char_bitmap(&mut self, codepoint: u32, _font: u32) -> Result<Option<(Vec<u8>, u32, u32)>> {
@@ -864,17 +929,45 @@ impl NativeServices for PackageServices<'_> {
     }
 }
 
-fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
-    let path = std::str::from_utf8(bytes).ok()?;
-    let path = Path::new(path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
+fn package_entry_path(internal_name: &[u8], guest_name: &[u8]) -> Option<Vec<u8>> {
+    let components = guest_name
+        .split(|byte| matches!(byte, b'/' | b'\\'))
+        .filter(|component| !component.is_empty() && *component != b".")
+        .collect::<Vec<_>>();
+    if components.is_empty() || components.iter().any(|component| *component == b"..") {
         return None;
     }
-    Some(work_dir.join(path))
+    let package_stem = internal_name.strip_suffix(b".mrp").unwrap_or(internal_name);
+    let components = if components.len() > 1 && components[0] == package_stem {
+        &components[1..]
+    } else {
+        &components[..]
+    };
+    let mut path = Vec::new();
+    for component in components {
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(component);
+    }
+    Some(path)
+}
+
+fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
+    let path = std::str::from_utf8(bytes).ok()?;
+    if path.starts_with('/') || path.starts_with('\\') {
+        return None;
+    }
+    let mut resolved = work_dir.to_path_buf();
+    for component in path.split(['/', '\\']) {
+        match component {
+            "" | "." => continue,
+            ".." => return None,
+            component if component.contains('\0') || component.contains(':') => return None,
+            component => resolved.push(component),
+        }
+    }
+    Some(resolved)
 }
 
 fn native_file_path(
@@ -1054,6 +1147,31 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_device_path_separators_inside_the_work_directory() {
+        assert_eq!(
+            safe_work_path(Path::new("device"), b"gxdzc\\res.temp"),
+            Some(PathBuf::from("device/gxdzc/res.temp"))
+        );
+        assert_eq!(
+            safe_work_path(Path::new("device"), b"gxdzc/res.pak"),
+            Some(PathBuf::from("device/gxdzc/res.pak"))
+        );
+    }
+
+    #[test]
+    fn resolves_application_directory_paths_to_package_entries() {
+        assert_eq!(
+            package_entry_path(b"gxdzc.mrp", b"gxdzc\\res.list"),
+            Some(b"res.list".to_vec())
+        );
+        assert_eq!(
+            package_entry_path(b"gxdzc.mrp", b"images\\title.bmp"),
+            Some(b"images/title.bmp".to_vec())
+        );
+        assert_eq!(package_entry_path(b"gxdzc.mrp", b"..\\secret"), None);
+    }
+
+    #[test]
     fn rejects_parent_paths_for_native_files() {
         assert_eq!(
             native_file_path(
@@ -1064,6 +1182,8 @@ mod tests {
             ),
             None
         );
+        assert_eq!(safe_work_path(Path::new("device"), b"..\\app.mrp"), None);
+        assert_eq!(safe_work_path(Path::new("device"), b"C:\\app.mrp"), None);
     }
 
     #[test]
