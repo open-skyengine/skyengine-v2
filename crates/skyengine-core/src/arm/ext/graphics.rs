@@ -217,13 +217,17 @@ impl ExtRuntime {
             let candidate = self
                 .memory
                 .read_u32(GuestAddr(descriptor_len_address - 4))?;
-            let Some(candidate_end) = candidate.checked_add(output_len) else {
-                continue;
-            };
-            if candidate & 3 != 0 || candidate < HEAP_BASE.0 || candidate_end > heap_end {
+            if candidate & 3 != 0 {
                 continue;
             }
             let candidate = GuestAddr(candidate);
+            if self
+                .memory
+                .check_range(candidate, output_len as usize, Permissions::READ_WRITE)
+                .is_err()
+            {
+                continue;
+            }
             if self.memory.read_u32(candidate)? == 0
                 && self.memory.read_u32(candidate.checked_add(4)?)? == aligned_len
             {

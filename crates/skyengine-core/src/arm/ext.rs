@@ -40,7 +40,10 @@ const PLATFORM_STORAGE_INFO_LEN: usize = 16;
 const PLATFORM_STORAGE_DRIVE_DATA: GuestAddr = GuestAddr(0x0100_1a20);
 const PLATFORM_STORAGE_DRIVE_LEN: usize = 2;
 const PLATFORM_USER_INFO_LEN: usize = 64;
-const PLATFORM_USER_INFO_VERSION: u32 = 1_001;
+// Common MTK EXT fixtures identify the 1.0.4 runtime through this encoded version.
+const PLATFORM_USER_INFO_VERSION: u32 = 101_040_000;
+const MTK_NATIVE_EXTENSION_BASE: GuestAddr = GuestAddr(0x4001_8800);
+const MTK_NATIVE_EXTENSION_LEN: usize = MODULE_STRIDE as usize;
 const PLATFORM_STORAGE_BLOCK_SIZE: u32 = 4 * 1024;
 const PLATFORM_STORAGE_AVAILABLE_BLOCKS: u32 = 4 * 1024;
 const INTERNAL_APPLICATION_STATE_OFFSETS: [u32; 2] = [8, 44];
@@ -55,6 +58,7 @@ const STACK_LEN: usize = 256 * 1024;
 const PLATFORM_MEMORY_BASE: GuestAddr = GuestAddr(0x4000_0000);
 const SCREEN_BASE: GuestAddr = GuestAddr(HEAP_BASE.0 + MIN_GUEST_RAM_LEN as u32);
 const FREE_BLOCK_HEADER_LEN: u32 = 8;
+const ALLOCATED_BLOCK_HEADER_LEN: u32 = FREE_BLOCK_HEADER_LEN;
 const HEAP_ALIGNMENT: u32 = 8;
 const BITMAP_ENTRY_SIZE: u32 = 16;
 const SCREEN_BITMAP_ID: u32 = 30;
@@ -525,8 +529,33 @@ impl ExtRuntime {
         write_platform_string(&mut self.memory, PREVIOUS_START_NAME_DATA, entry)
     }
 
-    pub fn set_device_info_profile(&mut self, profile: DeviceInfoProfile) {
+    pub fn set_device_info_profile(&mut self, profile: DeviceInfoProfile) -> Result<()> {
+        if profile == self.device_info_profile {
+            return Ok(());
+        }
+        if self.device_info_profile != DeviceInfoProfile::Unavailable {
+            return Err(Error::Abi(
+                "device-information profile cannot change after configuration".into(),
+            ));
+        }
+        if profile == DeviceInfoProfile::DeterministicMtk {
+            self.memory.map(
+                MTK_NATIVE_EXTENSION_BASE,
+                MTK_NATIVE_EXTENSION_LEN,
+                Permissions::READ_WRITE,
+                "MTK native extension window",
+            )?;
+            let window_end = MTK_NATIVE_EXTENSION_BASE
+                .0
+                .checked_add(MTK_NATIVE_EXTENSION_LEN as u32)
+                .ok_or_else(|| Error::ArmFault("MTK extension window end overflow".into()))?;
+            self.platform_memory_cursor = window_end
+                .checked_add(0xfff)
+                .map(|address| address & !0xfff)
+                .ok_or_else(|| Error::ArmFault("platform memory cursor overflow".into()))?;
+        }
         self.device_info_profile = profile;
+        Ok(())
     }
 
     pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
@@ -679,10 +708,36 @@ impl ExtRuntime {
                 });
             }
         }
+        let pc = cpu.pc().0;
+        let instruction = self
+            .memory
+            .read(GuestAddr(pc), if cpu.is_thumb() { 2 } else { 4 })
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|_| "unavailable".into());
         Err(Error::ArmFault(format!(
-            "instruction budget {INSTRUCTION_BUDGET} exhausted in module {} at PC {:#010x}",
+            "instruction budget {INSTRUCTION_BUDGET} exhausted in module {} at PC {pc:#010x} (insn={instruction}, cpsr={:#010x}, r0={:#010x}, r1={:#010x}, r2={:#010x}, r3={:#010x}, r4={:#010x}, r5={:#010x}, r6={:#010x}, r7={:#010x}, r8={:#010x}, r9={:#010x}, r10={:#010x}, r11={:#010x}, r12={:#010x}, sp={:#010x}, lr={:#010x})",
             function.module,
-            cpu.pc().0
+            cpu.cpsr(),
+            cpu.register(0),
+            cpu.register(1),
+            cpu.register(2),
+            cpu.register(3),
+            cpu.register(4),
+            cpu.register(5),
+            cpu.register(6),
+            cpu.register(7),
+            cpu.register(8),
+            cpu.register(9),
+            cpu.register(10),
+            cpu.register(11),
+            cpu.register(12),
+            cpu.register(13),
+            cpu.register(14),
         )))
     }
 

@@ -168,8 +168,9 @@ export class SkyEngineE2e {
 
   async click(x: number, y: number, timeoutMs = 2_000): Promise<void> {
     const previous = await this.drawCount();
-    await this.command(`CLICK ${x} ${y}`);
-    await this.waitDrawAfter(previous, timeoutMs);
+    const response = await this.command(`CLICK ${x} ${y}`);
+    const accepted = /^OK click draw_count (\d+)$/.exec(response);
+    await this.waitDrawAfter(accepted ? Number(accepted[1]) : previous, timeoutMs);
   }
 
   async delay(ms: number): Promise<void> {

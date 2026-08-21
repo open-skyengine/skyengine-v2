@@ -1,4 +1,3 @@
-use super::heap::aligned_heap_len;
 use super::*;
 
 impl ExtRuntime {
@@ -23,14 +22,6 @@ impl ExtRuntime {
                     self.free_guest_block(source, old_len)?;
                     cpu.set_register(0, 0);
                 } else if new_len <= old_len {
-                    let old_aligned = aligned_heap_len(old_len)?;
-                    let new_aligned = aligned_heap_len(new_len)?;
-                    if old_aligned - new_aligned >= FREE_BLOCK_HEADER_LEN {
-                        self.free_guest_block(
-                            GuestAddr(source.0.wrapping_add(new_aligned)),
-                            (old_aligned - new_aligned) as usize,
-                        )?;
-                    }
                     cpu.set_register(0, source.0);
                 } else {
                     let Some(output) = self.allocate_guest_block(new_len)? else {

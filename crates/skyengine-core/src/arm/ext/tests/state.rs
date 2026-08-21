@@ -31,6 +31,35 @@ fn guest_allocator_reuses_and_merges_freed_blocks() {
 }
 
 #[test]
+fn guest_allocator_preserves_forward_block_links_before_payloads() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+
+    let first = runtime.allocate_guest_block(1).unwrap().unwrap();
+    let second = runtime.allocate_guest_block(15).unwrap().unwrap();
+    let third = runtime.allocate_guest_block(24).unwrap().unwrap();
+    assert_eq!(
+        first,
+        HEAP_BASE.checked_add(ALLOCATED_BLOCK_HEADER_LEN).unwrap()
+    );
+    assert!(first.0 < second.0 && second.0 < third.0);
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let mut offset = 0;
+    while offset < heap.span {
+        let address = GuestAddr(heap.base.checked_add(offset).unwrap());
+        let next = runtime.memory.read_u32(address).unwrap();
+        assert!(
+            next > offset,
+            "block link did not advance at offset {offset:#x}"
+        );
+        assert!(next <= heap.span, "block link exceeded the heap span");
+        offset = next;
+    }
+    assert_eq!(offset, heap.span);
+}
+
+#[test]
 fn guest_allocator_follows_staged_and_switched_heap_variables() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -45,11 +74,14 @@ fn guest_allocator_follows_staged_and_switched_heap_variables() {
         .memory
         .write_u32(data_slot_address(111), staged_free_left)
         .unwrap();
-    assert_eq!(runtime.allocate_guest_block(16).unwrap(), Some(HEAP_BASE));
+    assert_eq!(
+        runtime.allocate_guest_block(16).unwrap(),
+        Some(HEAP_BASE.checked_add(ALLOCATED_BLOCK_HEADER_LEN).unwrap())
+    );
     let staged = runtime.guest_heap_state().unwrap();
     let (_, staged_terminator) = runtime.read_free_blocks(staged).unwrap();
     assert_eq!(staged_terminator, initial_span);
-    assert_eq!(staged.free_left, staged_free_left - 16);
+    assert_eq!(staged.free_left, staged_free_left - 24);
 
     runtime
         .memory
@@ -84,10 +116,14 @@ fn guest_allocator_follows_staged_and_switched_heap_variables() {
 
     assert_eq!(
         runtime.allocate_guest_block(16).unwrap(),
-        Some(PLATFORM_MEMORY_BASE)
+        Some(
+            PLATFORM_MEMORY_BASE
+                .checked_add(ALLOCATED_BLOCK_HEADER_LEN)
+                .unwrap()
+        )
     );
-    assert_eq!(runtime.read_platform_data_slot(146).unwrap(), 16);
-    assert_eq!(runtime.read_platform_data_slot(111).unwrap(), 0xf0);
+    assert_eq!(runtime.read_platform_data_slot(146).unwrap(), 24);
+    assert_eq!(runtime.read_platform_data_slot(111).unwrap(), 0xe8);
 }
 
 #[test]
@@ -320,11 +356,13 @@ fn compact_ram_package_writes_into_four_and_eight_byte_aligned_wrappers() {
     for alignment in [4, 8] {
         let mut runtime =
             ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
-        if alignment == 4 {
-            runtime.allocate(4, 4).unwrap();
-        }
         let aligned_len = (expected.len() + 7) & !7;
-        let prepared = runtime.allocate(aligned_len, alignment).unwrap();
+        let prepared_offset = if alignment == 4 { 4 } else { 0 };
+        let prepared = runtime
+            .allocate(aligned_len + prepared_offset, alignment)
+            .unwrap()
+            .checked_add(prepared_offset as u32)
+            .unwrap();
         assert_eq!(prepared.0 % 8, if alignment == 4 { 4 } else { 0 });
         runtime.memory.write_u32(prepared, 0).unwrap();
         runtime
@@ -369,6 +407,50 @@ fn compact_ram_package_writes_into_four_and_eight_byte_aligned_wrappers() {
             expected
         );
     }
+}
+
+#[test]
+fn compact_ram_package_accepts_a_prepared_platform_memory_target() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime
+        .set_device_info_profile(DeviceInfoProfile::DeterministicMtk)
+        .unwrap();
+    let output_len = 32_u32;
+    runtime
+        .memory
+        .write_u32(MTK_NATIVE_EXTENSION_BASE, 0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            MTK_NATIVE_EXTENSION_BASE.checked_add(4).unwrap(),
+            output_len,
+        )
+        .unwrap();
+
+    let descriptor = runtime.allocate(8, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(descriptor, MTK_NATIVE_EXTENSION_BASE.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(descriptor.checked_add(4).unwrap(), output_len)
+        .unwrap();
+    let package = runtime.allocate(24, 8).unwrap();
+    let mut compact_header = [0_u8; 24];
+    compact_header[..4].copy_from_slice(b"MRPG");
+    compact_header[4..8].copy_from_slice(&4_u32.to_le_bytes());
+    compact_header[12..16].copy_from_slice(&4_u32.to_le_bytes());
+    runtime.memory.write(package, &compact_header).unwrap();
+
+    assert_eq!(
+        runtime
+            .compact_ram_output_target(package, compact_header.len(), output_len as usize)
+            .unwrap(),
+        Some(MTK_NATIVE_EXTENSION_BASE)
+    );
 }
 
 #[test]

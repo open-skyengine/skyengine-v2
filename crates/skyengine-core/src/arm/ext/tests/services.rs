@@ -105,7 +105,9 @@ fn user_info_reports_unavailable_without_mutating_the_output() {
 fn mtk_user_info_returns_the_deterministic_virtual_device_profile() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
-    runtime.set_device_info_profile(DeviceInfoProfile::DeterministicMtk);
+    runtime
+        .set_device_info_profile(DeviceInfoProfile::DeterministicMtk)
+        .unwrap();
     let output = runtime.allocate(PLATFORM_USER_INFO_LEN, 4).unwrap();
     let mut cpu = ArmCpu::new();
     cpu.set_register(0, output.0);
@@ -131,6 +133,51 @@ fn mtk_user_info_returns_the_deterministic_virtual_device_profile() {
     runtime
         .dispatch(35, 0, &mut cpu, &mut StubServices)
         .unwrap();
+    assert_eq!(cpu.register(0) as i32, -1);
+}
+
+#[test]
+fn mtk_profile_reserves_an_extension_window_until_slot_131_marks_code_executable() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime
+        .set_device_info_profile(DeviceInfoProfile::DeterministicMtk)
+        .unwrap();
+    runtime
+        .memory
+        .write(MTK_NATIVE_EXTENSION_BASE, &[0x70, 0x47])
+        .unwrap();
+
+    assert!(runtime.memory.fetch_u16(MTK_NATIVE_EXTENSION_BASE).is_err());
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 0);
+    cpu.set_register(1, 9);
+    cpu.set_register(2, MTK_NATIVE_EXTENSION_BASE.0);
+    cpu.set_register(3, 2);
+    runtime
+        .dispatch(131, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), 0);
+    assert_eq!(
+        runtime.memory.fetch_u16(MTK_NATIVE_EXTENSION_BASE).unwrap(),
+        0x4770
+    );
+}
+
+#[test]
+fn optional_device_metric_reports_unavailable() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 1_101);
+    cpu.set_register(1, 2);
+
+    runtime
+        .dispatch(37, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
     assert_eq!(cpu.register(0) as i32, -1);
 }
 
@@ -387,6 +434,22 @@ fn text_drawing_accepts_the_baseline_wide_text_flags() {
         Err(Error::Abi(message))
             if message == "unsupported text drawing flags 3 called by module 0"
     ));
+}
+
+#[test]
+fn text_drawing_treats_a_null_text_pointer_as_empty_text() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let stack = runtime.allocate(16, 4).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 0);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(123, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), 0);
 }
 
 #[test]

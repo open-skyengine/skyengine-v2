@@ -150,6 +150,9 @@ impl ExtRuntime {
                 }
                 // Baseline SDK initialization notification; the return value is ignored.
                 (1_106, 0) => cpu.set_register(0, 0),
+                // Optional device metric. Repository EXT callers decode values above
+                // 1000 and explicitly treat -1 as an unavailable neutral result.
+                (1_101, 2) => cpu.set_register(0, u32::MAX),
                 // Report the normal storage profile. 1002 denotes USB mass-storage
                 // mode, in which applications must not access their regular volume.
                 (1_218, 0) => cpu.set_register(0, 1_001),
@@ -575,7 +578,12 @@ impl ExtRuntime {
                         "unsupported text drawing flags {flags} called by module {module}"
                     )));
                 }
-                let text = self.read_wide_string_be(GuestAddr(cpu.register(0)), 64 * 1024)?;
+                let text_address = GuestAddr(cpu.register(0));
+                let text = if text_address.0 == 0 {
+                    Vec::new()
+                } else {
+                    self.read_wide_string_be(text_address, 64 * 1024)?
+                };
                 let color = Framebuffer::rgb565(
                     cpu.register(3) as i32,
                     self.memory.read_u32(stack)? as i32,

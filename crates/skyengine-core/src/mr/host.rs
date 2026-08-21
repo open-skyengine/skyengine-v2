@@ -501,7 +501,7 @@ impl MrHost {
                         )?;
                         runtime.set_device_info_profile(device_info_profile(
                             self.package.header().platform,
-                        ));
+                        ))?;
                         let (previous_package, previous_entry) = self
                             .application_stack
                             .last()

@@ -50,6 +50,7 @@ enum ControlMessage {
         x: i32,
         y: i32,
         hold: Duration,
+        accepted: Sender<u64>,
     },
 }
 
@@ -186,11 +187,23 @@ impl PlatformDisplay for E2eDisplay {
                     pressed: true,
                 }))
             }
-            Ok(ControlMessage::Pointer { x, y, hold }) => {
+            Ok(ControlMessage::Pointer {
+                x,
+                y,
+                hold,
+                accepted,
+            }) => {
                 let deadline = Instant::now()
                     .checked_add(hold)
                     .unwrap_or_else(Instant::now);
                 self.pointer_releases.push((deadline, x, y));
+                let draw_count = self
+                    .state
+                    .data
+                    .lock()
+                    .map_err(|_| Error::Platform("E2E capture state is poisoned".into()))?
+                    .draw_count;
+                let _ = accepted.send(draw_count);
                 Ok(Some(DisplayEvent::Pointer {
                     x,
                     y,
@@ -285,6 +298,18 @@ fn handle_command(
         return Ok(format!("OK screen_draw {draw}"));
     }
     if let Some(path) = command.strip_prefix("SCREEN ") {
+        let needs_first_frame = state
+            .data
+            .lock()
+            .map_err(|_| "capture_state_poisoned".to_string())?
+            .draw_count
+            == 0;
+        if needs_first_frame {
+            // The zero-count frame is only a transport placeholder. A normal
+            // screenshot represents application output; SCREEN_DRAW 0 remains
+            // available to tests that explicitly need the placeholder.
+            wait_draw(state, 0, Duration::from_secs(25))?;
+        }
         let frame = {
             let data = state
                 .data
@@ -339,10 +364,19 @@ fn handle_command(
         if arguments.next().is_some() {
             return Err("invalid_click".into());
         }
+        let (accepted, acceptance) = mpsc::channel();
         sender
-            .send(ControlMessage::Pointer { x, y, hold })
+            .send(ControlMessage::Pointer {
+                x,
+                y,
+                hold,
+                accepted,
+            })
             .map_err(|_| "runtime_exited".to_string())?;
-        return Ok("OK click".into());
+        let draw_count = acceptance
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| "pointer_accept_timeout".to_string())?;
+        return Ok(format!("OK click draw_count {draw_count}"));
     }
     if command == "QUIT" {
         sender
