@@ -11,7 +11,7 @@ use encoding_rs::GBK;
 
 use crate::{
     Framebuffer, Package, PlatformDisplay, Result,
-    arm::{ExtLifecycleRequest, ExtRuntime, GuestAddr, NativeServices},
+    arm::{DeviceInfoProfile, ExtLifecycleRequest, ExtRuntime, GuestAddr, NativeServices},
 };
 
 use super::value::{Table, Value};
@@ -495,6 +495,9 @@ impl MrHost {
                             &self.current_entry,
                             self.memory_limit,
                         )?;
+                        runtime.set_device_info_profile(device_info_profile(
+                            self.package.header().platform,
+                        ));
                         let (previous_package, previous_entry) = self
                             .application_stack
                             .last()
@@ -1016,6 +1019,14 @@ fn package_entry_path(internal_name: &[u8], guest_name: &[u8]) -> Option<Vec<u8>
     Some(path)
 }
 
+fn device_info_profile(platform: u8) -> DeviceInfoProfile {
+    match platform {
+        // The package header explicitly declares the common MTK/MStar ABI.
+        1 => DeviceInfoProfile::DeterministicMtk,
+        _ => DeviceInfoProfile::Unavailable,
+    }
+}
+
 fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
     let path = std::str::from_utf8(bytes).ok()?;
     if path.starts_with('/') || path.starts_with('\\') {
@@ -1219,6 +1230,13 @@ mod tests {
             safe_work_path(Path::new("device"), b"gxdzc/res.pak"),
             Some(PathBuf::from("device/gxdzc/res.pak"))
         );
+    }
+
+    #[test]
+    fn selects_device_info_from_the_declared_package_platform() {
+        assert_eq!(device_info_profile(1), DeviceInfoProfile::DeterministicMtk);
+        assert_eq!(device_info_profile(0), DeviceInfoProfile::Unavailable);
+        assert_eq!(device_info_profile(2), DeviceInfoProfile::Unavailable);
     }
 
     #[test]

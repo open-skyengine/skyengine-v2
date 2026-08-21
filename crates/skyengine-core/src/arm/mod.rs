@@ -3,5 +3,5 @@ mod ext;
 mod memory;
 
 pub use cpu::ArmCpu;
-pub(crate) use ext::{ExtLifecycleRequest, ExtRuntime, NativeServices};
+pub(crate) use ext::{DeviceInfoProfile, ExtLifecycleRequest, ExtRuntime, NativeServices};
 pub use memory::{GuestAddr, GuestMemory, Permissions};

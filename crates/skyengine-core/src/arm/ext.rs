@@ -83,6 +83,12 @@ pub(crate) enum ExtLifecycleRequest {
     Exit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceInfoProfile {
+    Unavailable,
+    DeterministicMtk,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExtLifecycleState {
     pub application: u32,
@@ -152,6 +158,7 @@ pub(crate) struct ExtRuntime {
     next_ui_handle: u32,
     suppressed_ui_key_releases: BTreeSet<i32>,
     exit_requested: bool,
+    device_info_profile: DeviceInfoProfile,
     clock_origin: Instant,
     timer_deadline: Option<Instant>,
 }
@@ -283,6 +290,7 @@ impl ExtRuntime {
             next_ui_handle: 1,
             suppressed_ui_key_releases: BTreeSet::new(),
             exit_requested: false,
+            device_info_profile: DeviceInfoProfile::Unavailable,
             clock_origin: Instant::now(),
             timer_deadline: None,
         })
@@ -458,6 +466,10 @@ impl ExtRuntime {
     pub fn set_previous_application(&mut self, package: &[u8], entry: &[u8]) -> Result<()> {
         write_platform_string(&mut self.memory, PREVIOUS_PACKAGE_NAME_DATA, package)?;
         write_platform_string(&mut self.memory, PREVIOUS_START_NAME_DATA, entry)
+    }
+
+    pub fn set_device_info_profile(&mut self, profile: DeviceInfoProfile) {
+        self.device_info_profile = profile;
     }
 
     pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
@@ -717,11 +729,19 @@ impl ExtRuntime {
             }
             35 => {
                 let output = GuestAddr(cpu.register(0));
-                if output.0 == 0 {
-                    cpu.set_register(0, u32::MAX);
-                } else {
-                    self.memory.write(output, &platform_user_info())?;
-                    cpu.set_register(0, 0);
+                match self.device_info_profile {
+                    DeviceInfoProfile::Unavailable => {
+                        // The baseline profile has no device-information provider.
+                        // Leave the caller-owned output buffer untouched.
+                        cpu.set_register(0, u32::MAX);
+                    }
+                    DeviceInfoProfile::DeterministicMtk if output.0 == 0 => {
+                        cpu.set_register(0, u32::MAX);
+                    }
+                    DeviceInfoProfile::DeterministicMtk => {
+                        self.memory.write(output, &platform_user_info())?;
+                        cpu.set_register(0, 0);
+                    }
                 }
             }
             36 => {
@@ -3076,14 +3096,28 @@ mod tests {
     }
 
     #[test]
-    fn user_info_returns_the_deterministic_virtual_device_profile() {
+    fn user_info_reports_unavailable_without_mutating_the_output() {
         let mut runtime =
             ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
-        let output = runtime.allocate(PLATFORM_USER_INFO_LEN, 4).unwrap();
+        let output = runtime.allocate(64, 4).unwrap();
+        runtime.memory.write(output, &[0xaa; 64]).unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, output.0);
+
         runtime
-            .memory
-            .write(output, &[0xaa; PLATFORM_USER_INFO_LEN])
+            .dispatch(35, 0, &mut cpu, &mut StubServices)
             .unwrap();
+
+        assert_eq!(cpu.register(0) as i32, -1);
+        assert_eq!(runtime.memory.read(output, 64).unwrap(), vec![0xaa; 64]);
+    }
+
+    #[test]
+    fn mtk_user_info_returns_the_deterministic_virtual_device_profile() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        runtime.set_device_info_profile(DeviceInfoProfile::DeterministicMtk);
+        let output = runtime.allocate(PLATFORM_USER_INFO_LEN, 4).unwrap();
         let mut cpu = ArmCpu::new();
         cpu.set_register(0, output.0);
 
@@ -3103,18 +3137,11 @@ mod tests {
                 .unwrap(),
             PLATFORM_USER_INFO_VERSION
         );
-    }
 
-    #[test]
-    fn user_info_rejects_a_null_output_pointer() {
-        let mut runtime =
-            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
-        let mut cpu = ArmCpu::new();
-
+        cpu.set_register(0, 0);
         runtime
             .dispatch(35, 0, &mut cpu, &mut StubServices)
             .unwrap();
-
         assert_eq!(cpu.register(0) as i32, -1);
     }
 
