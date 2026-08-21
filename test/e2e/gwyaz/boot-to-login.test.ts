@@ -26,7 +26,7 @@ describe("gwyaz", () => {
         // rgb(32, 160, 224)
         expect(boot.pixel(89, 266)).toEqual([32, 160, 224]);
       }, {
-        timeout: 60_000,
+        timeout: 30_000,
         interval: 1000
       })
     }
@@ -38,7 +38,7 @@ describe("gwyaz", () => {
         // rgb(32, 160, 224)
         expect(boot.pixel(89, 266)).not.toEqual([32, 160, 224]);
       }, {
-        timeout: 60_000,
+        timeout: 30_000,
         interval: 1000
       })
     }

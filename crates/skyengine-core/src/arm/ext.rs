@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     path::PathBuf,
     sync::Arc,
@@ -62,6 +62,20 @@ pub(crate) trait NativeServices {
     ) -> Result<()>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExtLifecycleRequest {
+    Restart { package: Vec<u8>, entry: Vec<u8> },
+    Exit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExtLifecycleState {
+    pub application: u32,
+    pub callback: Vec<u8>,
+    pub package: Vec<u8>,
+    pub entry: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GuestFunction {
     module: usize,
@@ -83,6 +97,12 @@ struct GuestGlyph {
     address: GuestAddr,
     width: u32,
     height: u32,
+}
+
+#[derive(Debug)]
+struct PlatformDialog {
+    previous_screen: Vec<u8>,
+    dialog_screen: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +132,10 @@ pub(crate) struct ExtRuntime {
     heap_len: usize,
     random_state: u32,
     glyphs: BTreeMap<(u32, u32), GuestGlyph>,
+    dialogs: BTreeMap<u32, PlatformDialog>,
+    next_ui_handle: u32,
+    suppressed_ui_key_releases: BTreeSet<i32>,
+    exit_requested: bool,
     clock_origin: Instant,
     timer_deadline: Option<Instant>,
 }
@@ -222,6 +246,10 @@ impl ExtRuntime {
             heap_len,
             random_state: 1,
             glyphs: BTreeMap::new(),
+            dialogs: BTreeMap::new(),
+            next_ui_handle: 1,
+            suppressed_ui_key_releases: BTreeSet::new(),
+            exit_requested: false,
             clock_origin: Instant::now(),
             timer_deadline: None,
         })
@@ -371,8 +399,73 @@ impl ExtRuntime {
             return Ok(false);
         }
         self.timer_deadline = None;
-        self.memory.write_u32(TIMER_ACTIVE_DATA, 0)?;
         Ok(true)
+    }
+
+    pub fn lifecycle_request(&self) -> Result<Option<ExtLifecycleRequest>> {
+        if self.exit_requested {
+            return Ok(Some(ExtLifecycleRequest::Exit));
+        }
+        let state = self.lifecycle_state()?;
+        if state.callback != b"restart" {
+            return Ok(None);
+        }
+        if state.package.is_empty() || state.entry.is_empty() {
+            return Err(Error::Abi(format!(
+                "restart request has empty package or entry (application state {})",
+                state.application
+            )));
+        }
+        Ok(Some(ExtLifecycleRequest::Restart {
+            package: state.package,
+            entry: state.entry,
+        }))
+    }
+
+    pub fn set_previous_application(&mut self, package: &[u8], entry: &[u8]) -> Result<()> {
+        write_platform_string(&mut self.memory, PREVIOUS_PACKAGE_NAME_DATA, package)?;
+        write_platform_string(&mut self.memory, PREVIOUS_START_NAME_DATA, entry)
+    }
+
+    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
+        if !pressed && self.suppressed_ui_key_releases.remove(&code) {
+            return None;
+        }
+        if self.dialogs.is_empty() {
+            return Some((if pressed { 0 } else { 1 }, code, 0));
+        }
+        if !pressed {
+            return None;
+        }
+        self.suppressed_ui_key_releases.insert(code);
+        match code {
+            // Left soft key and select accept; right soft key and power cancel.
+            17 | 20 => Some((6, 1, 0)),
+            16 | 18 => Some((6, 0, 0)),
+            _ => None,
+        }
+    }
+
+    fn lifecycle_state(&self) -> Result<ExtLifecycleState> {
+        let read_slot_string = |slot| -> Result<Vec<u8>> {
+            let address = self.memory.read_u32(table_slot_address(slot))?;
+            if address == 0 {
+                Ok(Vec::new())
+            } else {
+                self.read_c_string(GuestAddr(address), 1024)
+            }
+        };
+        let callback = self.memory.read_u32(LIFECYCLE_CALLBACK_DATA)?;
+        Ok(ExtLifecycleState {
+            application: self.memory.read_u32(APPLICATION_STATE_DATA)?,
+            callback: if callback == 0 {
+                Vec::new()
+            } else {
+                self.read_c_string(GuestAddr(callback), 256)?
+            },
+            package: read_slot_string(100)?,
+            entry: read_slot_string(101)?,
+        })
     }
 
     fn call_guest(
@@ -396,7 +489,6 @@ impl ExtRuntime {
                 function.address, function.module
             )));
         }
-
         let mut cpu = ArmCpu::new();
         for (index, value) in registers.into_iter().enumerate() {
             cpu.set_register(index, value);
@@ -485,7 +577,7 @@ impl ExtRuntime {
                 cpu.register(1),
                 cpu.register(2),
                 cpu.register(3),
-                cpu.register(9)
+                cpu.register(9),
             );
         }
         match slot {
@@ -604,6 +696,8 @@ impl ExtRuntime {
             38 => match cpu.register(0) {
                 // Optional device identifier query. No device-info provider is configured.
                 1_204 => cpu.set_register(0, u32::MAX),
+                // Optional platform metadata query. No metadata provider is configured.
+                1_222 => self.return_unavailable_platform_extension(cpu)?,
                 command => {
                     return Err(Error::Abi(format!(
                         "unsupported platform slot 38 command {command} called by module {module}"
@@ -676,9 +770,41 @@ impl ExtRuntime {
                 };
                 cpu.set_register(0, result as u32);
             }
+            54 => {
+                self.exit_requested = true;
+                cpu.set_register(0, 0);
+            }
             61 => {
                 // No carrier/network identity provider is configured.
                 cpu.set_register(0, u32::MAX);
+            }
+            69 => {
+                let title = self.read_wide_string_be(GuestAddr(cpu.register(0)), 1024)?;
+                let message = self.read_wide_string_be(GuestAddr(cpu.register(1)), 16 * 1024)?;
+                let style = cpu.register(2);
+                let handle = self.create_platform_dialog(&title, &message, style, services)?;
+                cpu.set_register(0, handle);
+            }
+            70 => {
+                let handle = cpu.register(0);
+                let Some(dialog) = self.dialogs.remove(&handle) else {
+                    cpu.set_register(0, u32::MAX);
+                    return Ok(());
+                };
+                self.memory.write(SCREEN_BASE, &dialog.previous_screen)?;
+                self.present_screen(services)?;
+                cpu.set_register(0, 0);
+            }
+            71 => {
+                let handle = cpu.register(0);
+                let Some(dialog) = self.dialogs.get(&handle) else {
+                    cpu.set_register(0, u32::MAX);
+                    return Ok(());
+                };
+                let screen = dialog.dialog_screen.clone();
+                self.memory.write(SCREEN_BASE, &screen)?;
+                self.present_screen(services)?;
+                cpu.set_register(0, 0);
             }
             80 => {
                 let info = GuestAddr(cpu.register(0));
@@ -953,6 +1079,150 @@ impl ExtRuntime {
             }
         }
         Ok(())
+    }
+
+    fn return_unavailable_platform_extension(&mut self, cpu: &mut ArmCpu) -> Result<()> {
+        let output = GuestAddr(cpu.register(3));
+        if output.0 != 0 {
+            self.memory.write_u32(output, 0)?;
+        }
+        let output_len = GuestAddr(self.memory.read_u32(GuestAddr(cpu.register(13)))?);
+        if output_len.0 != 0 {
+            self.memory.write_u32(output_len, 0)?;
+        }
+        cpu.set_register(0, u32::MAX);
+        Ok(())
+    }
+
+    fn create_platform_dialog(
+        &mut self,
+        title: &[u16],
+        message: &[u16],
+        style: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<u32> {
+        if style != 0 {
+            return Err(Error::Abi(format!(
+                "unsupported platform dialog style {style}"
+            )));
+        }
+        let (width, height) = self.screen_dimensions()?;
+        let screen_len = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or_else(|| Error::Abi("platform dialog screen size overflow".into()))?;
+        let previous_screen = self.memory.read(SCREEN_BASE, screen_len)?;
+
+        let background = Framebuffer::rgb565(248, 252, 248);
+        let accent = Framebuffer::rgb565(32, 160, 224);
+        let accent_dark = Framebuffer::rgb565(0, 96, 176);
+        let black = Framebuffer::rgb565(0, 0, 0);
+        let white = Framebuffer::rgb565(255, 255, 255);
+        self.draw_rectangle_to_screen(0, 0, width, height, background)?;
+        self.draw_rectangle_to_screen(0, 0, width, 30, accent)?;
+        self.draw_text_to_screen(title, 8, 7, white, 0, services)?;
+        self.draw_wrapped_text_to_screen(message, 12, 48, width - 24, black, services)?;
+
+        let button_width = 120.min(width.saturating_sub(24));
+        let button_x = (width - button_width) / 2;
+        let button_y = height.saturating_sub(68);
+        self.draw_rectangle_to_screen(
+            button_x - 1,
+            button_y - 1,
+            button_width + 2,
+            32,
+            accent_dark,
+        )?;
+        self.draw_rectangle_to_screen(button_x, button_y, button_width, 30, accent)?;
+        self.draw_text_to_screen(
+            &[0x786e, 0x5b9a],
+            button_x + button_width / 2 - 16,
+            button_y + 7,
+            white,
+            0,
+            services,
+        )?;
+
+        let dialog_screen = self.memory.read(SCREEN_BASE, screen_len)?;
+        let handle = self.allocate_ui_handle()?;
+        self.dialogs.insert(
+            handle,
+            PlatformDialog {
+                previous_screen,
+                dialog_screen,
+            },
+        );
+        self.present_screen(services)?;
+        Ok(handle)
+    }
+
+    fn draw_wrapped_text_to_screen(
+        &mut self,
+        text: &[u16],
+        x: i32,
+        mut y: i32,
+        max_width: i32,
+        color: u16,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        let mut line = Vec::new();
+        let mut line_width = 0;
+        for &codepoint in text {
+            let glyph_width = if codepoint < 128 { 8 } else { 16 };
+            if codepoint == b'\n' as u16
+                || (!line.is_empty() && line_width + glyph_width > max_width)
+            {
+                self.draw_text_to_screen(&line, x, y, color, 0, services)?;
+                line.clear();
+                line_width = 0;
+                y += 22;
+                if codepoint == b'\n' as u16 {
+                    continue;
+                }
+            }
+            line.push(codepoint);
+            line_width += glyph_width;
+        }
+        if !line.is_empty() {
+            self.draw_text_to_screen(&line, x, y, color, 0, services)?;
+        }
+        Ok(())
+    }
+
+    fn allocate_ui_handle(&mut self) -> Result<u32> {
+        let start = self.next_ui_handle;
+        loop {
+            let handle = self.next_ui_handle;
+            self.next_ui_handle = self.next_ui_handle.checked_add(1).unwrap_or(1);
+            if handle != 0 && !self.dialogs.contains_key(&handle) {
+                return Ok(handle);
+            }
+            if self.next_ui_handle == start {
+                return Err(Error::ResourceLimit(
+                    "no platform UI handles available".into(),
+                ));
+            }
+        }
+    }
+
+    fn present_screen(&self, services: &mut dyn NativeServices) -> Result<()> {
+        let (width, height) = self.screen_dimensions()?;
+        let byte_len = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or_else(|| Error::Abi("screen presentation size overflow".into()))?;
+        let pixels = self.memory.read(SCREEN_BASE, byte_len)?;
+        services.draw_bitmap(&pixels, 0, 0, width as usize, height as usize)
     }
 
     fn compact_ram_output_target(
@@ -2108,6 +2378,120 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_platform_extension_clears_its_output_fields() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let output = runtime.allocate(4, 4).unwrap();
+        let output_len = runtime.allocate(4, 4).unwrap();
+        let stack = runtime.allocate(4, 4).unwrap();
+        runtime.memory.write_u32(output, 0xaaaa_aaaa).unwrap();
+        runtime.memory.write_u32(output_len, 0xbbbb_bbbb).unwrap();
+        runtime.memory.write_u32(stack, output_len.0).unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 1_222);
+        cpu.set_register(3, output.0);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0) as i32, -1);
+        assert_eq!(runtime.memory.read_u32(output).unwrap(), 0);
+        assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0);
+    }
+
+    #[test]
+    fn platform_dialog_draws_and_restores_the_screen() {
+        let mut runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let title = runtime.allocate(6, 2).unwrap();
+        let message = runtime.allocate(6, 2).unwrap();
+        runtime
+            .memory
+            .write(title, &[0x00, 0x41, 0, 0, 0, 0])
+            .unwrap();
+        runtime
+            .memory
+            .write(message, &[0x00, 0x42, 0, 0, 0, 0])
+            .unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, title.0);
+        cpu.set_register(1, message.0);
+        runtime
+            .dispatch(69, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        let handle = cpu.register(0);
+        assert_ne!(handle, 0);
+        assert_eq!(
+            runtime
+                .memory
+                .read_u16(runtime.screen_address(89, 266, 240).unwrap())
+                .unwrap(),
+            Framebuffer::rgb565(32, 160, 224)
+        );
+
+        cpu.set_register(0, handle);
+        runtime
+            .dispatch(70, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(
+            runtime
+                .memory
+                .read_u16(runtime.screen_address(89, 266, 240).unwrap())
+                .unwrap(),
+            0
+        );
+
+        cpu.set_register(0, title.0);
+        cpu.set_register(1, message.0);
+        cpu.set_register(2, 1);
+        assert!(matches!(
+            runtime.dispatch(69, 0, &mut cpu, &mut StubServices),
+            Err(Error::Abi(message)) if message == "unsupported platform dialog style 1"
+        ));
+    }
+
+    #[test]
+    fn platform_dialog_routes_and_fully_consumes_a_cancel_key() {
+        let mut runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        runtime.dialogs.insert(
+            1,
+            PlatformDialog {
+                previous_screen: Vec::new(),
+                dialog_screen: Vec::new(),
+            },
+        );
+
+        assert_eq!(runtime.route_key_event(18, true), Some((6, 0, 0)));
+        runtime.dialogs.clear();
+        assert_eq!(runtime.route_key_event(18, false), None);
+        assert_eq!(runtime.route_key_event(12, true), Some((0, 12, 0)));
+    }
+
+    #[test]
+    fn exposes_an_exit_lifecycle_request() {
+        let mut runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let stack = runtime.allocate(4, 4).unwrap();
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(13, stack.0);
+
+        runtime
+            .dispatch(54, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(
+            runtime.lifecycle_request().unwrap(),
+            Some(ExtLifecycleRequest::Exit)
+        );
+    }
+
+    #[test]
     fn reads_the_compact_ram_package_payload() {
         let expected = b"MRPGCMAPguest module";
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -2178,6 +2562,47 @@ mod tests {
                 .read_u32(INTERNAL_TABLE_DATA.checked_add(20).unwrap())
                 .unwrap(),
             TIMER_ACTIVE_DATA.0
+        );
+    }
+
+    #[test]
+    fn due_timer_is_consumed_without_clearing_the_guest_active_flag() {
+        let mut runtime =
+            ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        runtime.timer_deadline = Some(Instant::now());
+        runtime.memory.write_u32(TIMER_ACTIVE_DATA, 1).unwrap();
+
+        assert!(runtime.take_due_timer().unwrap());
+        assert_eq!(runtime.timer_deadline, None);
+        assert_eq!(runtime.memory.read_u32(TIMER_ACTIVE_DATA).unwrap(), 1);
+    }
+
+    #[test]
+    fn exposes_a_checked_restart_lifecycle_request() {
+        let mut runtime = ExtRuntime::new(
+            240,
+            320,
+            b"parent.mrp",
+            b"start.mr",
+            DEFAULT_HEAP_LEN as u32,
+        )
+        .unwrap();
+        let callback = runtime.allocate(8, 4).unwrap();
+        runtime.memory.write(callback, b"restart\0").unwrap();
+        runtime
+            .memory
+            .write_u32(LIFECYCLE_CALLBACK_DATA, callback.0)
+            .unwrap();
+        runtime.memory.write_u32(APPLICATION_STATE_DATA, 3).unwrap();
+        write_platform_string(&mut runtime.memory, PACKAGE_NAME_DATA, b"child.mrp").unwrap();
+        write_platform_string(&mut runtime.memory, START_NAME_DATA, b"main.mr").unwrap();
+
+        assert_eq!(
+            runtime.lifecycle_request().unwrap(),
+            Some(ExtLifecycleRequest::Restart {
+                package: b"child.mrp".to_vec(),
+                entry: b"main.mr".to_vec(),
+            })
         );
     }
 

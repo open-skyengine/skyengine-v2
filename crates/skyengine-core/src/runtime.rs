@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     DisplayEvent, Error, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result,
-    mr::{MrVm, value::Value},
+    mr::{MrVm, value::Value, vm::LifecycleOutcome},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +104,7 @@ impl Runtime {
         }
         self.vm.run_entry(&self.entry)?;
         self.state = RuntimeState::Running;
+        self.apply_lifecycle_request()?;
         Ok(())
     }
 
@@ -131,6 +132,7 @@ impl Runtime {
         }
         if self.state == RuntimeState::Running {
             self.vm.dispatch_native_timer()?;
+            self.apply_lifecycle_request()?;
         }
         Ok(())
     }
@@ -145,14 +147,19 @@ impl Runtime {
         match event {
             DisplayEvent::Quit => self.stop(),
             DisplayEvent::Key { code, pressed } if self.state == RuntimeState::Running => {
-                self.vm.call_global(
-                    b"dealevent",
-                    vec![
-                        Value::Number(if pressed { 0.0 } else { 1.0 }),
-                        Value::Number(f64::from(code)),
-                        Value::Number(0.0),
-                    ],
-                )?;
+                if let Some((event, parameter0, parameter1)) =
+                    self.vm.route_key_event(code, pressed)
+                {
+                    self.vm.call_global(
+                        b"dealevent",
+                        vec![
+                            Value::Number(f64::from(event)),
+                            Value::Number(f64::from(parameter0)),
+                            Value::Number(f64::from(parameter1)),
+                        ],
+                    )?;
+                    self.apply_lifecycle_request()?;
+                }
             }
             DisplayEvent::Pointer { x, y, pressed } if self.state == RuntimeState::Running => {
                 self.vm.call_global(
@@ -163,8 +170,16 @@ impl Runtime {
                         Value::Number(f64::from(y)),
                     ],
                 )?;
+                self.apply_lifecycle_request()?;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn apply_lifecycle_request(&mut self) -> Result<()> {
+        if self.vm.process_lifecycle_request()? == LifecycleOutcome::ExitRequested {
+            self.stop();
         }
         Ok(())
     }

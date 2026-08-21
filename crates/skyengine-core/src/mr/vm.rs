@@ -1,6 +1,8 @@
 use std::{cmp::Ordering, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
-use crate::{Framebuffer, Package, PlatformDisplay, ResourceLimits, Result};
+use crate::{
+    Framebuffer, Package, PlatformDisplay, ResourceLimits, Result, arm::ExtLifecycleRequest,
+};
 
 use super::{
     chunk::{Constant, MrChunk, Prototype},
@@ -18,6 +20,12 @@ pub struct MrVm {
     limits: ResourceLimits,
     instruction_count: u64,
     final_values: Vec<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LifecycleOutcome {
+    Continue,
+    ExitRequested,
 }
 
 struct Frame {
@@ -81,6 +89,7 @@ impl MrVm {
     }
 
     pub fn run_entry(&mut self, entry: &[u8]) -> Result<()> {
+        self.host.set_current_entry(entry);
         let bytes = self.host.package.read_named(entry)?;
         if !bytes.starts_with(SIGNATURE) {
             return Err(crate::Error::UnsupportedMr(format!(
@@ -110,6 +119,30 @@ impl MrVm {
             CallResult::Pushed => self.run_frames()?,
         }
         Ok(true)
+    }
+
+    pub(crate) fn process_lifecycle_request(&mut self) -> Result<LifecycleOutcome> {
+        let Some(request) = self.host.lifecycle_request()? else {
+            return Ok(LifecycleOutcome::Continue);
+        };
+        match request {
+            ExtLifecycleRequest::Restart { package, entry } => {
+                let package = self.host.prepare_restart(&package, &entry)?;
+                self.globals = Table::new();
+                self.frames.clear();
+                self.instruction_count = 0;
+                self.final_values.clear();
+                self.host.reset_for_restart(package, &entry);
+                self.register_libraries();
+                self.run_entry(&entry)?;
+            }
+            ExtLifecycleRequest::Exit => return Ok(LifecycleOutcome::ExitRequested),
+        }
+        Ok(LifecycleOutcome::Continue)
+    }
+
+    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
+        self.host.route_key_event(code, pressed)
     }
 
     fn run_frames(&mut self) -> Result<()> {

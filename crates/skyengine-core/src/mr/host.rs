@@ -11,7 +11,7 @@ use encoding_rs::GBK;
 
 use crate::{
     Framebuffer, Package, PlatformDisplay, Result,
-    arm::{ExtRuntime, GuestAddr, NativeServices},
+    arm::{ExtLifecycleRequest, ExtRuntime, GuestAddr, NativeServices},
 };
 
 use super::value::{Table, Value};
@@ -54,6 +54,8 @@ pub(crate) struct MrHost {
     native_files: BTreeMap<i32, File>,
     next_native_file_handle: i32,
     sdk_key: Option<i32>,
+    current_entry: Vec<u8>,
+    application_stack: Vec<(Vec<u8>, Vec<u8>)>,
     ext_runtime: Option<ExtRuntime>,
 }
 
@@ -79,6 +81,8 @@ impl MrHost {
             native_files: BTreeMap::new(),
             next_native_file_handle: 1,
             sdk_key: None,
+            current_entry: b"start.mr".to_vec(),
+            application_stack: Vec::new(),
             ext_runtime: None,
         }
     }
@@ -210,6 +214,61 @@ impl MrHost {
         }
         self.call_ext_helper(2, &[])?;
         Ok(true)
+    }
+
+    pub fn lifecycle_request(&self) -> Result<Option<ExtLifecycleRequest>> {
+        match self.ext_runtime.as_ref() {
+            Some(runtime) => runtime.lifecycle_request(),
+            None => Ok(None),
+        }
+    }
+
+    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
+        match self.ext_runtime.as_mut() {
+            Some(runtime) => runtime.route_key_event(code, pressed),
+            None => Some((if pressed { 0 } else { 1 }, code, 0)),
+        }
+    }
+
+    pub fn prepare_restart(&self, package_name: &[u8], entry: &[u8]) -> Result<Arc<Package>> {
+        let path = native_file_path(
+            &self.work_dir,
+            self.package.path(),
+            &self.package.header().internal_name,
+            package_name,
+        )
+        .ok_or_else(|| {
+            crate::Error::Platform(format!(
+                "restart package path {:?} is outside the work directory",
+                String::from_utf8_lossy(package_name)
+            ))
+        })?;
+        let package = Arc::new(Package::open(path, self.package.limits().clone())?);
+        package.resolve(entry)?;
+        Ok(package)
+    }
+
+    pub fn reset_for_restart(&mut self, package: Arc<Package>, entry: &[u8]) {
+        update_application_stack(
+            &mut self.application_stack,
+            &self.package.header().internal_name,
+            &self.current_entry,
+            &package.header().internal_name,
+            entry,
+        );
+        self.package = package;
+        self.bitmaps.clear();
+        self.directory_searches.clear();
+        self.next_directory_handle = 1;
+        self.native_files.clear();
+        self.next_native_file_handle = 1;
+        self.sdk_key = None;
+        self.current_entry = entry.to_vec();
+        self.ext_runtime = None;
+    }
+
+    pub fn set_current_entry(&mut self, entry: &[u8]) {
+        self.current_entry = entry.to_vec();
     }
 
     fn bitmap_load(&mut self, args: &[Value]) -> Result<()> {
@@ -423,13 +482,22 @@ impl MrHost {
                 let package_name = self.package.header().internal_name.clone();
                 let mut runtime = match self.ext_runtime.take() {
                     Some(runtime) => runtime,
-                    None => ExtRuntime::new(
-                        self.framebuffer.width(),
-                        self.framebuffer.height(),
-                        &package_name,
-                        b"start.mr",
-                        self.memory_limit,
-                    )?,
+                    None => {
+                        let mut runtime = ExtRuntime::new(
+                            self.framebuffer.width(),
+                            self.framebuffer.height(),
+                            &package_name,
+                            &self.current_entry,
+                            self.memory_limit,
+                        )?;
+                        let (previous_package, previous_entry) = self
+                            .application_stack
+                            .last()
+                            .map(|(package, entry)| (package.as_slice(), entry.as_slice()))
+                            .unwrap_or((&[], &[]));
+                        runtime.set_previous_application(previous_package, previous_entry)?;
+                        runtime
+                    }
                 };
                 let package = self.package.clone();
                 let mut services = PackageServices {
@@ -825,6 +893,23 @@ fn native_file_path(
     safe_work_path(work_dir, bytes)
 }
 
+fn update_application_stack(
+    stack: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    current_package: &[u8],
+    current_entry: &[u8],
+    target_package: &[u8],
+    target_entry: &[u8],
+) {
+    if stack
+        .last()
+        .is_some_and(|(package, entry)| package == target_package && entry == target_entry)
+    {
+        stack.pop();
+    } else {
+        stack.push((current_package.to_vec(), current_entry.to_vec()));
+    }
+}
+
 fn blit(framebuffer: &mut Framebuffer, bitmap: &Bitmap, region: BlitRegion) {
     for row in 0..region.height {
         for column in 0..region.width {
@@ -979,5 +1064,26 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn tracks_nested_application_restarts_as_a_stack() {
+        let mut stack = Vec::new();
+
+        update_application_stack(&mut stack, b"a.mrp", b"a.mr", b"b.mrp", b"b.mr");
+        update_application_stack(&mut stack, b"b.mrp", b"b.mr", b"c.mrp", b"c.mr");
+        assert_eq!(
+            stack,
+            vec![
+                (b"a.mrp".to_vec(), b"a.mr".to_vec()),
+                (b"b.mrp".to_vec(), b"b.mr".to_vec()),
+            ]
+        );
+
+        update_application_stack(&mut stack, b"c.mrp", b"c.mr", b"b.mrp", b"b.mr");
+        assert_eq!(stack, vec![(b"a.mrp".to_vec(), b"a.mr".to_vec())]);
+
+        update_application_stack(&mut stack, b"b.mrp", b"b.mr", b"a.mrp", b"a.mr");
+        assert!(stack.is_empty());
     }
 }
