@@ -1,3 +1,4 @@
+pub mod arm;
 pub mod display;
 pub mod error;
 pub mod mr;

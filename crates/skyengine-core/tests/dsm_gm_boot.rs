@@ -19,7 +19,7 @@ impl PlatformDisplay for HeadlessDisplay {
 #[test]
 fn dsm_gm_runs_the_real_start_chain_and_renders_its_first_frame() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut config = RuntimeConfig::for_app(workspace.join("test/fixtures/dsm_gm.mrp"));
+    let mut config = RuntimeConfig::for_app(workspace.join("test/fixtures/mythroad/dsm_gm.mrp"));
     config.font_path = workspace.join("test/fixtures/fonts/gb16.uc2");
     config.work_dir = std::env::temp_dir().join(format!(
         "skyengine-v2-empty-work-dir-{}",

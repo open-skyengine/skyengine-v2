@@ -26,6 +26,10 @@ pub enum Error {
     MrLoad { offset: usize, message: String },
     #[error("MR fault: {0}")]
     MrFault(String),
+    #[error("ARM fault: {0}")]
+    ArmFault(String),
+    #[error("ABI error: {0}")]
+    Abi(String),
     #[error("platform error: {0}")]
     Platform(String),
     #[error("invalid command line: {0}")]

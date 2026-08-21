@@ -5,9 +5,20 @@ SkyEngine v2 is a clean Rust implementation of the MRP application runtime descr
 loads V50 and V80 precompiled MR chunks, executes them in the built-in register VM, and renders
 MR drawing calls through either a headless RGB565 framebuffer or SDL2.
 
-The default font is `test/fixtures/fonts/gb16.uc2`. The included `dsm_gm.mrp` fixture runs through
-its real `start.mr` loading chain and renders its application-list UI; there is no package-name
-dispatch or fixture-specific drawing path.
+The default font is `mythroad/system/gb16.uc2`, resolved relative to `--work-dir`. The included
+`dsm_gm.mrp` fixture runs through its real `start.mr` loading chain and renders its application-list
+UI; there is no package-name dispatch or fixture-specific drawing path.
+
+`--work-dir` represents the device filesystem root. Installed applications and shared runtime
+resources use the same layout as a device:
+
+```text
+<work-dir>/
+  mythroad/
+    app.mrp
+    system/gb16.uc2
+    plugins/*.mrp
+```
 
 ## Prerequisites
 
@@ -42,8 +53,9 @@ cargo run -p skyengine -- inspect --json test/fixtures/dsm_gm.mrp
 ```bash
 cargo run -p skyengine -- run \
   --headless \
+  --work-dir test/fixtures \
   --frame-output skyengine-frame.ppm \
-  test/fixtures/dsm_gm.mrp
+  test/fixtures/mythroad/dsm_gm.mrp
 ```
 
 The output is a binary P6 PPM image. `--frame-output` implies headless mode. Useful overrides are
@@ -52,7 +64,9 @@ The output is a binary P6 PPM image. `--frame-output` implies headless mode. Use
 ## Run With SDL2
 
 ```bash
-cargo run -p skyengine -- run test/fixtures/dsm_gm.mrp
+cargo run -p skyengine -- run \
+  --work-dir test/fixtures \
+  test/fixtures/mythroad/dsm_gm.mrp
 ```
 
 The SDL window uses a 2x logical scale. Arrow keys map to the MR direction keys, Enter or Space

@@ -264,6 +264,18 @@ impl Package {
         Ok(entry)
     }
 
+    /// Resolves a resource using the baseline SDK overlay rule.
+    ///
+    /// Updated packages can prepend replacement entries before the retained
+    /// original directory. Runtime lookup observes the first matching entry,
+    /// while `find_unique` remains available for ambiguity diagnostics.
+    pub fn resolve(&self, name: &[u8]) -> Result<&PackageEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| Error::EntryNotFound(String::from_utf8_lossy(name).into_owned()))
+    }
+
     pub fn read_entry(&self, entry: &PackageEntry) -> Result<Vec<u8>> {
         let start = entry.payload_offset as usize;
         let end = start + entry.stored_len as usize;
@@ -287,7 +299,7 @@ impl Package {
     }
 
     pub fn read_named(&self, name: &[u8]) -> Result<Vec<u8>> {
-        self.read_entry(self.find_unique(name)?)
+        self.read_entry(self.resolve(name)?)
     }
 
     pub fn read_raw_range(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -381,5 +393,39 @@ mod tests {
         assert_eq!(package.read_raw_range(0, 4).unwrap(), b"MRPG");
         assert!(package.read_raw_range(HEADER_MIN_LEN - 1, 2).is_err());
         assert!(package.read_raw_range(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn baseline_resolution_uses_the_first_duplicate_entry() {
+        const LIST_START: usize = 240;
+        const ENTRY_LEN: usize = 25;
+        let mut bytes = vec![0_u8; 400];
+        bytes[0..4].copy_from_slice(b"MRPG");
+        bytes[4..8].copy_from_slice(&282_u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&400_u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(LIST_START as u32).to_le_bytes());
+        for (index, (payload_offset, payload)) in [(320_u32, b"old"), (323_u32, b"new")]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = LIST_START + index * ENTRY_LEN;
+            bytes[offset..offset + 4].copy_from_slice(&9_u32.to_le_bytes());
+            bytes[offset + 4..offset + 13].copy_from_slice(b"start.mr\0");
+            bytes[offset + 13..offset + 17].copy_from_slice(&payload_offset.to_le_bytes());
+            bytes[offset + 17..offset + 21].copy_from_slice(&3_u32.to_le_bytes());
+            bytes[payload_offset as usize..payload_offset as usize + 3].copy_from_slice(payload);
+        }
+
+        let package = Package::parse(
+            PathBuf::from("duplicate.mrp"),
+            bytes.into(),
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            package.find_unique(b"start.mr"),
+            Err(Error::AmbiguousEntry(_))
+        ));
+        assert_eq!(package.read_named(b"start.mr").unwrap(), b"old");
     }
 }

@@ -1,0 +1,2127 @@
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use flate2::read::GzDecoder;
+
+use crate::{Error, Framebuffer, Package, ResourceLimits, Result};
+
+use super::{ArmCpu, GuestAddr, GuestMemory, Permissions};
+
+const PLATFORM_TABLE: GuestAddr = GuestAddr(0x0100_0000);
+const PLATFORM_DATA: GuestAddr = GuestAddr(0x0100_1000);
+const PACKAGE_NAME_DATA: GuestAddr = GuestAddr(0x0100_1400);
+const START_NAME_DATA: GuestAddr = GuestAddr(0x0100_1500);
+const PREVIOUS_PACKAGE_NAME_DATA: GuestAddr = GuestAddr(0x0100_1600);
+const PREVIOUS_START_NAME_DATA: GuestAddr = GuestAddr(0x0100_1700);
+const CURRENT_ENTRY_DATA: GuestAddr = GuestAddr(0x0100_1800);
+const INTERNAL_TABLE_DATA: GuestAddr = GuestAddr(0x0100_1900);
+const APPLICATION_STATE_DATA: GuestAddr = GuestAddr(0x0100_1980);
+const LIFECYCLE_CALLBACK_DATA: GuestAddr = GuestAddr(0x0100_1984);
+const TIMER_ACTIVE_DATA: GuestAddr = GuestAddr(0x0100_1988);
+const MODULE_BASE: u32 = 0x1000_0000;
+const MODULE_STRIDE: u32 = 0x0010_0000;
+const HEAP_BASE: GuestAddr = GuestAddr(0x2000_0000);
+const HEAP_LEN: usize = 4 * 1024 * 1024;
+const STACK_BASE: GuestAddr = GuestAddr(0x3000_0000);
+const STACK_LEN: usize = 256 * 1024;
+const SCREEN_BASE: GuestAddr = GuestAddr(0x4000_0000);
+const BITMAP_ENTRY_SIZE: u32 = 16;
+const SCREEN_BITMAP_ID: u32 = 30;
+const TRAP_BASE: u32 = 0xff00_0000;
+const RETURN_SENTINEL: u32 = 0xffff_ff00;
+const PLATFORM_SLOT_COUNT: u32 = 150;
+const INSTRUCTION_BUDGET: u64 = 20_000_000;
+
+pub(crate) trait NativeServices {
+    fn read_package_file(&mut self, name: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn file_info(&mut self, name: &[u8]) -> Result<i32>;
+    fn open_file(&mut self, name: &[u8], mode: u32) -> Result<i32>;
+    fn close_file(&mut self, handle: i32) -> Result<i32>;
+    fn read_file(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>>;
+    fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<bool>;
+    fn file_len(&mut self, handle: i32) -> Result<Option<u64>>;
+    fn char_bitmap(&mut self, codepoint: u32, font: u32) -> Result<Option<(Vec<u8>, u32, u32)>>;
+    fn draw_bitmap(
+        &mut self,
+        pixels: &[u8],
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+    ) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuestFunction {
+    module: usize,
+    address: u32,
+}
+
+#[derive(Debug)]
+struct ModuleContext {
+    base: GuestAddr,
+    len: usize,
+    loader_context: GuestAddr,
+    helper: Option<GuestFunction>,
+    helper_parameter: GuestAddr,
+    static_base_r9: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuestGlyph {
+    address: GuestAddr,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BitmapDescriptor {
+    pixels: GuestAddr,
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BitmapTransform {
+    a: i16,
+    b: i16,
+    c: i16,
+    d: i16,
+    mode: i16,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExtRuntime {
+    memory: GuestMemory,
+    modules: Vec<ModuleContext>,
+    active_helper: Option<GuestFunction>,
+    heap_cursor: u32,
+    random_state: u32,
+    glyphs: BTreeMap<(u32, u32), GuestGlyph>,
+    clock_origin: Instant,
+    timer_deadline: Option<Instant>,
+}
+
+impl ExtRuntime {
+    pub fn new(
+        screen_width: u16,
+        screen_height: u16,
+        package_name: &[u8],
+        entry_name: &[u8],
+    ) -> Result<Self> {
+        let mut memory = GuestMemory::new();
+        memory.map(
+            PLATFORM_TABLE,
+            0x1000,
+            Permissions::READ_WRITE,
+            "platform table",
+        )?;
+        memory.map(
+            PLATFORM_DATA,
+            0x1000,
+            Permissions::READ_WRITE,
+            "platform data",
+        )?;
+        memory.map(HEAP_BASE, HEAP_LEN, Permissions::READ_WRITE, "guest heap")?;
+        memory.map(STACK_BASE, STACK_LEN, Permissions::READ_WRITE, "EXT stack")?;
+        let screen_len = usize::from(screen_width)
+            .checked_mul(usize::from(screen_height))
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or_else(|| Error::ArmFault("guest screen buffer size overflow".into()))?;
+        memory.map(
+            SCREEN_BASE,
+            screen_len,
+            Permissions::READ_WRITE,
+            "screen buffer",
+        )?;
+
+        for slot in 0..PLATFORM_SLOT_COUNT {
+            let value = if is_function_slot(slot) {
+                TRAP_BASE + slot * 4
+            } else if is_data_slot(slot) {
+                PLATFORM_DATA.0 + slot * 4
+            } else {
+                0
+            };
+            memory.write_u32(GuestAddr(PLATFORM_TABLE.0 + slot * 4), value)?;
+        }
+        write_platform_string(&mut memory, PACKAGE_NAME_DATA, package_name)?;
+        write_platform_string(&mut memory, START_NAME_DATA, entry_name)?;
+        write_platform_string(&mut memory, PREVIOUS_PACKAGE_NAME_DATA, b"")?;
+        write_platform_string(&mut memory, PREVIOUS_START_NAME_DATA, b"")?;
+        write_platform_string(&mut memory, CURRENT_ENTRY_DATA, entry_name)?;
+        memory.write_u32(table_slot_address(100), PACKAGE_NAME_DATA.0)?;
+        memory.write_u32(table_slot_address(101), START_NAME_DATA.0)?;
+        memory.write_u32(table_slot_address(102), PREVIOUS_PACKAGE_NAME_DATA.0)?;
+        memory.write_u32(table_slot_address(103), PREVIOUS_START_NAME_DATA.0)?;
+        memory.write_u32(table_slot_address(144), CURRENT_ENTRY_DATA.0)?;
+        memory.write_u32(table_slot_address(23), INTERNAL_TABLE_DATA.0)?;
+        memory.write_u32(
+            INTERNAL_TABLE_DATA.checked_add(8)?,
+            APPLICATION_STATE_DATA.0,
+        )?;
+        memory.write_u32(
+            INTERNAL_TABLE_DATA.checked_add(16)?,
+            LIFECYCLE_CALLBACK_DATA.0,
+        )?;
+        memory.write_u32(INTERNAL_TABLE_DATA.checked_add(20)?, TIMER_ACTIVE_DATA.0)?;
+        memory.write_u32(APPLICATION_STATE_DATA, 1)?;
+        memory.write_u32(data_slot_address(91), SCREEN_BASE.0)?;
+        memory.write_u32(data_slot_address(92), u32::from(screen_width))?;
+        memory.write_u32(data_slot_address(93), u32::from(screen_height))?;
+        memory.write_u32(data_slot_address(94), 16)?;
+        let bitmap_table = GuestAddr(memory.read_u32(table_slot_address(95))?);
+        let screen_bitmap = bitmap_table.checked_add(SCREEN_BITMAP_ID * BITMAP_ENTRY_SIZE)?;
+        memory.write_u16(screen_bitmap, screen_width)?;
+        memory.write_u16(screen_bitmap.checked_add(2)?, screen_height)?;
+        memory.write_u32(
+            screen_bitmap.checked_add(4)?,
+            u32::try_from(screen_len)
+                .map_err(|_| Error::ArmFault("guest screen buffer size exceeds u32".into()))?,
+        )?;
+        memory.write_u32(screen_bitmap.checked_add(8)?, 0)?;
+        memory.write_u32(screen_bitmap.checked_add(12)?, SCREEN_BASE.0)?;
+        memory.write_u32(data_slot_address(106), 1)?;
+        memory.write_u32(data_slot_address(107), 1)?;
+        memory.write_u32(data_slot_address(108), HEAP_BASE.0)?;
+        memory.write_u32(data_slot_address(109), HEAP_LEN as u32)?;
+        memory.write_u32(data_slot_address(110), HEAP_BASE.0 + HEAP_LEN as u32)?;
+        memory.write_u32(data_slot_address(111), HEAP_LEN as u32)?;
+
+        Ok(Self {
+            memory,
+            modules: Vec::new(),
+            active_helper: None,
+            heap_cursor: HEAP_BASE.0,
+            random_state: 1,
+            glyphs: BTreeMap::new(),
+            clock_origin: Instant::now(),
+            timer_deadline: None,
+        })
+    }
+
+    pub fn load_and_call_entry(
+        &mut self,
+        image: &[u8],
+        code: i32,
+        services: &mut dyn NativeServices,
+    ) -> Result<i32> {
+        if !image.starts_with(b"MRPGCMAP") || image.len() <= 8 {
+            return Err(Error::Abi(
+                "EXT image is missing the complete MRPGCMAP marker".into(),
+            ));
+        }
+        let module_index = self.modules.len();
+        let module_offset = u32::try_from(module_index)
+            .ok()
+            .and_then(|index| index.checked_mul(MODULE_STRIDE))
+            .ok_or_else(|| Error::ArmFault("module address allocation overflow".into()))?;
+        let base = GuestAddr(
+            MODULE_BASE
+                .checked_add(module_offset)
+                .ok_or_else(|| Error::ArmFault("module base overflow".into()))?,
+        );
+        if image.len() > MODULE_STRIDE as usize {
+            return Err(Error::ArmFault(format!(
+                "EXT image is {} bytes (module stride is {})",
+                image.len(),
+                MODULE_STRIDE
+            )));
+        }
+        self.memory.map_bytes(
+            base,
+            image.to_vec(),
+            Permissions::READ_WRITE_EXECUTE,
+            format!("EXT module {module_index}"),
+        )?;
+        let loader_context = self.allocate(64, 8)?;
+        self.memory.write(loader_context, &[0; 64])?;
+        self.memory.write_u32(base, PLATFORM_TABLE.0)?;
+        self.memory
+            .write_u32(base.checked_add(4)?, loader_context.0)?;
+        self.modules.push(ModuleContext {
+            base,
+            len: image.len(),
+            loader_context,
+            helper: None,
+            helper_parameter: GuestAddr(0),
+            static_base_r9: 0,
+        });
+
+        let result = self
+            .call_guest(
+                GuestFunction {
+                    module: module_index,
+                    address: base.0 + 8,
+                },
+                [code as u32, 0, 0, 0],
+                &[],
+                services,
+            )
+            .and_then(|value| {
+                let loader_context = self.modules[module_index].loader_context;
+                let static_base = self.memory.read_u32(loader_context)?;
+                let helper_parameter = self.modules[module_index].helper_parameter;
+                self.modules[module_index].static_base_r9 = static_base;
+                if helper_parameter.0 != 0 {
+                    self.memory.write_u32(helper_parameter, static_base)?;
+                }
+                Ok(value)
+            });
+        if result.is_err() {
+            self.modules.pop();
+        }
+        result.map(|value| value as i32)
+    }
+
+    pub fn load_guest_image_and_call_entry(
+        &mut self,
+        address: GuestAddr,
+        len: usize,
+        code: i32,
+        services: &mut dyn NativeServices,
+    ) -> Result<i32> {
+        let image = self.memory.read(address, len)?;
+        self.load_and_call_entry(&image, code, services)
+    }
+
+    pub fn call_active_helper(
+        &mut self,
+        code: i32,
+        input: &[u8],
+        services: &mut dyn NativeServices,
+    ) -> Result<(i32, Vec<u8>)> {
+        let helper = self
+            .active_helper
+            .ok_or_else(|| Error::Abi("no EXT helper is registered".into()))?;
+        let input_address = if input.is_empty() {
+            GuestAddr(0)
+        } else {
+            let address = self.allocate(input.len(), 4)?;
+            self.memory.write(address, input)?;
+            address
+        };
+        let output_fields = self.allocate(8, 4)?;
+        self.memory.write_u32(output_fields, 0)?;
+        self.memory.write_u32(output_fields.checked_add(4)?, 0)?;
+        let module_parameter = self.modules[helper.module].helper_parameter;
+        let return_value = self.call_guest(
+            helper,
+            [
+                module_parameter.0,
+                code as u32,
+                input_address.0,
+                input.len() as u32,
+            ],
+            &[output_fields.0, output_fields.0 + 4],
+            services,
+        )? as i32;
+        let output_address = self.memory.read_u32(output_fields)?;
+        let output_len = self.memory.read_u32(output_fields.checked_add(4)?)? as usize;
+        let output = if output_address == 0 || output_len == 0 {
+            Vec::new()
+        } else {
+            if output_len > HEAP_LEN {
+                return Err(Error::Abi(format!(
+                    "EXT helper returned {output_len} output bytes"
+                )));
+            }
+            self.memory.read(GuestAddr(output_address), output_len)?
+        };
+        Ok((return_value, output))
+    }
+
+    pub fn timer_due_in(&self) -> Option<Duration> {
+        self.timer_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub fn take_due_timer(&mut self) -> Result<bool> {
+        let Some(deadline) = self.timer_deadline else {
+            return Ok(false);
+        };
+        if deadline > Instant::now() {
+            return Ok(false);
+        }
+        self.timer_deadline = None;
+        self.memory.write_u32(TIMER_ACTIVE_DATA, 0)?;
+        Ok(true)
+    }
+
+    fn call_guest(
+        &mut self,
+        function: GuestFunction,
+        registers: [u32; 4],
+        stack_arguments: &[u32],
+        services: &mut dyn NativeServices,
+    ) -> Result<u32> {
+        let module = self.modules.get(function.module).ok_or_else(|| {
+            Error::Abi(format!(
+                "guest function references module {}",
+                function.module
+            ))
+        })?;
+        let module_end = module.base.0 + module.len as u32;
+        let executable_address = function.address & !1;
+        if executable_address < module.base.0 || executable_address >= module_end {
+            return Err(Error::Abi(format!(
+                "guest function {:#010x} is outside module {}",
+                function.address, function.module
+            )));
+        }
+
+        let mut cpu = ArmCpu::new();
+        for (index, value) in registers.into_iter().enumerate() {
+            cpu.set_register(index, value);
+        }
+        cpu.set_register(9, module.static_base_r9);
+        let stack_top = STACK_BASE.0 + STACK_LEN as u32;
+        let stack_bytes = u32::try_from(stack_arguments.len())
+            .ok()
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(|| Error::ArmFault("stack argument size overflow".into()))?;
+        let stack_pointer = stack_top
+            .checked_sub(stack_bytes)
+            .ok_or_else(|| Error::ArmFault("EXT stack underflow".into()))?
+            & !7;
+        for (index, argument) in stack_arguments.iter().copied().enumerate() {
+            self.memory.write_u32(
+                GuestAddr(stack_pointer + u32::try_from(index).unwrap() * 4),
+                argument,
+            )?;
+        }
+        cpu.set_register(13, stack_pointer);
+        cpu.set_register(14, RETURN_SENTINEL);
+        cpu.set_pc(function.address);
+
+        for instruction_count in 0..INSTRUCTION_BUDGET {
+            let pc = cpu.pc().0;
+            if pc == RETURN_SENTINEL {
+                return Ok(cpu.register(0));
+            }
+            if let Some(slot) = trap_slot(pc) {
+                self.dispatch(slot, function.module, &mut cpu, services)?;
+                let return_address = cpu.register(14);
+                cpu.set_pc(return_address);
+                continue;
+            }
+            if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+                eprintln!(
+                    "[arm-step] module={} n={} pc={pc:#010x} cpsr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r9={:#010x} sp={:#010x} lr={:#010x}",
+                    function.module,
+                    instruction_count,
+                    cpu.cpsr(),
+                    cpu.register(0),
+                    cpu.register(1),
+                    cpu.register(2),
+                    cpu.register(3),
+                    cpu.register(9),
+                    cpu.register(13),
+                    cpu.register(14),
+                );
+            }
+            if let Err(error) = cpu.step(&mut self.memory) {
+                return Err(match error {
+                    Error::ArmFault(message) => Error::ArmFault(format!(
+                        "{message} while executing module {} at PC {pc:#010x} (r0={:#010x}, r1={:#010x}, r2={:#010x}, r3={:#010x}, r9={:#010x}, sp={:#010x}, lr={:#010x})",
+                        function.module,
+                        cpu.register(0),
+                        cpu.register(1),
+                        cpu.register(2),
+                        cpu.register(3),
+                        cpu.register(9),
+                        cpu.register(13),
+                        cpu.register(14),
+                    )),
+                    other => other,
+                });
+            }
+        }
+        Err(Error::ArmFault(format!(
+            "instruction budget {INSTRUCTION_BUDGET} exhausted in module {} at PC {:#010x}",
+            function.module,
+            cpu.pc().0
+        )))
+    }
+
+    fn dispatch(
+        &mut self,
+        slot: u32,
+        module: usize,
+        cpu: &mut ArmCpu,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+            eprintln!(
+                "[arm-trap] module={module} slot={slot} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r9={:#010x}",
+                cpu.register(0),
+                cpu.register(1),
+                cpu.register(2),
+                cpu.register(3),
+                cpu.register(9)
+            );
+        }
+        match slot {
+            0..=20 => self.dispatch_libc(slot, cpu)?,
+            25 => {
+                let helper = cpu.register(0);
+                let parameter_len = cpu.register(1).max(20) as usize;
+                let parameter = self.allocate(parameter_len, 8)?;
+                self.memory.write(parameter, &vec![0; parameter_len])?;
+                let function = GuestFunction {
+                    module,
+                    address: helper,
+                };
+                let context = self.modules.get_mut(module).ok_or_else(|| {
+                    Error::Abi(format!("helper registration for missing module {module}"))
+                })?;
+                context.helper = Some(function);
+                context.helper_parameter = parameter;
+                self.active_helper = Some(function);
+                cpu.set_register(0, parameter.0);
+            }
+            26 => {
+                let format = self.read_c_string(GuestAddr(cpu.register(0)), 64 * 1024)?;
+                if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+                    eprintln!(
+                        "[guest-printf] format={:?} r1={:#010x} r2={:#010x} r3={:#010x}",
+                        String::from_utf8_lossy(&format),
+                        cpu.register(1),
+                        cpu.register(2),
+                        cpu.register(3)
+                    );
+                }
+                cpu.set_register(0, format.len() as u32);
+            }
+            29 => {
+                let source = GuestAddr(cpu.register(0));
+                let x = cpu.register(1) as i32;
+                let y = cpu.register(2) as i32;
+                let width = cpu.register(3) as usize;
+                let height = self.memory.read_u32(GuestAddr(cpu.register(13)))? as usize;
+                let byte_len = width
+                    .checked_mul(height)
+                    .and_then(|pixels| pixels.checked_mul(2))
+                    .ok_or_else(|| Error::Abi("mr_drawBitmap dimensions overflow".into()))?;
+                if byte_len > HEAP_LEN {
+                    return Err(Error::Abi(format!(
+                        "mr_drawBitmap source is {byte_len} bytes"
+                    )));
+                }
+                let pixels = self.memory.read(source, byte_len)?;
+                services.draw_bitmap(&pixels, x, y, width, height)?;
+                cpu.set_register(0, 0);
+            }
+            30 => {
+                let codepoint = cpu.register(0);
+                let font = cpu.register(1);
+                let width_out = GuestAddr(cpu.register(2));
+                let height_out = GuestAddr(cpu.register(3));
+                let key = (codepoint, font);
+                let glyph = match self.glyphs.get(&key).copied() {
+                    Some(glyph) => Some(glyph),
+                    None => match services.char_bitmap(codepoint, font)? {
+                        Some((bitmap, width, height)) => {
+                            let address = self.allocate(bitmap.len(), 4)?;
+                            self.memory.write(address, &bitmap)?;
+                            let glyph = GuestGlyph {
+                                address,
+                                width,
+                                height,
+                            };
+                            self.glyphs.insert(key, glyph);
+                            Some(glyph)
+                        }
+                        None => None,
+                    },
+                };
+                let (address, width, height) = glyph
+                    .map(|glyph| (glyph.address.0, glyph.width, glyph.height))
+                    .unwrap_or((0, 0, 0));
+                if width_out.0 != 0 {
+                    self.memory.write_u32(width_out, width)?;
+                }
+                if height_out.0 != 0 {
+                    self.memory.write_u32(height_out, height)?;
+                }
+                cpu.set_register(0, address);
+            }
+            31 => {
+                let delay = Duration::from_millis(u64::from(cpu.register(0)));
+                self.timer_deadline = Instant::now().checked_add(delay);
+                self.memory.write_u32(TIMER_ACTIVE_DATA, 1)?;
+                cpu.set_register(0, 0);
+            }
+            32 => {
+                self.timer_deadline = None;
+                self.memory.write_u32(TIMER_ACTIVE_DATA, 0)?;
+                cpu.set_register(0, 0);
+            }
+            33 => {
+                cpu.set_register(0, self.clock_origin.elapsed().as_millis() as u32);
+            }
+            35 => {
+                // No device identity provider is configured. Callers treat -1
+                // as an unavailable optional user-info record.
+                cpu.set_register(0, u32::MAX);
+            }
+            37 => match (cpu.register(0), cpu.register(1)) {
+                // Baseline SDK initialization notification; the return value is ignored.
+                (1_106, 0) => cpu.set_register(0, 0),
+                (command, argument) => {
+                    return Err(Error::Abi(format!(
+                        "unsupported platform slot 37 command ({command}, {argument}) called by module {module}"
+                    )));
+                }
+            },
+            38 => match cpu.register(0) {
+                // Optional device identifier query. No device-info provider is configured.
+                1_204 => cpu.set_register(0, u32::MAX),
+                command => {
+                    return Err(Error::Abi(format!(
+                        "unsupported platform slot 38 command {command} called by module {module}"
+                    )));
+                }
+            },
+            40 => {
+                let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                cpu.set_register(0, services.open_file(&name, cpu.register(1))? as u32);
+            }
+            41 => {
+                cpu.set_register(0, services.close_file(cpu.register(0) as i32)? as u32);
+            }
+            42 => {
+                let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                cpu.set_register(0, services.file_info(&name)? as u32);
+            }
+            44 => {
+                let handle = cpu.register(0) as i32;
+                let destination = GuestAddr(cpu.register(1));
+                let len = cpu.register(2) as usize;
+                match services.read_file(handle, len)? {
+                    Some(bytes) => {
+                        self.memory.write(destination, &bytes)?;
+                        cpu.set_register(0, bytes.len() as u32);
+                    }
+                    None => cpu.set_register(0, u32::MAX),
+                }
+            }
+            45 => {
+                let succeeded = services.seek_file(
+                    cpu.register(0) as i32,
+                    cpu.register(1) as i32,
+                    cpu.register(2),
+                )?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            46 => {
+                let result = services.file_len(cpu.register(0) as i32)?;
+                cpu.set_register(
+                    0,
+                    result
+                        .and_then(|len| u32::try_from(len).ok())
+                        .unwrap_or(u32::MAX),
+                );
+            }
+            61 => {
+                // No carrier/network identity provider is configured.
+                cpu.set_register(0, u32::MAX);
+            }
+            80 => {
+                let info = GuestAddr(cpu.register(0));
+                let width = self.memory.read_u32(data_slot_address(92))?;
+                let height = self.memory.read_u32(data_slot_address(93))?;
+                self.memory.write_u32(info, width)?;
+                self.memory.write_u32(info.checked_add(4)?, height)?;
+                cpu.set_register(0, 0);
+            }
+            119 => {
+                let (width, height) = self.screen_dimensions()?;
+                self.write_screen_pixel(
+                    cpu.register(0) as i32,
+                    cpu.register(1) as i32,
+                    cpu.register(2) as u16,
+                    width,
+                    height,
+                )?;
+                cpu.set_register(0, 0);
+            }
+            120 => {
+                let source = GuestAddr(cpu.register(0));
+                let x = cpu.register(1) as i32;
+                let y = cpu.register(2) as i32;
+                let width = cpu.register(3) as usize;
+                let stack = GuestAddr(cpu.register(13));
+                let height = self.memory.read_u32(stack)? as usize;
+                let mode = self.memory.read_u32(stack.checked_add(4)?)?;
+                let transparent_color = self.memory.read_u32(stack.checked_add(8)?)? as u16;
+                let source_x = self.memory.read_u32(stack.checked_add(12)?)? as usize;
+                let source_y = self.memory.read_u32(stack.checked_add(16)?)? as usize;
+                let source_stride = self.memory.read_u32(stack.checked_add(20)?)? as usize;
+                let transparent_color = match mode {
+                    2 => None,
+                    6 => Some(transparent_color),
+                    _ => {
+                        return Err(Error::Abi(format!(
+                            "unsupported bitmap drawing mode {mode} called by module {module}"
+                        )));
+                    }
+                };
+                let source_end_x = source_x
+                    .checked_add(width)
+                    .ok_or_else(|| Error::Abi("bitmap source width overflow".into()))?;
+                if source_end_x > source_stride {
+                    return Err(Error::Abi(format!(
+                        "bitmap source region ends at {source_end_x}, beyond stride {source_stride}"
+                    )));
+                }
+                let source_end_y = source_y
+                    .checked_add(height)
+                    .ok_or_else(|| Error::Abi("bitmap source height overflow".into()))?;
+                let byte_len = width
+                    .checked_mul(height)
+                    .and_then(|pixels| pixels.checked_mul(2))
+                    .ok_or_else(|| Error::Abi("bitmap source byte count overflow".into()))?;
+                if byte_len > HEAP_LEN {
+                    return Err(Error::Abi(format!(
+                        "bitmap source region requires {byte_len} bytes"
+                    )));
+                }
+                let pixels = if source_x == 0 && width == source_stride {
+                    let byte_offset = source_y
+                        .checked_mul(source_stride)
+                        .and_then(|offset| offset.checked_mul(2))
+                        .and_then(|offset| u32::try_from(offset).ok())
+                        .ok_or_else(|| Error::Abi("bitmap source offset overflow".into()))?;
+                    self.memory
+                        .read(source.checked_add(byte_offset)?, byte_len)?
+                } else {
+                    let row_len = width
+                        .checked_mul(2)
+                        .ok_or_else(|| Error::Abi("bitmap source row overflow".into()))?;
+                    let mut pixels = Vec::with_capacity(byte_len);
+                    for row in source_y..source_end_y {
+                        let byte_offset = row
+                            .checked_mul(source_stride)
+                            .and_then(|offset| offset.checked_add(source_x))
+                            .and_then(|offset| offset.checked_mul(2))
+                            .and_then(|offset| u32::try_from(offset).ok())
+                            .ok_or_else(|| Error::Abi("bitmap source offset overflow".into()))?;
+                        pixels.extend_from_slice(
+                            &self
+                                .memory
+                                .read(source.checked_add(byte_offset)?, row_len)?,
+                        );
+                    }
+                    pixels
+                };
+                self.draw_bitmap_region_to_screen(&pixels, x, y, width, height, transparent_color)?;
+                cpu.set_register(0, 0);
+            }
+            121 => {
+                let source = self.read_bitmap_descriptor(GuestAddr(cpu.register(0)))?;
+                let destination = self.read_bitmap_descriptor(GuestAddr(cpu.register(1)))?;
+                let stack = GuestAddr(cpu.register(13));
+                let transform_address = GuestAddr(self.memory.read_u32(stack)?);
+                let transform = self.read_bitmap_transform(transform_address)?;
+                let transparent_color = self.memory.read_u32(stack.checked_add(4)?)? as u16;
+                self.copy_transformed_bitmap(
+                    destination,
+                    source,
+                    cpu.register(2) as usize,
+                    cpu.register(3) as usize,
+                    transform,
+                    transparent_color,
+                    module,
+                )?;
+                cpu.set_register(0, 0);
+            }
+            122 => {
+                let stack = GuestAddr(cpu.register(13));
+                let color = Framebuffer::rgb565(
+                    self.memory.read_u32(stack)? as i32,
+                    self.memory.read_u32(stack.checked_add(4)?)? as i32,
+                    self.memory.read_u32(stack.checked_add(8)?)? as i32,
+                );
+                let x = cpu.register(0) as i32;
+                let y = cpu.register(1) as i32;
+                let width = cpu.register(2) as i32;
+                let height = cpu.register(3) as i32;
+                self.draw_rectangle_to_screen(x, y, width, height, color)?;
+                cpu.set_register(0, 0);
+            }
+            123 => {
+                let stack = GuestAddr(cpu.register(13));
+                let style = self.memory.read_u32(stack.checked_add(12)?)?;
+                if style != 0 {
+                    return Err(Error::Abi(format!(
+                        "unsupported text drawing style {style} called by module {module}"
+                    )));
+                }
+                let text = self.read_wide_string_be(GuestAddr(cpu.register(0)), 64 * 1024)?;
+                let color = Framebuffer::rgb565(
+                    cpu.register(3) as i32,
+                    self.memory.read_u32(stack)? as i32,
+                    self.memory.read_u32(stack.checked_add(4)?)? as i32,
+                );
+                self.draw_text_to_screen(
+                    &text,
+                    cpu.register(1) as i32,
+                    cpu.register(2) as i32,
+                    color,
+                    self.memory.read_u32(stack.checked_add(8)?)?,
+                    services,
+                )?;
+                cpu.set_register(0, 0);
+            }
+            125 => {
+                let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                let ram_address = self.memory.read_u32(data_slot_address(104))?;
+                let ram_len = self.memory.read_u32(data_slot_address(105))? as usize;
+                let bytes = if ram_address == 0 && ram_len == 0 {
+                    services.read_package_file(&name)?
+                } else {
+                    if ram_address == 0 || ram_len == 0 {
+                        return Err(Error::Abi(format!(
+                            "RAM-backed MRP has inconsistent address {ram_address:#010x} and length {ram_len}"
+                        )));
+                    }
+                    self.read_ram_package_file(GuestAddr(ram_address), ram_len, &name)?
+                };
+                if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+                    eprintln!(
+                        "[arm-package] name={:?} ram={ram_address:#010x}+{ram_len:#x} result_len={:?}",
+                        String::from_utf8_lossy(&name),
+                        bytes.as_ref().map(Vec::len),
+                    );
+                }
+                let Some(bytes) = bytes else {
+                    let len_pointer = GuestAddr(cpu.register(1));
+                    if len_pointer.0 != 0 {
+                        self.memory.write_u32(len_pointer, 0)?;
+                    }
+                    cpu.set_register(0, 0);
+                    return Ok(());
+                };
+                let prepared_output = if ram_address == 0 {
+                    None
+                } else {
+                    self.compact_ram_output_target(GuestAddr(ram_address), ram_len, bytes.len())?
+                };
+                let output = match prepared_output {
+                    Some(output) => output,
+                    None => self.allocate(bytes.len(), 8)?,
+                };
+                self.memory.write(output, &bytes)?;
+                let len_pointer = GuestAddr(cpu.register(1));
+                if len_pointer.0 != 0 {
+                    self.memory.write_u32(len_pointer, bytes.len() as u32)?;
+                }
+                cpu.set_register(0, output.0);
+            }
+            130 => match (cpu.register(0), cpu.register(1), cpu.register(2)) {
+                // Baseline SDK compatibility probe, equivalent to the MR TestCom stub.
+                (0, 7, 9_999) => cpu.set_register(0, 0),
+                (command, argument, fallback) => {
+                    return Err(Error::Abi(format!(
+                        "unsupported platform slot 130 command ({command}, {argument}, {fallback}) called by module {module}"
+                    )));
+                }
+            },
+            131 => match (
+                cpu.register(0),
+                cpu.register(1),
+                cpu.register(2),
+                cpu.register(3),
+            ) {
+                // Marks a dynamically loaded native module as executable.
+                (0, 9, address, len) if len != 0 => {
+                    let address = GuestAddr(address);
+                    let image = self.memory.read(address, len as usize)?;
+                    if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+                        eprintln!(
+                            "[arm-executable] address={:#010x} len={len:#x} head={:02x?}",
+                            address.0,
+                            &image[..image.len().min(64)]
+                        );
+                    }
+                    self.memory
+                        .add_permissions(address, len as usize, Permissions::EXECUTE)?;
+                    cpu.set_register(0, 0);
+                }
+                (command, argument, address, len) => {
+                    return Err(Error::Abi(format!(
+                        "unsupported platform slot 131 command ({command}, {argument}, {address:#010x}, {len}) called by module {module}"
+                    )));
+                }
+            },
+            other => {
+                let return_address = cpu.register(14) & !1;
+                let caller_start = return_address.saturating_sub(24);
+                let caller_bytes = self
+                    .memory
+                    .read(GuestAddr(caller_start), 48)
+                    .map(|bytes| format!("{bytes:02x?}"))
+                    .unwrap_or_else(|error| format!("unavailable: {error}"));
+                let stack_words = (0..6)
+                    .map(|index| {
+                        self.memory
+                            .read_u32(GuestAddr(cpu.register(13).wrapping_add(index * 4)))
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(|words| format!("{words:08x?}"))
+                    .unwrap_or_else(|error| format!("unavailable: {error}"));
+                let argument_bytes = self
+                    .memory
+                    .read(GuestAddr(cpu.register(0)), 32)
+                    .map(|bytes| format!("{bytes:02x?}"))
+                    .unwrap_or_else(|error| format!("unavailable: {error}"));
+                let second_argument_bytes = self
+                    .memory
+                    .read(GuestAddr(cpu.register(1)), 32)
+                    .map(|bytes| format!("{bytes:02x?}"))
+                    .unwrap_or_else(|error| format!("unavailable: {error}"));
+                let stack_record_bytes = self
+                    .memory
+                    .read_u32(GuestAddr(cpu.register(13)))
+                    .and_then(|address| self.memory.read(GuestAddr(address), 32))
+                    .map(|bytes| format!("{bytes:02x?}"))
+                    .unwrap_or_else(|error| format!("unavailable: {error}"));
+                return Err(Error::Abi(format!(
+                    "unsupported platform slot {other} called by module {module} at LR {:#010x} (r0={:#010x}, r1={:#010x}, r2={:#010x}, r3={:#010x}, sp={:#010x}, stack={stack_words}, r0-bytes={argument_bytes}, r1-bytes={second_argument_bytes}, stack-record={stack_record_bytes}); guest bytes at {caller_start:#010x}: {caller_bytes}",
+                    cpu.register(14),
+                    cpu.register(0),
+                    cpu.register(1),
+                    cpu.register(2),
+                    cpu.register(3),
+                    cpu.register(13),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn compact_ram_output_target(
+        &self,
+        package_address: GuestAddr,
+        package_len: usize,
+        output_len: usize,
+    ) -> Result<Option<GuestAddr>> {
+        if package_len < 24 {
+            return Ok(None);
+        }
+        let header = self.memory.read(package_address, 24)?;
+        if &header[..4] != b"MRPG"
+            || read_le_u32(&header, 4)? != 4
+            || read_le_u32(&header, 12)? != 4
+        {
+            return Ok(None);
+        }
+
+        let output_len = u32::try_from(output_len)
+            .map_err(|_| Error::Abi("compact RAM MRP output length exceeds u32".into()))?;
+        let aligned_len = output_len
+            .checked_add(7)
+            .map(|len| len & !7)
+            .ok_or_else(|| Error::Abi("compact RAM MRP output alignment overflow".into()))?;
+        let heap_end = HEAP_BASE.0 + HEAP_LEN as u32;
+        let mut candidates = Vec::new();
+        for descriptor_len_address in (HEAP_BASE.0 + 4..heap_end).step_by(4) {
+            let recorded_len = self.memory.read_u32(GuestAddr(descriptor_len_address))?;
+            if recorded_len != aligned_len {
+                continue;
+            }
+            let candidate = self
+                .memory
+                .read_u32(GuestAddr(descriptor_len_address - 4))?;
+            let Some(candidate_end) = candidate.checked_add(output_len) else {
+                continue;
+            };
+            if candidate & 7 != 0 || candidate < HEAP_BASE.0 || candidate_end > heap_end {
+                continue;
+            }
+            let candidate = GuestAddr(candidate);
+            if self.memory.read_u32(candidate)? == 0
+                && self.memory.read_u32(candidate.checked_add(4)?)? == aligned_len
+            {
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        match candidates.as_slice() {
+            [] => Ok(None),
+            [candidate] => Ok(Some(*candidate)),
+            _ => Err(Error::Abi(format!(
+                "compact RAM MRP output has ambiguous prepared buffers: {candidates:?}"
+            ))),
+        }
+    }
+
+    fn draw_bitmap_region_to_screen(
+        &mut self,
+        pixels: &[u8],
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+        transparent_color: Option<u16>,
+    ) -> Result<()> {
+        let (screen_width, screen_height) = self.screen_dimensions()?;
+        let destination_x0 = i64::from(x).max(0);
+        let destination_y0 = i64::from(y).max(0);
+        let destination_x1 = (i64::from(x) + width as i64).min(i64::from(screen_width));
+        let destination_y1 = (i64::from(y) + height as i64).min(i64::from(screen_height));
+        if destination_x0 >= destination_x1 || destination_y0 >= destination_y1 {
+            return Ok(());
+        }
+
+        let visible_width = usize::try_from(destination_x1 - destination_x0)
+            .map_err(|_| Error::Abi("visible bitmap width exceeds usize".into()))?;
+        let source_x = usize::try_from(destination_x0 - i64::from(x))
+            .map_err(|_| Error::Abi("visible bitmap source x exceeds usize".into()))?;
+        let source_y = usize::try_from(destination_y0 - i64::from(y))
+            .map_err(|_| Error::Abi("visible bitmap source y exceeds usize".into()))?;
+        let row_byte_len = visible_width
+            .checked_mul(2)
+            .ok_or_else(|| Error::Abi("visible bitmap row byte count overflow".into()))?;
+
+        for visible_row in 0..usize::try_from(destination_y1 - destination_y0)
+            .map_err(|_| Error::Abi("visible bitmap height exceeds usize".into()))?
+        {
+            let source_offset = (source_y + visible_row)
+                .checked_mul(width)
+                .and_then(|offset| offset.checked_add(source_x))
+                .and_then(|offset| offset.checked_mul(2))
+                .ok_or_else(|| Error::Abi("visible bitmap source offset overflow".into()))?;
+            let source_row = &pixels[source_offset..source_offset + row_byte_len];
+            let destination_address = self.screen_address(
+                destination_x0 as i32,
+                destination_y0 as i32 + visible_row as i32,
+                screen_width,
+            )?;
+            if let Some(transparent_color) = transparent_color {
+                let mut destination_row = self.memory.read(destination_address, row_byte_len)?;
+                for (source, destination) in source_row
+                    .chunks_exact(2)
+                    .zip(destination_row.chunks_exact_mut(2))
+                {
+                    let color = u16::from_le_bytes([source[0], source[1]]);
+                    if color != transparent_color {
+                        destination.copy_from_slice(source);
+                    }
+                }
+                self.memory.write(destination_address, &destination_row)?;
+            } else {
+                self.memory.write(destination_address, source_row)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_bitmap_descriptor(&self, address: GuestAddr) -> Result<BitmapDescriptor> {
+        Ok(BitmapDescriptor {
+            pixels: GuestAddr(self.memory.read_u32(address)?),
+            width: usize::from(self.memory.read_u16(address.checked_add(4)?)?),
+            height: usize::from(self.memory.read_u16(address.checked_add(6)?)?),
+            x: i32::from(self.memory.read_u16(address.checked_add(8)?)? as i16),
+            y: i32::from(self.memory.read_u16(address.checked_add(10)?)? as i16),
+        })
+    }
+
+    fn read_bitmap_transform(&self, address: GuestAddr) -> Result<BitmapTransform> {
+        let read_field = |offset| {
+            self.memory
+                .read_u16(address.checked_add(offset)?)
+                .map(|value| value as i16)
+        };
+        Ok(BitmapTransform {
+            a: read_field(0)?,
+            b: read_field(2)?,
+            c: read_field(4)?,
+            d: read_field(6)?,
+            mode: read_field(8)?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_transformed_bitmap(
+        &mut self,
+        destination: BitmapDescriptor,
+        source: BitmapDescriptor,
+        width: usize,
+        height: usize,
+        transform: BitmapTransform,
+        transparent_color: u16,
+        module: usize,
+    ) -> Result<()> {
+        let transparent_color = match transform.mode {
+            2 => None,
+            6 => Some(transparent_color),
+            mode => {
+                return Err(Error::Abi(format!(
+                    "unsupported transformed bitmap mode {mode} called by module {module}"
+                )));
+            }
+        };
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let source_x = usize::try_from(source.x).map_err(|_| {
+            Error::Abi(format!("negative transformed bitmap source x {}", source.x))
+        })?;
+        let source_y = usize::try_from(source.y).map_err(|_| {
+            Error::Abi(format!("negative transformed bitmap source y {}", source.y))
+        })?;
+        let source_end_x = source_x
+            .checked_add(width)
+            .ok_or_else(|| Error::Abi("transformed bitmap source width overflow".into()))?;
+        let source_end_y = source_y
+            .checked_add(height)
+            .ok_or_else(|| Error::Abi("transformed bitmap source height overflow".into()))?;
+        if source_end_x > source.width || source_end_y > source.height {
+            return Err(Error::Abi(format!(
+                "transformed bitmap source region ({source_x}, {source_y}) {width}x{height} exceeds {}x{} bitmap",
+                source.width, source.height
+            )));
+        }
+        let pixel_count = width
+            .checked_mul(height)
+            .ok_or_else(|| Error::Abi("transformed bitmap region dimensions overflow".into()))?;
+        if pixel_count > HEAP_LEN / 2 {
+            return Err(Error::Abi(format!(
+                "transformed bitmap region requires {pixel_count} pixels"
+            )));
+        }
+
+        // Source and destination can refer to the same bitmap. Capture the
+        // complete source region before changing any destination pixel.
+        let mut pixels = Vec::with_capacity(pixel_count);
+        for row in 0..height {
+            for column in 0..width {
+                let address = bitmap_pixel_address(
+                    source.pixels,
+                    source.width,
+                    source_x + column,
+                    source_y + row,
+                )?;
+                pixels.push(self.memory.read_u16(address)?);
+            }
+        }
+
+        let last_x = i64::try_from(width - 1)
+            .map_err(|_| Error::Abi("transformed bitmap width exceeds i64".into()))?;
+        let last_y = i64::try_from(height - 1)
+            .map_err(|_| Error::Abi("transformed bitmap height exceeds i64".into()))?;
+        let corners = [
+            transform.apply(0, 0),
+            transform.apply(last_x, 0),
+            transform.apply(0, last_y),
+            transform.apply(last_x, last_y),
+        ];
+        let minimum_x = corners
+            .iter()
+            .map(|(x, _)| *x)
+            .min()
+            .expect("four transform corners");
+        let minimum_y = corners
+            .iter()
+            .map(|(_, y)| *y)
+            .min()
+            .expect("four transform corners");
+
+        for row in 0..height {
+            for column in 0..width {
+                let color = pixels[row * width + column];
+                if Some(color) == transparent_color {
+                    continue;
+                }
+                let (transformed_x, transformed_y) = transform.apply(column as i64, row as i64);
+                let destination_x = i64::from(destination.x) + transformed_x - minimum_x;
+                let destination_y = i64::from(destination.y) + transformed_y - minimum_y;
+                if destination_x < 0
+                    || destination_y < 0
+                    || destination_x >= destination.width as i64
+                    || destination_y >= destination.height as i64
+                {
+                    continue;
+                }
+                let address = bitmap_pixel_address(
+                    destination.pixels,
+                    destination.width,
+                    destination_x as usize,
+                    destination_y as usize,
+                )?;
+                self.memory.write_u16(address, color)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_rectangle_to_screen(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        color: u16,
+    ) -> Result<()> {
+        if width <= 0 || height <= 0 {
+            return Ok(());
+        }
+        let (screen_width, screen_height) = self.screen_dimensions()?;
+        let x0 = x.clamp(0, screen_width);
+        let y0 = y.clamp(0, screen_height);
+        let x1 = x.saturating_add(width).clamp(0, screen_width);
+        let y1 = y.saturating_add(height).clamp(0, screen_height);
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(());
+        }
+        let color = color.to_le_bytes();
+        let mut row = Vec::with_capacity((x1 - x0) as usize * 2);
+        for _ in x0..x1 {
+            row.extend_from_slice(&color);
+        }
+        for screen_y in y0..y1 {
+            let address = self.screen_address(x0, screen_y, screen_width)?;
+            self.memory.write(address, &row)?;
+        }
+        Ok(())
+    }
+
+    fn draw_text_to_screen(
+        &mut self,
+        text: &[u16],
+        mut x: i32,
+        y: i32,
+        color: u16,
+        font: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        let (screen_width, screen_height) = self.screen_dimensions()?;
+        for &codepoint in text {
+            let Some((glyph, width, height)) = services.char_bitmap(u32::from(codepoint), font)?
+            else {
+                x += if codepoint < 128 { 8 } else { 16 };
+                continue;
+            };
+            let width = width.min(16) as i32;
+            let height = height.min(16) as usize;
+            let required = height
+                .checked_mul(2)
+                .ok_or_else(|| Error::Abi("character bitmap size overflow".into()))?;
+            if glyph.len() < required {
+                return Err(Error::Abi(format!(
+                    "character bitmap for {codepoint:#06x} has {} bytes, needs {required}",
+                    glyph.len()
+                )));
+            }
+            for row in 0..height as i32 {
+                let offset = row as usize * 2;
+                let bits = u16::from_be_bytes([glyph[offset], glyph[offset + 1]]);
+                for column in 0..width {
+                    if bits & (0x8000_u16 >> column) != 0 {
+                        self.write_screen_pixel(
+                            x + column,
+                            y + row,
+                            color,
+                            screen_width,
+                            screen_height,
+                        )?;
+                    }
+                }
+            }
+            x += width;
+        }
+        Ok(())
+    }
+
+    fn write_screen_pixel(
+        &mut self,
+        x: i32,
+        y: i32,
+        color: u16,
+        width: i32,
+        height: i32,
+    ) -> Result<()> {
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return Ok(());
+        }
+        let address = self.screen_address(x, y, width)?;
+        self.memory.write_u16(address, color)
+    }
+
+    fn screen_dimensions(&self) -> Result<(i32, i32)> {
+        let width = self.memory.read_u32(data_slot_address(92))?;
+        let height = self.memory.read_u32(data_slot_address(93))?;
+        Ok((
+            i32::try_from(width)
+                .map_err(|_| Error::Abi(format!("screen width {width} exceeds i32")))?,
+            i32::try_from(height)
+                .map_err(|_| Error::Abi(format!("screen height {height} exceeds i32")))?,
+        ))
+    }
+
+    fn screen_address(&self, x: i32, y: i32, width: i32) -> Result<GuestAddr> {
+        let offset = y
+            .checked_mul(width)
+            .and_then(|offset| offset.checked_add(x))
+            .and_then(|offset| offset.checked_mul(2))
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or_else(|| Error::Abi("screen pixel offset overflow".into()))?;
+        SCREEN_BASE.checked_add(offset)
+    }
+
+    fn read_ram_package_file(
+        &self,
+        address: GuestAddr,
+        len: usize,
+        name: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let image = self.memory.read(address, len)?;
+        if image.len() < 24 || &image[..4] != b"MRPG" {
+            return Err(Error::Package(
+                "RAM-backed MRP is missing its 24-byte MRPG header".into(),
+            ));
+        }
+
+        // Native wrappers use this compact one-file MRP while the current
+        // package name is "$". The four-byte name precedes the stored length,
+        // and the single payload follows the 24-byte header immediately.
+        if read_le_u32(&image, 4)? == 4 && read_le_u32(&image, 12)? == 4 {
+            let compact_name = image[16..20]
+                .split(|byte| *byte == 0)
+                .next()
+                .unwrap_or_default();
+            if compact_name.is_empty() || name != compact_name {
+                return Ok(None);
+            }
+            let declared_len = read_le_u32(&image, 8)? as usize;
+            let stored_len = read_le_u32(&image, 20)? as usize;
+            let payload_end = 24_usize
+                .checked_add(stored_len)
+                .ok_or_else(|| Error::Package("compact RAM MRP payload range overflow".into()))?;
+            if declared_len > image.len() || payload_end > declared_len {
+                return Err(Error::Package(format!(
+                    "compact RAM MRP payload 0x18..{payload_end:#x} exceeds declared length {declared_len}"
+                )));
+            }
+            return expand_ram_payload(&image[24..payload_end]).map(Some);
+        }
+
+        let limits = ResourceLimits {
+            max_package_len: HEAP_LEN,
+            max_stored_file_len: HEAP_LEN,
+            max_expanded_file_len: HEAP_LEN,
+            max_total_expanded_len: HEAP_LEN,
+            ..ResourceLimits::default()
+        };
+        let package = Package::parse(
+            PathBuf::from("<guest-memory>.mrp"),
+            Arc::from(image),
+            limits,
+        )?;
+        match package.read_named(name) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(Error::EntryNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn dispatch_libc(&mut self, slot: u32, cpu: &mut ArmCpu) -> Result<()> {
+        match slot {
+            0 => {
+                let address = self.allocate(cpu.register(0) as usize, 8)?;
+                cpu.set_register(0, address.0);
+            }
+            1 => cpu.set_register(0, 0),
+            2 => {
+                let source = GuestAddr(cpu.register(0));
+                let old_len = cpu.register(1) as usize;
+                let new_len = cpu.register(2) as usize;
+                if source.0 == 0 {
+                    let output = self.allocate(new_len, 8)?;
+                    cpu.set_register(0, output.0);
+                } else if new_len == 0 {
+                    cpu.set_register(0, 0);
+                } else {
+                    let output = self.allocate(new_len, 8)?;
+                    let bytes = self.memory.read(source, old_len.min(new_len))?;
+                    self.memory.write(output, &bytes)?;
+                    cpu.set_register(0, output.0);
+                }
+            }
+            3 | 4 => {
+                let destination = GuestAddr(cpu.register(0));
+                let bytes = self
+                    .memory
+                    .read(GuestAddr(cpu.register(1)), cpu.register(2) as usize)?;
+                self.memory.write(destination, &bytes)?;
+                cpu.set_register(0, destination.0);
+            }
+            5 => {
+                let destination = GuestAddr(cpu.register(0));
+                let bytes = self.read_c_string(GuestAddr(cpu.register(1)), 1024 * 1024)?;
+                self.memory.write(destination, &bytes)?;
+                self.memory
+                    .write_u8(destination.checked_add(bytes.len() as u32)?, 0)?;
+                cpu.set_register(0, destination.0);
+            }
+            6 => {
+                let destination = GuestAddr(cpu.register(0));
+                let source =
+                    self.read_c_string(GuestAddr(cpu.register(1)), cpu.register(2) as usize)?;
+                let len = cpu.register(2) as usize;
+                let mut bytes = vec![0; len];
+                let copied = source.len().min(len);
+                bytes[..copied].copy_from_slice(&source[..copied]);
+                self.memory.write(destination, &bytes)?;
+                cpu.set_register(0, destination.0);
+            }
+            7 | 8 => {
+                let destination = GuestAddr(cpu.register(0));
+                let destination_len = self.read_c_string(destination, 1024 * 1024)?.len();
+                let mut source = self.read_c_string(GuestAddr(cpu.register(1)), 1024 * 1024)?;
+                if slot == 8 {
+                    source.truncate(cpu.register(2) as usize);
+                }
+                let append_at = destination.checked_add(destination_len as u32)?;
+                self.memory.write(append_at, &source)?;
+                self.memory
+                    .write_u8(append_at.checked_add(source.len() as u32)?, 0)?;
+                cpu.set_register(0, destination.0);
+            }
+            9 => {
+                let len = cpu.register(2) as usize;
+                let left = self.memory.read(GuestAddr(cpu.register(0)), len)?;
+                let right = self.memory.read(GuestAddr(cpu.register(1)), len)?;
+                cpu.set_register(0, compare_bytes(&left, &right) as u32);
+            }
+            10 | 12 => {
+                let left = self.read_c_string(GuestAddr(cpu.register(0)), 1024 * 1024)?;
+                let right = self.read_c_string(GuestAddr(cpu.register(1)), 1024 * 1024)?;
+                cpu.set_register(0, compare_bytes(&left, &right) as u32);
+            }
+            11 => {
+                let limit = cpu.register(2) as usize;
+                let mut left = self.read_c_string(GuestAddr(cpu.register(0)), limit)?;
+                let mut right = self.read_c_string(GuestAddr(cpu.register(1)), limit)?;
+                left.truncate(limit);
+                right.truncate(limit);
+                cpu.set_register(0, compare_bytes(&left, &right) as u32);
+            }
+            13 => {
+                let start = cpu.register(0);
+                let needle = cpu.register(1) as u8;
+                let bytes = self
+                    .memory
+                    .read(GuestAddr(start), cpu.register(2) as usize)?;
+                cpu.set_register(
+                    0,
+                    bytes
+                        .iter()
+                        .position(|byte| *byte == needle)
+                        .map(|offset| start + offset as u32)
+                        .unwrap_or(0),
+                );
+            }
+            14 => {
+                let destination = GuestAddr(cpu.register(0));
+                let value = cpu.register(1) as u8;
+                let len = cpu.register(2) as usize;
+                self.memory.write(destination, &vec![value; len])?;
+                cpu.set_register(0, destination.0);
+            }
+            15 => {
+                let len = self
+                    .read_c_string(GuestAddr(cpu.register(0)), 1024 * 1024)?
+                    .len();
+                cpu.set_register(0, len as u32);
+            }
+            16 => {
+                let start = cpu.register(0);
+                let haystack = self.read_c_string(GuestAddr(start), 1024 * 1024)?;
+                let needle = self.read_c_string(GuestAddr(cpu.register(1)), 1024 * 1024)?;
+                let found = if needle.is_empty() {
+                    Some(0)
+                } else {
+                    haystack
+                        .windows(needle.len())
+                        .position(|window| window == needle)
+                };
+                cpu.set_register(0, found.map(|offset| start + offset as u32).unwrap_or(0));
+            }
+            17 => self.sprintf(cpu)?,
+            18 => {
+                let text = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                cpu.set_register(0, parse_integer(&text, 10).0 as u32);
+            }
+            19 => {
+                let source = cpu.register(0);
+                let text = self.read_c_string(GuestAddr(source), 1024)?;
+                let base = cpu.register(2);
+                let (value, consumed) = parse_integer(&text, base);
+                let end_pointer = GuestAddr(cpu.register(1));
+                if end_pointer.0 != 0 {
+                    self.memory
+                        .write_u32(end_pointer, source.wrapping_add(consumed as u32))?;
+                }
+                cpu.set_register(0, value as u32);
+            }
+            20 => {
+                self.random_state = self
+                    .random_state
+                    .wrapping_mul(1_103_515_245)
+                    .wrapping_add(12_345);
+                cpu.set_register(0, (self.random_state >> 16) & 0x7fff);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn sprintf(&mut self, cpu: &mut ArmCpu) -> Result<()> {
+        let destination = GuestAddr(cpu.register(0));
+        let format = self.read_c_string(GuestAddr(cpu.register(1)), 64 * 1024)?;
+        let stack_pointer = cpu.register(13);
+        let mut argument_index = 0_u32;
+        let mut next_argument = |memory: &GuestMemory| -> Result<u32> {
+            let value = match argument_index {
+                0 => cpu.register(2),
+                1 => cpu.register(3),
+                index => memory.read_u32(GuestAddr(stack_pointer + (index - 2) * 4))?,
+            };
+            argument_index += 1;
+            Ok(value)
+        };
+        let mut output = Vec::new();
+        let mut index = 0;
+        while index < format.len() {
+            if format[index] != b'%' {
+                output.push(format[index]);
+                index += 1;
+                continue;
+            }
+            index += 1;
+            if format.get(index) == Some(&b'%') {
+                output.push(b'%');
+                index += 1;
+                continue;
+            }
+            while format
+                .get(index)
+                .is_some_and(|byte| b"-+ #0.123456789hl".contains(byte))
+            {
+                index += 1;
+            }
+            let specifier = *format
+                .get(index)
+                .ok_or_else(|| Error::Abi("sprintf format ends after '%'".into()))?;
+            index += 1;
+            let argument = next_argument(&self.memory)?;
+            match specifier {
+                b's' => {
+                    output.extend_from_slice(&self.read_c_string(GuestAddr(argument), 1024 * 1024)?)
+                }
+                b'c' => output.push(argument as u8),
+                b'd' | b'i' => output.extend_from_slice((argument as i32).to_string().as_bytes()),
+                b'u' => output.extend_from_slice(argument.to_string().as_bytes()),
+                b'x' => output.extend_from_slice(format!("{argument:x}").as_bytes()),
+                b'X' => output.extend_from_slice(format!("{argument:X}").as_bytes()),
+                b'p' => output.extend_from_slice(format!("0x{argument:08x}").as_bytes()),
+                other => {
+                    return Err(Error::Abi(format!(
+                        "unsupported sprintf specifier {:?}",
+                        char::from(other)
+                    )));
+                }
+            }
+        }
+        self.memory.write(destination, &output)?;
+        self.memory
+            .write_u8(destination.checked_add(output.len() as u32)?, 0)?;
+        cpu.set_register(0, output.len() as u32);
+        Ok(())
+    }
+
+    fn allocate(&mut self, len: usize, alignment: u32) -> Result<GuestAddr> {
+        let len = len.max(1);
+        let mask = alignment - 1;
+        let start = self
+            .heap_cursor
+            .checked_add(mask)
+            .map(|value| value & !mask)
+            .ok_or_else(|| Error::ArmFault("guest heap alignment overflow".into()))?;
+        let end = start
+            .checked_add(u32::try_from(len).map_err(|_| {
+                Error::ArmFault(format!("guest allocation length {len} does not fit u32"))
+            })?)
+            .ok_or_else(|| Error::ArmFault("guest heap allocation overflow".into()))?;
+        if end > HEAP_BASE.0 + HEAP_LEN as u32 {
+            return Err(Error::ArmFault(format!(
+                "guest heap exhausted while allocating {len} bytes"
+            )));
+        }
+        self.heap_cursor = end;
+        self.memory
+            .write_u32(data_slot_address(111), HEAP_BASE.0 + HEAP_LEN as u32 - end)?;
+        Ok(GuestAddr(start))
+    }
+
+    fn read_c_string(&self, address: GuestAddr, limit: usize) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for offset in 0..limit {
+            let byte = self.memory.read_u8(address.checked_add(offset as u32)?)?;
+            if byte == 0 {
+                return Ok(bytes);
+            }
+            bytes.push(byte);
+        }
+        Err(Error::Abi(format!(
+            "guest C string at {:#010x} exceeds {limit} bytes",
+            address.0
+        )))
+    }
+
+    fn read_wide_string_be(&self, address: GuestAddr, limit: usize) -> Result<Vec<u16>> {
+        let mut codepoints = Vec::new();
+        for offset in 0..limit {
+            let address = address.checked_add(
+                u32::try_from(offset)
+                    .ok()
+                    .and_then(|offset| offset.checked_mul(2))
+                    .ok_or_else(|| Error::Abi("guest wide-string offset overflow".into()))?,
+            )?;
+            let bytes = self.memory.read(address, 2)?;
+            let codepoint = u16::from_be_bytes([bytes[0], bytes[1]]);
+            if codepoint == 0 {
+                return Ok(codepoints);
+            }
+            codepoints.push(codepoint);
+        }
+        Err(Error::Abi(format!(
+            "guest wide string at {:#010x} exceeds {limit} code units",
+            address.0
+        )))
+    }
+}
+
+impl BitmapTransform {
+    fn apply(self, x: i64, y: i64) -> (i64, i64) {
+        (
+            (i64::from(self.a) * x + i64::from(self.b) * y) >> 8,
+            (i64::from(self.c) * x + i64::from(self.d) * y) >> 8,
+        )
+    }
+}
+
+fn bitmap_pixel_address(pixels: GuestAddr, stride: usize, x: usize, y: usize) -> Result<GuestAddr> {
+    let byte_offset = y
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(x))
+        .and_then(|offset| offset.checked_mul(2))
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or_else(|| Error::Abi("bitmap pixel offset overflow".into()))?;
+    pixels.checked_add(byte_offset)
+}
+
+fn compare_bytes(left: &[u8], right: &[u8]) -> i32 {
+    for (left, right) in left.iter().copied().zip(right.iter().copied()) {
+        if left != right {
+            return i32::from(left) - i32::from(right);
+        }
+    }
+    left.len().cmp(&right.len()) as i32
+}
+
+fn parse_integer(input: &[u8], requested_base: u32) -> (i64, usize) {
+    let mut index = 0;
+    while input.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    let negative = input.get(index) == Some(&b'-');
+    if negative || input.get(index) == Some(&b'+') {
+        index += 1;
+    }
+    let mut base = requested_base;
+    if base == 0 {
+        base = if input
+            .get(index..index + 2)
+            .is_some_and(|prefix| prefix[0] == b'0' && matches!(prefix[1], b'x' | b'X'))
+        {
+            16
+        } else if input.get(index) == Some(&b'0') {
+            8
+        } else {
+            10
+        };
+    }
+    if base == 16
+        && input
+            .get(index..index + 2)
+            .is_some_and(|prefix| prefix[0] == b'0' && matches!(prefix[1], b'x' | b'X'))
+    {
+        index += 2;
+    }
+    if !(2..=36).contains(&base) {
+        return (0, index);
+    }
+    let digit_start = index;
+    let mut value = 0_i64;
+    while let Some(digit) = input.get(index).and_then(|byte| match byte {
+        b'0'..=b'9' => Some(u32::from(byte - b'0')),
+        b'a'..=b'z' => Some(u32::from(byte - b'a') + 10),
+        b'A'..=b'Z' => Some(u32::from(byte - b'A') + 10),
+        _ => None,
+    }) {
+        if digit >= base {
+            break;
+        }
+        value = value
+            .saturating_mul(i64::from(base))
+            .saturating_add(i64::from(digit));
+        index += 1;
+    }
+    if index == digit_start {
+        return (0, digit_start);
+    }
+    (if negative { -value } else { value }, index)
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| Error::Package(format!("truncated RAM MRP u32 at {offset:#x}")))?;
+    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn expand_ram_payload(stored: &[u8]) -> Result<Vec<u8>> {
+    if !stored.starts_with(&[0x1f, 0x8b, 0x08]) {
+        return Ok(stored.to_vec());
+    }
+    let mut decoder = GzDecoder::new(stored).take((HEAP_LEN as u64).saturating_add(1));
+    let mut output = Vec::new();
+    decoder
+        .read_to_end(&mut output)
+        .map_err(|error| Error::Package(format!("invalid RAM MRP gzip payload: {error}")))?;
+    if output.len() > HEAP_LEN {
+        return Err(Error::ResourceLimit(format!(
+            "expanded RAM MRP payload exceeds {HEAP_LEN} bytes"
+        )));
+    }
+    Ok(output)
+}
+
+fn trap_slot(address: u32) -> Option<u32> {
+    let offset = address.checked_sub(TRAP_BASE)?;
+    (offset % 4 == 0 && offset / 4 < PLATFORM_SLOT_COUNT).then_some(offset / 4)
+}
+
+fn data_slot_address(slot: u32) -> GuestAddr {
+    GuestAddr(PLATFORM_DATA.0 + slot * 4)
+}
+
+fn table_slot_address(slot: u32) -> GuestAddr {
+    GuestAddr(PLATFORM_TABLE.0 + slot * 4)
+}
+
+fn write_platform_string(memory: &mut GuestMemory, address: GuestAddr, value: &[u8]) -> Result<()> {
+    if value.len() >= 256 {
+        return Err(Error::Abi(format!(
+            "platform string contains {} bytes (limit 255)",
+            value.len()
+        )));
+    }
+    memory.write(address, value)?;
+    memory.write_u8(address.checked_add(value.len() as u32)?, 0)
+}
+
+fn is_function_slot(slot: u32) -> bool {
+    matches!(
+        slot,
+        0..=20
+            | 22
+            | 25..=65
+            | 67..=90
+            | 113..=134
+            | 137
+            | 141
+            | 145
+            | 147..=148
+    )
+}
+
+fn is_data_slot(slot: u32) -> bool {
+    matches!(slot, 91..=112 | 135..=136 | 138..=140 | 142..=144 | 146)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use flate2::{Compression, write::GzEncoder};
+
+    use super::*;
+
+    struct StubServices;
+
+    impl NativeServices for StubServices {
+        fn read_package_file(&mut self, _name: &[u8]) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn file_info(&mut self, _name: &[u8]) -> Result<i32> {
+            Ok(-1)
+        }
+
+        fn open_file(&mut self, _name: &[u8], _mode: u32) -> Result<i32> {
+            Ok(-1)
+        }
+
+        fn close_file(&mut self, _handle: i32) -> Result<i32> {
+            Ok(0)
+        }
+
+        fn read_file(&mut self, _handle: i32, _len: usize) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn seek_file(&mut self, _handle: i32, _offset: i32, _origin: u32) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn file_len(&mut self, _handle: i32) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        fn char_bitmap(
+            &mut self,
+            _codepoint: u32,
+            _font: u32,
+        ) -> Result<Option<(Vec<u8>, u32, u32)>> {
+            Ok(None)
+        }
+
+        fn draw_bitmap(
+            &mut self,
+            _pixels: &[u8],
+            _x: i32,
+            _y: i32,
+            _width: usize,
+            _height: usize,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn read_bitmap_pixels(
+        runtime: &ExtRuntime,
+        address: GuestAddr,
+        width: usize,
+        height: usize,
+    ) -> Vec<u16> {
+        (0..width * height)
+            .map(|index| {
+                runtime
+                    .memory
+                    .read_u16(address.checked_add((index * 2) as u32).unwrap())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transformed_bitmap_copy_snapshots_overlapping_source_pixels() {
+        let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr").unwrap();
+        let bitmap = runtime.allocate(16, 2).unwrap();
+        for (index, color) in [1_u16, 2, 3, 4, 5, 6, 7, 8].into_iter().enumerate() {
+            runtime
+                .memory
+                .write_u16(bitmap.checked_add((index * 2) as u32).unwrap(), color)
+                .unwrap();
+        }
+
+        runtime
+            .copy_transformed_bitmap(
+                BitmapDescriptor {
+                    pixels: bitmap,
+                    width: 4,
+                    height: 2,
+                    x: 1,
+                    y: 0,
+                },
+                BitmapDescriptor {
+                    pixels: bitmap,
+                    width: 4,
+                    height: 2,
+                    x: 0,
+                    y: 0,
+                },
+                3,
+                2,
+                BitmapTransform {
+                    a: 256,
+                    b: 0,
+                    c: 0,
+                    d: 256,
+                    mode: 2,
+                },
+                0,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_bitmap_pixels(&runtime, bitmap, 4, 2),
+            [1, 1, 2, 3, 5, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn transformed_bitmap_copy_normalizes_a_quarter_turn() {
+        let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr").unwrap();
+        let source = runtime.allocate(12, 2).unwrap();
+        let destination = runtime.allocate(12, 2).unwrap();
+        for (index, color) in [1_u16, 2, 3, 4, 5, 6].into_iter().enumerate() {
+            runtime
+                .memory
+                .write_u16(source.checked_add((index * 2) as u32).unwrap(), color)
+                .unwrap();
+        }
+
+        runtime
+            .copy_transformed_bitmap(
+                BitmapDescriptor {
+                    pixels: destination,
+                    width: 2,
+                    height: 3,
+                    x: 0,
+                    y: 0,
+                },
+                BitmapDescriptor {
+                    pixels: source,
+                    width: 3,
+                    height: 2,
+                    x: 0,
+                    y: 0,
+                },
+                3,
+                2,
+                BitmapTransform {
+                    a: 0,
+                    b: -256,
+                    c: 256,
+                    d: 0,
+                    mode: 2,
+                },
+                0,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_bitmap_pixels(&runtime, destination, 2, 3),
+            [4, 1, 5, 2, 6, 3]
+        );
+    }
+
+    #[test]
+    fn transformed_bitmap_trap_treats_r0_as_the_source() {
+        let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr").unwrap();
+        let source = runtime.allocate(4, 2).unwrap();
+        let destination = runtime.allocate(4, 2).unwrap();
+        runtime.memory.write_u16(source, 0x1234).unwrap();
+        runtime
+            .memory
+            .write_u16(source.checked_add(2).unwrap(), 0xabcd)
+            .unwrap();
+
+        let source_descriptor = runtime.allocate(12, 4).unwrap();
+        runtime
+            .memory
+            .write_u32(source_descriptor, source.0)
+            .unwrap();
+        runtime
+            .memory
+            .write_u16(source_descriptor.checked_add(4).unwrap(), 2)
+            .unwrap();
+        runtime
+            .memory
+            .write_u16(source_descriptor.checked_add(6).unwrap(), 1)
+            .unwrap();
+
+        let destination_descriptor = runtime.allocate(12, 4).unwrap();
+        runtime
+            .memory
+            .write_u32(destination_descriptor, destination.0)
+            .unwrap();
+        runtime
+            .memory
+            .write_u16(destination_descriptor.checked_add(4).unwrap(), 2)
+            .unwrap();
+        runtime
+            .memory
+            .write_u16(destination_descriptor.checked_add(6).unwrap(), 1)
+            .unwrap();
+
+        let transform = runtime.allocate(10, 2).unwrap();
+        runtime.memory.write_u16(transform, 256).unwrap();
+        runtime
+            .memory
+            .write_u16(transform.checked_add(6).unwrap(), 256)
+            .unwrap();
+        runtime
+            .memory
+            .write_u16(transform.checked_add(8).unwrap(), 2)
+            .unwrap();
+        let stack = runtime.allocate(8, 4).unwrap();
+        runtime.memory.write_u32(stack, transform.0).unwrap();
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, source_descriptor.0);
+        cpu.set_register(1, destination_descriptor.0);
+        cpu.set_register(2, 2);
+        cpu.set_register(3, 1);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(121, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        assert_eq!(
+            read_bitmap_pixels(&runtime, destination, 2, 1),
+            [0x1234, 0xabcd]
+        );
+    }
+
+    #[test]
+    fn reads_the_compact_ram_package_payload() {
+        let expected = b"MRPGCMAPguest module";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(expected).unwrap();
+        let stored = encoder.finish().unwrap();
+
+        let mut image = vec![0_u8; 24 + stored.len()];
+        let image_len = image.len() as u32;
+        image[..4].copy_from_slice(b"MRPG");
+        image[4..8].copy_from_slice(&4_u32.to_le_bytes());
+        image[8..12].copy_from_slice(&image_len.to_le_bytes());
+        image[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        image[16..20].copy_from_slice(b"abc\0");
+        image[20..24].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+        image[24..].copy_from_slice(&stored);
+
+        let mut runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let address = runtime.allocate(image.len(), 8).unwrap();
+        runtime.memory.write(address, &image).unwrap();
+
+        assert_eq!(
+            runtime
+                .read_ram_package_file(address, image.len(), b"abc")
+                .unwrap(),
+            Some(expected.to_vec())
+        );
+        assert_eq!(
+            runtime
+                .read_ram_package_file(address, image.len(), b"other")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn initializes_the_internal_runtime_state_subtable() {
+        let runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let internal_table = runtime.memory.read_u32(table_slot_address(23)).unwrap();
+
+        assert_eq!(internal_table, INTERNAL_TABLE_DATA.0);
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(INTERNAL_TABLE_DATA.checked_add(8).unwrap())
+                .unwrap(),
+            APPLICATION_STATE_DATA.0
+        );
+        assert_eq!(runtime.memory.read_u32(APPLICATION_STATE_DATA).unwrap(), 1);
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(INTERNAL_TABLE_DATA.checked_add(16).unwrap())
+                .unwrap(),
+            LIFECYCLE_CALLBACK_DATA.0
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(INTERNAL_TABLE_DATA.checked_add(20).unwrap())
+                .unwrap(),
+            TIMER_ACTIVE_DATA.0
+        );
+    }
+
+    #[test]
+    fn initializes_the_screen_bitmap_resource() {
+        let runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let bitmap_table = GuestAddr(runtime.memory.read_u32(table_slot_address(95)).unwrap());
+        let screen_bitmap = bitmap_table
+            .checked_add(SCREEN_BITMAP_ID * BITMAP_ENTRY_SIZE)
+            .unwrap();
+
+        assert_eq!(runtime.memory.read_u16(screen_bitmap).unwrap(), 240);
+        assert_eq!(
+            runtime
+                .memory
+                .read_u16(screen_bitmap.checked_add(2).unwrap())
+                .unwrap(),
+            320
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(screen_bitmap.checked_add(4).unwrap())
+                .unwrap(),
+            240 * 320 * 2
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(screen_bitmap.checked_add(8).unwrap())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read_u32(screen_bitmap.checked_add(12).unwrap())
+                .unwrap(),
+            SCREEN_BASE.0
+        );
+    }
+
+    #[test]
+    fn rejects_a_compact_ram_package_with_an_out_of_range_payload() {
+        let mut image = vec![0_u8; 24];
+        image[..4].copy_from_slice(b"MRPG");
+        image[4..8].copy_from_slice(&4_u32.to_le_bytes());
+        image[8..12].copy_from_slice(&24_u32.to_le_bytes());
+        image[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        image[16..20].copy_from_slice(b"abc\0");
+        image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+
+        let mut runtime = ExtRuntime::new(240, 320, b"test.mrp", b"start.mr").unwrap();
+        let address = runtime.allocate(image.len(), 8).unwrap();
+        runtime.memory.write(address, &image).unwrap();
+        let error = runtime
+            .read_ram_package_file(address, image.len(), b"abc")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds declared length"));
+    }
+}

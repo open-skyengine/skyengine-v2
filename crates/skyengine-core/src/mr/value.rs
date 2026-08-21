@@ -206,6 +206,10 @@ impl Table {
         self.set(Value::Number(length as f64), Value::Nil);
         removed
     }
+
+    pub(crate) fn debug_entries(&self) -> String {
+        format!("{:?}", self.entries)
+    }
 }
 
 #[derive(Debug)]

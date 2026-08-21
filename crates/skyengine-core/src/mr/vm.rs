@@ -1,9 +1,9 @@
-use std::{cmp::Ordering, path::PathBuf, rc::Rc, sync::Arc};
+use std::{cmp::Ordering, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use crate::{Framebuffer, Package, PlatformDisplay, ResourceLimits, Result};
 
 use super::{
-    chunk::{Constant, MrChunk},
+    chunk::{Constant, MrChunk, Prototype},
     host::MrHost,
     value::{Cell, Closure, ClosureRef, Table, TableRef, Value},
 };
@@ -71,6 +71,14 @@ impl MrVm {
         self.host.display.as_mut()
     }
 
+    pub fn native_timer_due_in(&self) -> Option<Duration> {
+        self.host.native_timer_due_in()
+    }
+
+    pub fn dispatch_native_timer(&mut self) -> Result<bool> {
+        self.host.dispatch_native_timer()
+    }
+
     pub fn run_entry(&mut self, entry: &[u8]) -> Result<()> {
         let bytes = self.host.package.read_named(entry)?;
         if !bytes.starts_with(SIGNATURE) {
@@ -80,6 +88,9 @@ impl MrVm {
             )));
         }
         let chunk = MrChunk::load(&bytes, &self.limits)?;
+        if std::env::var_os("SKYENGINE_TRACE_MR_PROTOTYPES").is_some() {
+            trace_prototype(&chunk.root, 0);
+        }
         let closure = Rc::new(Closure {
             prototype: chunk.root,
             upvalues: Vec::new(),
@@ -156,6 +167,40 @@ impl MrVm {
         let c = ((instruction >> 6) & 0x1ff) as usize;
         let bx = ((instruction >> 6) & 0x3ffff) as usize;
         let sbx = bx as isize - 131_071;
+
+        if std::env::var_os("SKYENGINE_TRACE_MR_INSTRUCTIONS").is_some() {
+            let frame = &self.frames[frame_index];
+            let source = frame
+                .closure
+                .prototype
+                .source
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_else(|| "?".into());
+            let registers = frame
+                .registers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let value = value.borrow();
+                    (!matches!(*value, Value::Nil))
+                        .then(|| format!("r{index}={}", trace_value(&value)))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let operand = if matches!(opcode, 5 | 7) {
+                self.constant_bytes(frame_index, bx)
+                    .ok()
+                    .map(|name| format!(" global={:?}", String::from_utf8_lossy(&name)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[mr-step] {source} pc={} op={opcode} a={a} b={b} c={c} bx={bx}{operand} {registers}",
+                frame.pc - 1
+            );
+        }
 
         match opcode {
             0 => self.set_register(frame_index, a, self.register(frame_index, b)?)?,
@@ -252,6 +297,18 @@ impl MrVm {
                 let left = self.rk(frame_index, b)?;
                 let right = self.rk(frame_index, c)?;
                 let result = compare(opcode, &left, &right)?;
+                if std::env::var_os("SKYENGINE_TRACE_MR_INSTRUCTIONS").is_some() {
+                    eprintln!(
+                        "[mr-compare] {} {} {} -> {result}",
+                        trace_value(&left),
+                        match opcode {
+                            21 => "==",
+                            22 => "<",
+                            _ => "<=",
+                        },
+                        trace_value(&right)
+                    );
+                }
                 if result != (a != 0) {
                     self.skip(frame_index, 1)?;
                 }
@@ -419,7 +476,9 @@ impl MrVm {
                 };
                 Ok(CallResult::Immediate(values))
             }
-            other => Err(crate::Error::MrFault(format!("attempt to call {other:?}"))),
+            other => Err(crate::Error::MrFault(format!(
+                "attempt to call {other:?} with arguments {args:?}"
+            ))),
         }
     }
 
@@ -797,6 +856,7 @@ impl MrVm {
             "TimerStart",
             "TimerStop",
             "_num",
+            "_t",
             "mod",
             "_mod",
             "_and",
@@ -812,7 +872,8 @@ impl MrVm {
 
         let string = Table::new();
         for name in [
-            "byte", "char", "len", "clen", "cstr", "sub", "find", "format", "rep", "lower", "upper",
+            "byte", "char", "len", "clen", "cstr", "sub", "find", "format", "rep", "lower",
+            "upper", "pack", "unpack",
         ] {
             string
                 .borrow_mut()
@@ -870,7 +931,11 @@ impl MrVm {
     }
 
     fn call_native(&mut self, name: &'static str, args: &[Value]) -> Result<Vec<Value>> {
-        match name {
+        let trace = std::env::var_os("SKYENGINE_TRACE_MR_CALLS").is_some();
+        if trace {
+            eprintln!("[mr-call] {name}({})", trace_values(args));
+        }
+        let result = match name {
             "type" => Ok(vec![bytes(args.first().unwrap_or(&Value::Nil).type_name())]),
             "tostring" => Ok(vec![
                 args.first()
@@ -880,6 +945,14 @@ impl MrVm {
                     .unwrap_or_else(|| bytes(format!("{:?}", args[0]).as_bytes())),
             ]),
             "tonumber" | "_num" => Ok(vec![native_tonumber(args)]),
+            "_t" => Ok(vec![bytes(match args.first().unwrap_or(&Value::Nil) {
+                Value::Nil => b"nil",
+                Value::Boolean(_) => b"bool",
+                Value::Number(_) => b"num",
+                Value::Bytes(_) => b"str",
+                Value::Table(_) => b"tab",
+                Value::Closure(_) | Value::Native(_) => b"fun",
+            })]),
             "print" => {
                 let message = args
                     .iter()
@@ -950,6 +1023,8 @@ impl MrVm {
             "rep" => string_rep(args),
             "lower" => string_case(args, false),
             "upper" => string_case(args, true),
+            "pack" => string_pack(args),
+            "unpack" => string_unpack(args),
             "insert" => table_insert(args),
             "remove" => table_remove(args),
             "getn" => Ok(vec![Value::Number(
@@ -961,7 +1036,20 @@ impl MrVm {
             "close" => Ok(vec![Value::Number(0.0)]),
             "rename" | "file_remove" | "getlen" => Ok(vec![Value::Number(-1.0)]),
             _ => self.host.call(name, args),
+        };
+        if result.is_ok()
+            && name == "_strCom"
+            && matches!(args.first(), Some(Value::Number(command)) if *command == 800.0)
+        {
+            self.set_global(b"_mr_c_load", Value::Native("mr_c_load"))?;
         }
+        if trace {
+            match &result {
+                Ok(values) => eprintln!("[mr-return] {name} -> {}", trace_values(values)),
+                Err(error) => eprintln!("[mr-return] {name} -> error: {error}"),
+            }
+        }
+        result
     }
 
     fn file_exist(&self, args: &[Value]) -> Result<Vec<Value>> {
@@ -978,6 +1066,58 @@ impl MrVm {
         } else {
             0.0
         })])
+    }
+}
+
+fn trace_prototype(prototype: &Prototype, depth: usize) {
+    eprintln!(
+        "[mr-prototype] depth={depth} line={} params={} stack={} constants={} code={}",
+        prototype.line_defined,
+        prototype.parameter_count,
+        prototype.max_stack_size,
+        prototype.constants.len(),
+        prototype.code.len()
+    );
+    for (index, constant) in prototype.constants.iter().enumerate() {
+        let value = match constant {
+            Constant::Nil => "nil".into(),
+            Constant::Number(number) => number.to_string(),
+            Constant::Bytes(bytes) => format!("{:?}", String::from_utf8_lossy(bytes)),
+        };
+        eprintln!("[mr-constant] depth={depth} index={index} value={value}");
+    }
+    for (pc, instruction) in prototype.code.iter().copied().enumerate() {
+        let opcode = instruction & 0x3f;
+        let a = instruction >> 24;
+        let b = (instruction >> 15) & 0x1ff;
+        let c = (instruction >> 6) & 0x1ff;
+        let bx = (instruction >> 6) & 0x3ffff;
+        eprintln!("[mr-code] depth={depth} pc={pc} op={opcode} a={a} b={b} c={c} bx={bx}");
+    }
+    for child in &prototype.prototypes {
+        trace_prototype(child, depth + 1);
+    }
+}
+
+fn trace_values(values: &[Value]) -> String {
+    values
+        .iter()
+        .map(trace_value)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn trace_value(value: &Value) -> String {
+    match value {
+        Value::Bytes(bytes) if bytes.len() > 48 => {
+            format!("bytes(len={}, head={:02x?})", bytes.len(), &bytes[..16])
+        }
+        Value::Table(table) => format!(
+            "table:{:p}{}",
+            std::rc::Rc::as_ptr(table),
+            table.borrow().debug_entries()
+        ),
+        _ => format!("{value:?}"),
     }
 }
 
@@ -1248,6 +1388,87 @@ fn string_case(args: &[Value], upper: bool) -> Result<Vec<Value>> {
         };
     }
     Ok(vec![Value::Bytes(string.into())])
+}
+
+fn string_pack(args: &[Value]) -> Result<Vec<Value>> {
+    let format = value_bytes(args.first())?;
+    let mut output = Vec::new();
+    let mut values = args.iter().skip(1);
+    let mut little_endian = true;
+    for specifier in format.iter().copied() {
+        match specifier {
+            b'<' => little_endian = true,
+            b'>' => little_endian = false,
+            b' ' => {}
+            b'i' | b'I' => {
+                let value = integer_number(values.next().unwrap_or(&Value::Nil))? as u32;
+                let encoded = if little_endian {
+                    value.to_le_bytes()
+                } else {
+                    value.to_be_bytes()
+                };
+                output.extend_from_slice(&encoded);
+            }
+            other => {
+                return Err(crate::Error::MrFault(format!(
+                    "unsupported string.pack specifier {:?}",
+                    char::from(other)
+                )));
+            }
+        }
+    }
+    Ok(vec![Value::Bytes(output.into())])
+}
+
+fn string_unpack(args: &[Value]) -> Result<Vec<Value>> {
+    let format = value_bytes(args.first())?;
+    let input = value_bytes(args.get(1))?;
+    let mut offset = match args.get(2) {
+        Some(value) => lua_index(Some(value), input.len(), 1)?,
+        None => 0,
+    };
+    let mut output = Vec::new();
+    let mut little_endian = true;
+    for specifier in format.iter().copied() {
+        match specifier {
+            b'<' => little_endian = true,
+            b'>' => little_endian = false,
+            b' ' => {}
+            b'i' | b'I' => {
+                let end = offset
+                    .checked_add(4)
+                    .ok_or_else(|| crate::Error::MrFault("string.unpack offset overflow".into()))?;
+                let raw: [u8; 4] = input
+                    .get(offset..end)
+                    .ok_or_else(|| {
+                        crate::Error::MrFault(format!(
+                            "string.unpack needs 4 bytes at offset {offset}, input has {}",
+                            input.len()
+                        ))
+                    })?
+                    .try_into()
+                    .expect("checked four-byte field");
+                let value = if little_endian {
+                    u32::from_le_bytes(raw)
+                } else {
+                    u32::from_be_bytes(raw)
+                };
+                output.push(Value::Number(if specifier == b'i' {
+                    f64::from(value as i32)
+                } else {
+                    f64::from(value)
+                }));
+                offset = end;
+            }
+            other => {
+                return Err(crate::Error::MrFault(format!(
+                    "unsupported string.unpack specifier {:?}",
+                    char::from(other)
+                )));
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn table_insert(args: &[Value]) -> Result<Vec<Value>> {

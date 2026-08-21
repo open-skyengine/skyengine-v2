@@ -13,6 +13,9 @@ use skyengine_core::{
 };
 use skyengine_sdl::SdlDisplay;
 
+#[cfg(unix)]
+mod e2e;
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
@@ -33,12 +36,10 @@ fn real_main() -> Result<()> {
     match command.to_str() {
         Some("inspect") => inspect(args),
         Some("run") => run(args),
-        Some(other) => Err(skyengine_core::Error::Config(format!(
-            "unknown command {other:?}; expected inspect or run"
-        ))),
-        None => Err(skyengine_core::Error::Config(
-            "command is not valid Unicode".into(),
-        )),
+        _ => {
+            args.insert(0, command);
+            run(args)
+        }
     }
 }
 
@@ -86,8 +87,7 @@ fn inspect(mut args: Vec<std::ffi::OsString>) -> Result<()> {
 fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     let entry = take_option(&mut args, "--entry")?.unwrap_or_else(|| "start.mr".into());
     let work_dir = take_option(&mut args, "--work-dir")?.unwrap_or_else(|| ".".into());
-    let font =
-        take_option(&mut args, "--font")?.unwrap_or_else(|| "test/fixtures/fonts/gb16.uc2".into());
+    let font = take_option(&mut args, "--font")?;
     let screen = take_option(&mut args, "--screen")?.unwrap_or_else(|| "240x320".into());
     let frame_output = take_option(&mut args, "--frame-output")?;
     let headless = take_flag(&mut args, "--headless") || frame_output.is_some();
@@ -100,7 +100,9 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     let mut config = RuntimeConfig::for_app(PathBuf::from(&args[0]));
     config.entry = entry.as_bytes().to_vec();
     config.work_dir = PathBuf::from(work_dir);
-    config.font_path = PathBuf::from(font);
+    if let Some(font) = font {
+        config.font_path = PathBuf::from(font);
+    }
     config.screen_width = width;
     config.screen_height = height;
 
@@ -116,6 +118,21 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
             Path::new(&output).display()
         );
         return Ok(());
+    }
+
+    if let Some(socket_path) = env::var_os("SKYENGINE_E2E_SOCKET") {
+        #[cfg(unix)]
+        {
+            let display = e2e::E2eDisplay::new(PathBuf::from(socket_path))?;
+            return Runtime::load(config, Box::new(display))?.run();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = socket_path;
+            return Err(skyengine_core::Error::Config(
+                "SKYENGINE_E2E_SOCKET is not supported on this host".into(),
+            ));
+        }
     }
 
     let display = SdlDisplay::new(width, height, 2)?;
@@ -223,7 +240,10 @@ fn print_help() {
          skyengine inspect [--json] <app.mrp>\n  \
          skyengine run [--entry NAME] [--work-dir DIR] [--font FILE]\n  \
                        [--screen WIDTHxHEIGHT] [--headless]\n  \
-                       [--frame-output FILE.ppm] <app.mrp>\n\n\
-         The default font is test/fixtures/fonts/gb16.uc2."
+                       [--frame-output FILE.ppm] <app.mrp>\n  \
+         skyengine [run options] <app.mrp>\n\n\
+         --work-dir is the device root; installed MRP files live in mythroad/.\n  \
+         Relative font paths are resolved from --work-dir.\n  \
+         The default font is mythroad/system/gb16.uc2."
     );
 }
