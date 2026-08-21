@@ -218,6 +218,21 @@ impl GuestMemory {
         Ok(())
     }
 
+    pub fn unmap(&mut self, base: GuestAddr, len: usize) -> Result<()> {
+        let Some(index) = self
+            .regions
+            .iter()
+            .position(|region| region.base == base.0 && region.bytes.len() == len)
+        else {
+            return Err(Error::ArmFault(format!(
+                "guest unmap does not match a region at {:#010x} ({} bytes)",
+                base.0, len
+            )));
+        };
+        self.regions.remove(index);
+        Ok(())
+    }
+
     fn range(&self, address: GuestAddr, len: usize, required: Permissions) -> Result<&[u8]> {
         let (region, offset) = self.locate(address, len, required)?;
         Ok(&region.bytes[offset..offset + len])
@@ -341,5 +356,17 @@ mod tests {
                 .add_permissions(GuestAddr(0x1000), 0, Permissions::EXECUTE)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn exact_mappings_can_be_unmapped() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map(GuestAddr(0x1000), 16, Permissions::READ_WRITE, "temporary")
+            .unwrap();
+
+        assert!(memory.unmap(GuestAddr(0x1000), 8).is_err());
+        memory.unmap(GuestAddr(0x1000), 16).unwrap();
+        assert!(memory.read_u8(GuestAddr(0x1000)).is_err());
     }
 }

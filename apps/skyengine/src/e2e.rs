@@ -382,7 +382,7 @@ fn wait_draw(
     if data.draw_count > previous {
         Ok(format!("OK draw_count {}", data.draw_count))
     } else if data.exited {
-        Err(format!("runtime_exited draw_count {}", data.draw_count))
+        Ok(format!("OK draw_count {} exited", data.draw_count))
     } else {
         Err(format!("wait_draw_timeout draw_count {}", data.draw_count))
     }

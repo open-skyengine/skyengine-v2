@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -37,18 +39,24 @@ const INTERNAL_APPLICATION_STATE_OFFSETS: [u32; 2] = [8, 44];
 const MODULE_BASE: u32 = 0x1000_0000;
 const MODULE_STRIDE: u32 = 0x0010_0000;
 const HEAP_BASE: GuestAddr = GuestAddr(0x2000_0000);
+const MIN_GUEST_RAM_LEN: usize = 8 * 1024 * 1024;
 #[cfg(test)]
 const DEFAULT_HEAP_LEN: usize = 4 * 1024 * 1024;
 const STACK_BASE: GuestAddr = GuestAddr(0x3000_0000);
 const STACK_LEN: usize = 256 * 1024;
-const SCREEN_BASE: GuestAddr = GuestAddr(0x4000_0000);
+const PLATFORM_MEMORY_BASE: GuestAddr = GuestAddr(0x4000_0000);
+const SCREEN_BASE: GuestAddr = GuestAddr(HEAP_BASE.0 + MIN_GUEST_RAM_LEN as u32);
+const FREE_BLOCK_HEADER_LEN: u32 = 8;
+const HEAP_ALIGNMENT: u32 = 8;
 const BITMAP_ENTRY_SIZE: u32 = 16;
 const SCREEN_BITMAP_ID: u32 = 30;
 const TRAP_BASE: u32 = 0xff00_0000;
 const RETURN_SENTINEL: u32 = 0xffff_ff00;
 const PLATFORM_SLOT_COUNT: u32 = 150;
-const INSTRUCTION_BUDGET: u64 = 20_000_000;
+const INSTRUCTION_BUDGET: u64 = 200_000_000;
 const MD5_BUFFER_OFFSET: u32 = 24;
+const MAX_NATIVE_SOCKETS: usize = 64;
+const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) trait NativeServices {
     fn read_package_file(&mut self, package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -144,19 +152,50 @@ struct BitmapTransform {
     mode: i16,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GuestHeapState {
+    base: u32,
+    span: u32,
+    head: u32,
+    head_variable: GuestAddr,
+    free_left: u32,
+    free_left_variable: GuestAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FreeBlock {
+    offset: u32,
+    len: u32,
+}
+
+#[derive(Debug)]
+enum NativeSocketState {
+    Created,
+    Connecting(mpsc::Receiver<std::io::Result<TcpStream>>),
+    Connected(TcpStream),
+    Failed,
+}
+
+#[derive(Debug)]
+struct NativeSocket {
+    state: NativeSocketState,
+}
+
 #[derive(Debug)]
 pub(crate) struct ExtRuntime {
     memory: GuestMemory,
     modules: Vec<ModuleContext>,
     active_helper: Option<GuestFunction>,
-    heap_cursor: u32,
     heap_len: usize,
     platform_memory_extensions: BTreeMap<u32, (usize, u32)>,
+    platform_memory_cursor: u32,
     random_state: u32,
     glyphs: BTreeMap<(u32, u32), GuestGlyph>,
     dialogs: BTreeMap<u32, PlatformDialog>,
     next_ui_handle: u32,
     suppressed_ui_key_releases: BTreeSet<i32>,
+    native_sockets: BTreeMap<i32, NativeSocket>,
+    next_native_socket_handle: i32,
     exit_requested: bool,
     device_info_profile: DeviceInfoProfile,
     clock_origin: Instant,
@@ -193,7 +232,12 @@ impl ExtRuntime {
             Permissions::READ_WRITE,
             "platform data",
         )?;
-        memory.map(HEAP_BASE, heap_len, Permissions::READ_WRITE, "guest heap")?;
+        memory.map(
+            HEAP_BASE,
+            heap_len.max(MIN_GUEST_RAM_LEN),
+            Permissions::READ_WRITE,
+            "guest RAM",
+        )?;
         memory.map(STACK_BASE, STACK_LEN, Permissions::READ_WRITE, "EXT stack")?;
         let screen_len = usize::from(screen_width)
             .checked_mul(usize::from(screen_height))
@@ -260,6 +304,9 @@ impl ExtRuntime {
         memory.write_u32(data_slot_address(109), heap_len as u32)?;
         memory.write_u32(data_slot_address(110), heap_end)?;
         memory.write_u32(data_slot_address(111), heap_len as u32)?;
+        memory.write_u32(data_slot_address(146), 0)?;
+        memory.write_u32(HEAP_BASE, heap_len as u32)?;
+        memory.write_u32(HEAP_BASE.checked_add(4)?, heap_len as u32)?;
         memory.write(PLATFORM_SIM_INFO_DATA, &[0; PLATFORM_SIM_INFO_LEN])?;
         for (index, value) in [
             PLATFORM_STORAGE_AVAILABLE_BLOCKS * 2,
@@ -281,14 +328,16 @@ impl ExtRuntime {
             memory,
             modules: Vec::new(),
             active_helper: None,
-            heap_cursor: HEAP_BASE.0,
             heap_len,
             platform_memory_extensions: BTreeMap::new(),
+            platform_memory_cursor: PLATFORM_MEMORY_BASE.0,
             random_state: 1,
             glyphs: BTreeMap::new(),
             dialogs: BTreeMap::new(),
             next_ui_handle: 1,
             suppressed_ui_key_releases: BTreeSet::new(),
+            native_sockets: BTreeMap::new(),
+            next_native_socket_handle: 1,
             exit_requested: false,
             device_info_profile: DeviceInfoProfile::Unavailable,
             clock_origin: Instant::now(),
@@ -586,17 +635,38 @@ impl ExtRuntime {
             }
             if let Err(error) = cpu.step(&mut self.memory) {
                 return Err(match error {
-                    Error::ArmFault(message) => Error::ArmFault(format!(
-                        "{message} while executing module {} at PC {pc:#010x} (r0={:#010x}, r1={:#010x}, r2={:#010x}, r3={:#010x}, r9={:#010x}, sp={:#010x}, lr={:#010x})",
-                        function.module,
-                        cpu.register(0),
-                        cpu.register(1),
-                        cpu.register(2),
-                        cpu.register(3),
-                        cpu.register(9),
-                        cpu.register(13),
-                        cpu.register(14),
-                    )),
+                    Error::ArmFault(message) => {
+                        let instruction = self
+                            .memory
+                            .read(GuestAddr(pc), 4)
+                            .map(|bytes| {
+                                format!(
+                                    "{:02x}{:02x}{:02x}{:02x}",
+                                    bytes[0], bytes[1], bytes[2], bytes[3]
+                                )
+                            })
+                            .unwrap_or_else(|_| "unavailable".into());
+                        Error::ArmFault(format!(
+                            "{message} while executing module {} at PC {pc:#010x} (insn={instruction}, cpsr={:#010x}, r0={:#010x}, r1={:#010x}, r2={:#010x}, r3={:#010x}, r4={:#010x}, r5={:#010x}, r6={:#010x}, r7={:#010x}, r8={:#010x}, r9={:#010x}, r10={:#010x}, r11={:#010x}, r12={:#010x}, sp={:#010x}, lr={:#010x})",
+                            function.module,
+                            cpu.cpsr(),
+                            cpu.register(0),
+                            cpu.register(1),
+                            cpu.register(2),
+                            cpu.register(3),
+                            cpu.register(4),
+                            cpu.register(5),
+                            cpu.register(6),
+                            cpu.register(7),
+                            cpu.register(8),
+                            cpu.register(9),
+                            cpu.register(10),
+                            cpu.register(11),
+                            cpu.register(12),
+                            cpu.register(13),
+                            cpu.register(14),
+                        ))
+                    }
                     other => other,
                 });
             }
@@ -704,7 +774,8 @@ impl ExtRuntime {
                 cpu.set_register(0, address);
             }
             31 => {
-                let delay = Duration::from_millis(u64::from(cpu.register(0)));
+                let delay_ms = cpu.register(0);
+                let delay = Duration::from_millis(u64::from(delay_ms));
                 self.timer_deadline = Instant::now().checked_add(delay);
                 self.memory.write_u32(TIMER_ACTIVE_DATA, 1)?;
                 cpu.set_register(0, 0);
@@ -750,6 +821,10 @@ impl ExtRuntime {
                 cpu.set_register(0, 0);
             }
             37 => match (cpu.register(0), cpu.register(1)) {
+                // Poll a non-blocking socket created through slots 84 and 85.
+                (1_001, handle) => {
+                    cpu.set_register(0, self.native_socket_state(handle as i32) as u32)
+                }
                 // Baseline SDK initialization notification; the return value is ignored.
                 (1_106, 0) => cpu.set_register(0, 0),
                 // Report the normal storage profile. 1002 denotes USB mass-storage
@@ -986,27 +1061,59 @@ impl ExtRuntime {
                 cpu.set_register(0, 0);
             }
             82 => {
-                // Closing an unavailable or already closed network service is
-                // intentionally idempotent.
+                self.native_sockets.clear();
                 cpu.set_register(0, 0);
             }
             84 => {
-                // No socket provider is configured in the deterministic offline profile.
-                cpu.set_register(0, u32::MAX);
+                let socket_type = cpu.register(0);
+                let protocol = cpu.register(1);
+                let handle = if socket_type == 0 && protocol == 0 {
+                    self.allocate_native_socket_handle()?
+                } else {
+                    None
+                };
+                cpu.set_register(0, handle.map_or(u32::MAX, |handle| handle as u32));
             }
             85 => {
-                cpu.set_register(0, u32::MAX);
+                let result = self.connect_native_socket(
+                    cpu.register(0) as i32,
+                    cpu.register(1),
+                    cpu.register(2),
+                    cpu.register(3),
+                );
+                cpu.set_register(0, result as u32);
             }
             86 => {
-                cpu.set_register(0, u32::MAX);
+                let handle = cpu.register(0) as i32;
+                let result = if self.native_sockets.remove(&handle).is_some() {
+                    0
+                } else {
+                    -1
+                };
+                cpu.set_register(0, result as u32);
             }
             87 => {
+                let handle = cpu.register(0) as i32;
+                let output = GuestAddr(cpu.register(1));
+                let len = cpu.register(2) as usize;
+                let bytes = self.receive_native_socket(handle, len);
+                match bytes {
+                    Some(bytes) => {
+                        self.memory.write(output, &bytes)?;
+                        cpu.set_register(0, bytes.len() as u32);
+                    }
+                    None => cpu.set_register(0, u32::MAX),
+                }
+            }
+            88 | 90 => {
+                // Datagram sockets are not part of the baseline stream profile.
                 cpu.set_register(0, u32::MAX);
             }
             89 => {
                 let len = cpu.register(2) as usize;
-                self.memory.read(GuestAddr(cpu.register(1)), len)?;
-                cpu.set_register(0, u32::MAX);
+                let bytes = self.memory.read(GuestAddr(cpu.register(1)), len)?;
+                let written = self.send_native_socket(cpu.register(0) as i32, &bytes);
+                cpu.set_register(0, written.map_or(u32::MAX, |written| written as u32));
             }
             113 => {
                 self.md5_init(GuestAddr(cpu.register(0)))?;
@@ -1167,15 +1274,21 @@ impl ExtRuntime {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
                 let ram_address = self.memory.read_u32(data_slot_address(104))?;
                 let ram_len = self.memory.read_u32(data_slot_address(105))? as usize;
-                let bytes = if ram_address == 0 && ram_len == 0 {
+                if (ram_address == 0) != (ram_len == 0) {
+                    return Err(Error::Abi(format!(
+                        "RAM-backed MRP has inconsistent address {ram_address:#010x} and length {ram_len}"
+                    )));
+                }
+                let use_ram_package = if ram_address == 0 {
+                    false
+                } else {
+                    ram_len >= 24
+                        && self.memory.read(GuestAddr(ram_address), 4)?.as_slice() == b"MRPG"
+                };
+                let bytes = if !use_ram_package {
                     let package_name = self.read_c_string(PACKAGE_NAME_DATA, 256)?;
                     services.read_package_file(&package_name, &name)?
                 } else {
-                    if ram_address == 0 || ram_len == 0 {
-                        return Err(Error::Abi(format!(
-                            "RAM-backed MRP has inconsistent address {ram_address:#010x} and length {ram_len}"
-                        )));
-                    }
                     self.read_ram_package_file(GuestAddr(ram_address), ram_len, &name)?
                 };
                 if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
@@ -1193,10 +1306,10 @@ impl ExtRuntime {
                     cpu.set_register(0, 0);
                     return Ok(());
                 };
-                let prepared_output = if ram_address == 0 {
-                    None
-                } else {
+                let prepared_output = if use_ram_package {
                     self.compact_ram_output_target(GuestAddr(ram_address), ram_len, bytes.len())?
+                } else {
+                    None
                 };
                 let output = match prepared_output {
                     Some(output) => output,
@@ -1470,11 +1583,29 @@ impl ExtRuntime {
             ));
         }
 
-        let previous_heap_cursor = self.heap_cursor;
-        let arena = self.allocate(requested_len, 8)?;
-        self.memory.write(arena, &vec![0; requested_len])?;
+        let previous_cursor = self.platform_memory_cursor;
+        let arena_value = previous_cursor
+            .checked_add(0xfff)
+            .map(|value| value & !0xfff)
+            .ok_or_else(|| Error::ArmFault("platform memory alignment overflow".into()))?;
+        let requested_len_u32 = u32::try_from(requested_len).map_err(|_| {
+            Error::ArmFault(format!(
+                "platform memory request {requested_len} does not fit u32"
+            ))
+        })?;
+        let arena_end = arena_value
+            .checked_add(requested_len_u32)
+            .ok_or_else(|| Error::ArmFault("platform memory request overflow".into()))?;
+        let arena = GuestAddr(arena_value);
+        self.memory.map(
+            arena,
+            requested_len,
+            Permissions::READ_WRITE,
+            "platform memory extension",
+        )?;
+        self.platform_memory_cursor = arena_end;
         self.platform_memory_extensions
-            .insert(arena.0, (requested_len, previous_heap_cursor));
+            .insert(arena.0, (requested_len, previous_cursor));
         self.memory.write_u32(output, arena.0)?;
         self.memory.write_u32(output_len, cpu.register(2))?;
         cpu.set_register(0, 0);
@@ -1489,7 +1620,7 @@ impl ExtRuntime {
                 cpu.register(2)
             )));
         }
-        let (len, previous_heap_cursor) = self
+        let (len, previous_cursor) = self
             .platform_memory_extensions
             .remove(&arena.0)
             .ok_or_else(|| {
@@ -1498,8 +1629,6 @@ impl ExtRuntime {
                     arena.0
                 ))
             })?;
-        self.memory.write(arena, &vec![0; len])?;
-
         let end = arena
             .0
             .checked_add(u32::try_from(len).map_err(|_| {
@@ -1508,11 +1637,9 @@ impl ExtRuntime {
                 ))
             })?)
             .ok_or_else(|| Error::Abi("platform memory extension end overflow".into()))?;
-        if end == self.heap_cursor {
-            self.heap_cursor = previous_heap_cursor;
-            let heap_end = HEAP_BASE.0 + self.heap_len as u32;
-            self.memory
-                .write_u32(data_slot_address(111), heap_end - self.heap_cursor)?;
+        self.memory.unmap(arena, len)?;
+        if end == self.platform_memory_cursor {
+            self.platform_memory_cursor = previous_cursor;
         }
         cpu.set_register(0, 0);
         Ok(())
@@ -2128,26 +2255,161 @@ impl ExtRuntime {
         }
     }
 
+    fn allocate_native_socket_handle(&mut self) -> Result<Option<i32>> {
+        if self.native_sockets.len() >= MAX_NATIVE_SOCKETS {
+            return Ok(None);
+        }
+        let start = self.next_native_socket_handle;
+        loop {
+            let handle = self.next_native_socket_handle;
+            self.next_native_socket_handle = self
+                .next_native_socket_handle
+                .checked_add(1)
+                .filter(|next| *next > 0)
+                .unwrap_or(1);
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.native_sockets.entry(handle)
+            {
+                entry.insert(NativeSocket {
+                    state: NativeSocketState::Created,
+                });
+                return Ok(Some(handle));
+            }
+            if self.next_native_socket_handle == start {
+                return Err(Error::ResourceLimit(
+                    "no native socket handles are available".into(),
+                ));
+            }
+        }
+    }
+
+    fn connect_native_socket(&mut self, handle: i32, ip: u32, port: u32, mode: u32) -> i32 {
+        let Some(socket) = self.native_sockets.get_mut(&handle) else {
+            return -1;
+        };
+        match socket.state {
+            NativeSocketState::Created => {}
+            NativeSocketState::Connecting(_) => return 2,
+            NativeSocketState::Connected(_) => return 0,
+            NativeSocketState::Failed => return -1,
+        }
+        let Ok(port) = u16::try_from(port) else {
+            socket.state = NativeSocketState::Failed;
+            return -1;
+        };
+        if mode != 1 {
+            socket.state = NativeSocketState::Failed;
+            return -1;
+        }
+        let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port));
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name(format!("skyengine-connect-{handle}"))
+            .spawn(move || {
+                let result = TcpStream::connect_timeout(&address, NETWORK_CONNECT_TIMEOUT);
+                let _ = sender.send(result);
+            });
+        if worker.is_err() {
+            socket.state = NativeSocketState::Failed;
+            return -1;
+        }
+        socket.state = NativeSocketState::Connecting(receiver);
+        2
+    }
+
+    fn native_socket_state(&mut self, handle: i32) -> i32 {
+        let Some(socket) = self.native_sockets.get_mut(&handle) else {
+            return -1;
+        };
+        let completed = match &socket.state {
+            NativeSocketState::Connecting(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    socket.state = NativeSocketState::Failed;
+                    return -1;
+                }
+            },
+            _ => None,
+        };
+        if let Some(result) = completed {
+            socket.state = match result {
+                Ok(stream) if stream.set_nonblocking(true).is_ok() => {
+                    NativeSocketState::Connected(stream)
+                }
+                Ok(_) | Err(_) => NativeSocketState::Failed,
+            };
+        }
+        match socket.state {
+            NativeSocketState::Created | NativeSocketState::Connecting(_) => 1,
+            NativeSocketState::Connected(_) => 0,
+            NativeSocketState::Failed => -1,
+        }
+    }
+
+    fn receive_native_socket(&mut self, handle: i32, len: usize) -> Option<Vec<u8>> {
+        if len > self.heap_len || self.native_socket_state(handle) != 0 {
+            return None;
+        }
+        let socket = self.native_sockets.get_mut(&handle)?;
+        let NativeSocketState::Connected(stream) = &mut socket.state else {
+            return None;
+        };
+        let mut bytes = vec![0; len];
+        let read = stream.read(&mut bytes).ok()?;
+        bytes.truncate(read);
+        Some(bytes)
+    }
+
+    fn send_native_socket(&mut self, handle: i32, bytes: &[u8]) -> Option<usize> {
+        if bytes.len() > self.heap_len || self.native_socket_state(handle) != 0 {
+            return None;
+        }
+        let socket = self.native_sockets.get_mut(&handle)?;
+        let NativeSocketState::Connected(stream) = &mut socket.state else {
+            return None;
+        };
+        stream.write(bytes).ok()
+    }
+
     fn dispatch_libc(&mut self, slot: u32, cpu: &mut ArmCpu) -> Result<()> {
         match slot {
             0 => {
-                let address = self.allocate(cpu.register(0) as usize, 8)?;
-                cpu.set_register(0, address.0);
+                let address = self.allocate_guest_block(cpu.register(0) as usize)?;
+                cpu.set_register(0, address.map_or(0, |address| address.0));
             }
-            1 => cpu.set_register(0, 0),
+            1 => {
+                self.free_guest_block(GuestAddr(cpu.register(0)), cpu.register(1) as usize)?;
+                cpu.set_register(0, 0);
+            }
             2 => {
                 let source = GuestAddr(cpu.register(0));
                 let old_len = cpu.register(1) as usize;
                 let new_len = cpu.register(2) as usize;
                 if source.0 == 0 {
-                    let output = self.allocate(new_len, 8)?;
-                    cpu.set_register(0, output.0);
+                    let output = self.allocate_guest_block(new_len)?;
+                    cpu.set_register(0, output.map_or(0, |address| address.0));
                 } else if new_len == 0 {
+                    self.free_guest_block(source, old_len)?;
                     cpu.set_register(0, 0);
+                } else if new_len <= old_len {
+                    let old_aligned = aligned_heap_len(old_len)?;
+                    let new_aligned = aligned_heap_len(new_len)?;
+                    if old_aligned - new_aligned >= FREE_BLOCK_HEADER_LEN {
+                        self.free_guest_block(
+                            GuestAddr(source.0.wrapping_add(new_aligned)),
+                            (old_aligned - new_aligned) as usize,
+                        )?;
+                    }
+                    cpu.set_register(0, source.0);
                 } else {
-                    let output = self.allocate(new_len, 8)?;
-                    let bytes = self.memory.read(source, old_len.min(new_len))?;
+                    let Some(output) = self.allocate_guest_block(new_len)? else {
+                        cpu.set_register(0, 0);
+                        return Ok(());
+                    };
+                    let bytes = self.memory.read(source, old_len)?;
                     self.memory.write(output, &bytes)?;
+                    self.free_guest_block(source, old_len)?;
                     cpu.set_register(0, output.0);
                 }
             }
@@ -2346,28 +2608,286 @@ impl ExtRuntime {
     }
 
     fn allocate(&mut self, len: usize, alignment: u32) -> Result<GuestAddr> {
-        let len = len.max(1);
-        let mask = alignment - 1;
-        let start = self
-            .heap_cursor
-            .checked_add(mask)
-            .map(|value| value & !mask)
-            .ok_or_else(|| Error::ArmFault("guest heap alignment overflow".into()))?;
-        let end = start
-            .checked_add(u32::try_from(len).map_err(|_| {
-                Error::ArmFault(format!("guest allocation length {len} does not fit u32"))
-            })?)
-            .ok_or_else(|| Error::ArmFault("guest heap allocation overflow".into()))?;
-        let heap_end = HEAP_BASE.0 + self.heap_len as u32;
-        if end > heap_end {
+        if alignment == 0 || !alignment.is_power_of_two() || alignment > HEAP_ALIGNMENT {
             return Err(Error::ArmFault(format!(
-                "guest heap exhausted while allocating {len} bytes"
+                "unsupported guest heap alignment {alignment}"
             )));
         }
-        self.heap_cursor = end;
-        self.memory
-            .write_u32(data_slot_address(111), heap_end - end)?;
-        Ok(GuestAddr(start))
+        let len = u32::try_from(len.max(1)).map_err(|_| {
+            Error::ArmFault(format!("guest allocation length {len} does not fit u32"))
+        })?;
+        self.allocate_heap_block(len, alignment)?.ok_or_else(|| {
+            Error::ArmFault(format!("guest heap exhausted while allocating {len} bytes"))
+        })
+    }
+
+    fn allocate_guest_block(&mut self, len: usize) -> Result<Option<GuestAddr>> {
+        let required = aligned_heap_len(len)?;
+        self.allocate_heap_block(required, HEAP_ALIGNMENT)
+    }
+
+    fn allocate_heap_block(&mut self, required: u32, alignment: u32) -> Result<Option<GuestAddr>> {
+        let heap = self.guest_heap_state()?;
+        let (mut blocks, terminator) = self.read_free_blocks(heap)?;
+        let mask = alignment - 1;
+        let Some((index, start)) = blocks.iter().enumerate().find_map(|(index, block)| {
+            let start = block.offset.checked_add(mask).map(|value| value & !mask)?;
+            let end = start.checked_add(required)?;
+            let block_end = block.offset.checked_add(block.len)?;
+            (end <= block_end).then_some((index, start))
+        }) else {
+            return Ok(None);
+        };
+
+        let block = blocks[index];
+        let allocation_end = start
+            .checked_add(required)
+            .ok_or_else(|| Error::Abi("guest allocation end overflow".into()))?;
+        let block_end = block
+            .offset
+            .checked_add(block.len)
+            .ok_or_else(|| Error::Abi("guest free-block end overflow".into()))?;
+        let prefix_len = start - block.offset;
+        let suffix_len = block_end - allocation_end;
+        let mut replacement = Vec::with_capacity(2);
+        if prefix_len >= FREE_BLOCK_HEADER_LEN {
+            replacement.push(FreeBlock {
+                offset: block.offset,
+                len: prefix_len,
+            });
+        }
+        if suffix_len >= FREE_BLOCK_HEADER_LEN {
+            replacement.push(FreeBlock {
+                offset: allocation_end,
+                len: suffix_len,
+            });
+        }
+        let replacement_len = replacement.iter().try_fold(0_u32, |total, block| {
+            total
+                .checked_add(block.len)
+                .ok_or_else(|| Error::Abi("guest replacement free-byte count overflow".into()))
+        })?;
+        let consumed = block.len - replacement_len;
+        let free_left = heap.free_left.checked_sub(consumed).ok_or_else(|| {
+            Error::Abi(format!(
+                "guest free-byte count {:#x} is smaller than allocation cost {consumed:#x}",
+                heap.free_left
+            ))
+        })?;
+        blocks.splice(index..=index, replacement);
+        self.write_free_blocks(heap, &blocks, terminator, free_left)?;
+        let address = GuestAddr(heap.base.wrapping_add(start));
+        self.memory.write(address, &vec![0; required as usize])?;
+        Ok(Some(address))
+    }
+
+    fn free_guest_block(&mut self, address: GuestAddr, len: usize) -> Result<()> {
+        if address.0 == 0 {
+            return Ok(());
+        }
+        self.clear_freed_ram_package(address, len)?;
+        if len < FREE_BLOCK_HEADER_LEN as usize {
+            return Ok(());
+        }
+        let block_len = aligned_heap_len(len)?;
+        let heap = self.guest_heap_state()?;
+        let offset = address.0.wrapping_sub(heap.base);
+        let end = offset
+            .checked_add(block_len)
+            .ok_or_else(|| Error::Abi("freed guest block offset overflow".into()))?;
+        if offset >= heap.span || end > heap.span || offset % HEAP_ALIGNMENT != 0 {
+            return Err(Error::Abi(format!(
+                "freed guest block {:#010x} ({} bytes) is outside the active heap {:#010x}..{:#010x}",
+                address.0,
+                len,
+                heap.base,
+                heap.base.wrapping_add(heap.span),
+            )));
+        }
+
+        let (mut blocks, mut terminator) = self.read_free_blocks(heap)?;
+        blocks.push(FreeBlock {
+            offset,
+            len: block_len,
+        });
+        if offset >= terminator || end > terminator {
+            terminator = heap.span;
+        }
+        blocks.sort_unstable_by_key(|block| block.offset);
+
+        let mut merged: Vec<FreeBlock> = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            if let Some(previous) = merged.last_mut() {
+                let previous_end = previous
+                    .offset
+                    .checked_add(previous.len)
+                    .ok_or_else(|| Error::Abi("guest free-block end overflow".into()))?;
+                if block.offset < previous_end {
+                    return Err(Error::Abi(format!(
+                        "freed guest block at offset {:#x} overlaps free block {:#x}..{:#x}",
+                        block.offset, previous.offset, previous_end
+                    )));
+                }
+                if block.offset == previous_end {
+                    previous.len = previous.len.checked_add(block.len).ok_or_else(|| {
+                        Error::Abi("merged guest free-block length overflow".into())
+                    })?;
+                    continue;
+                }
+            }
+            merged.push(block);
+        }
+        let free_left = heap
+            .free_left
+            .checked_add(block_len)
+            .ok_or_else(|| Error::Abi("guest free-byte count overflow".into()))?;
+        self.write_free_blocks(heap, &merged, terminator, free_left)
+    }
+
+    fn clear_freed_ram_package(&mut self, address: GuestAddr, len: usize) -> Result<()> {
+        let ram_address = self.memory.read_u32(data_slot_address(104))?;
+        if ram_address == 0 {
+            return Ok(());
+        }
+        let free_start = u64::from(address.0);
+        let free_end = free_start
+            .checked_add(len as u64)
+            .ok_or_else(|| Error::Abi("freed RAM package range overflow".into()))?;
+        if u64::from(ram_address) >= free_start && u64::from(ram_address) < free_end {
+            self.memory.write_u32(data_slot_address(104), 0)?;
+            self.memory.write_u32(data_slot_address(105), 0)?;
+        }
+        Ok(())
+    }
+
+    fn guest_heap_state(&self) -> Result<GuestHeapState> {
+        let base = self.read_platform_data_slot(108)?;
+        let end = self.read_platform_data_slot(110)?;
+        let span = end.wrapping_sub(base);
+        if span < FREE_BLOCK_HEADER_LEN {
+            return Err(Error::Abi(format!(
+                "active guest heap {base:#010x}..{end:#010x} is too small"
+            )));
+        }
+        let head_variable = self.platform_data_slot_address(146)?;
+        let head = self.memory.read_u32(head_variable)?;
+        if head > span {
+            return Err(Error::Abi(format!(
+                "guest free-list head {head:#x} exceeds heap span {span:#x}"
+            )));
+        }
+        let free_left_variable = self.platform_data_slot_address(111)?;
+        Ok(GuestHeapState {
+            base,
+            span,
+            head,
+            head_variable,
+            free_left: self.memory.read_u32(free_left_variable)?,
+            free_left_variable,
+        })
+    }
+
+    fn read_free_blocks(&self, heap: GuestHeapState) -> Result<(Vec<FreeBlock>, u32)> {
+        let mut blocks = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut offset = heap.head;
+        loop {
+            if offset == heap.span {
+                return Ok((blocks, offset));
+            }
+            let header_end = offset
+                .checked_add(FREE_BLOCK_HEADER_LEN)
+                .ok_or_else(|| Error::Abi("guest free-block header overflow".into()))?;
+            if header_end > heap.span {
+                return Err(Error::Abi(format!(
+                    "guest free-list offset {offset:#x} is outside heap span {:#x}",
+                    heap.span
+                )));
+            }
+            if !seen.insert(offset) {
+                return Err(Error::Abi(format!(
+                    "guest free-list contains a cycle at offset {offset:#x}"
+                )));
+            }
+            let address = GuestAddr(heap.base.wrapping_add(offset));
+            let next = self.memory.read_u32(address)?;
+            let len = self.memory.read_u32(address.checked_add(4)?)?;
+            if next == 0 && len == 0 {
+                return Ok((blocks, offset));
+            }
+            let block_end = offset
+                .checked_add(len)
+                .ok_or_else(|| Error::Abi("guest free-block range overflow".into()))?;
+            if len < FREE_BLOCK_HEADER_LEN || block_end > heap.span {
+                return Err(Error::Abi(format!(
+                    "guest free block at offset {offset:#x} has invalid length {len:#x} for heap span {:#x}",
+                    heap.span
+                )));
+            }
+            if next <= offset || next > heap.span {
+                return Err(Error::Abi(format!(
+                    "guest free block at offset {offset:#x} has invalid next offset {next:#x}"
+                )));
+            }
+            if next != heap.span && block_end > next {
+                return Err(Error::Abi(format!(
+                    "guest free block {offset:#x}..{block_end:#x} overlaps its successor {next:#x}"
+                )));
+            }
+            blocks.push(FreeBlock { offset, len });
+            offset = next;
+        }
+    }
+
+    fn write_free_blocks(
+        &mut self,
+        heap: GuestHeapState,
+        blocks: &[FreeBlock],
+        terminator: u32,
+        free_left: u32,
+    ) -> Result<()> {
+        if terminator > heap.span {
+            return Err(Error::Abi(format!(
+                "guest free-list terminator {terminator:#x} exceeds heap span {:#x}",
+                heap.span
+            )));
+        }
+        let head = blocks.first().map_or(terminator, |block| block.offset);
+        for (index, block) in blocks.iter().copied().enumerate() {
+            let next = blocks
+                .get(index + 1)
+                .map_or(terminator, |block| block.offset);
+            let block_end = block
+                .offset
+                .checked_add(block.len)
+                .ok_or_else(|| Error::Abi("guest free-block range overflow".into()))?;
+            if block_end > next {
+                return Err(Error::Abi(format!(
+                    "guest free block {:#x}..{block_end:#x} exceeds its successor {next:#x}",
+                    block.offset
+                )));
+            }
+            let address = GuestAddr(heap.base.wrapping_add(block.offset));
+            self.memory.write_u32(address, next)?;
+            self.memory.write_u32(address.checked_add(4)?, block.len)?;
+        }
+        self.memory.write_u32(heap.head_variable, head)?;
+        self.memory.write_u32(heap.free_left_variable, free_left)
+    }
+
+    fn platform_data_slot_address(&self, slot: u32) -> Result<GuestAddr> {
+        let address = GuestAddr(self.memory.read_u32(table_slot_address(slot))?);
+        if address.0 == 0 {
+            return Err(Error::Abi(format!(
+                "platform data slot {slot} contains a null variable address"
+            )));
+        }
+        Ok(address)
+    }
+
+    fn read_platform_data_slot(&self, slot: u32) -> Result<u32> {
+        let variable = self.platform_data_slot_address(slot)?;
+        self.memory.read_u32(variable)
     }
 
     fn read_c_string(&self, address: GuestAddr, limit: usize) -> Result<Vec<u8>> {
@@ -2688,6 +3208,15 @@ fn trap_slot(address: u32) -> Option<u32> {
     (offset % 4 == 0 && offset / 4 < PLATFORM_SLOT_COUNT).then_some(offset / 4)
 }
 
+fn aligned_heap_len(len: usize) -> Result<u32> {
+    let len = u32::try_from(len.max(1))
+        .map_err(|_| Error::ArmFault(format!("guest allocation length {len} does not fit u32")))?;
+    len.max(FREE_BLOCK_HEADER_LEN)
+        .checked_add(HEAP_ALIGNMENT - 1)
+        .map(|value| value & !(HEAP_ALIGNMENT - 1))
+        .ok_or_else(|| Error::ArmFault("guest allocation length alignment overflow".into()))
+}
+
 fn data_slot_address(slot: u32) -> GuestAddr {
     GuestAddr(PLATFORM_DATA.0 + slot * 4)
 }
@@ -2728,7 +3257,7 @@ fn is_data_slot(slot: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, net::TcpListener};
 
     use flate2::{Compression, write::GzEncoder};
 
@@ -3168,7 +3697,16 @@ mod tests {
     }
 
     #[test]
-    fn headless_network_lifecycle_succeeds_but_socket_operations_fail() {
+    fn native_stream_socket_connects_polls_and_transfers_on_loopback() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").unwrap();
+        });
         let mut runtime =
             ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
         let mut cpu = ArmCpu::new();
@@ -3180,31 +3718,76 @@ mod tests {
 
         assert_eq!(cpu.register(0), 0);
 
-        runtime
-            .dispatch(82, 0, &mut cpu, &mut StubServices)
-            .unwrap();
-        assert_eq!(cpu.register(0), 0);
-
+        cpu.set_register(0, 0);
+        cpu.set_register(1, 0);
         runtime
             .dispatch(84, 0, &mut cpu, &mut StubServices)
             .unwrap();
-        assert_eq!(cpu.register(0) as i32, -1);
+        let handle = cpu.register(0);
+        assert_ne!(handle as i32, -1);
 
-        for slot in [85, 86, 87] {
+        cpu.set_register(0, handle);
+        cpu.set_register(1, u32::from_be_bytes(Ipv4Addr::LOCALHOST.octets()));
+        cpu.set_register(2, u32::from(port));
+        cpu.set_register(3, 1);
+        runtime
+            .dispatch(85, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 2);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            cpu.set_register(0, 1_001);
+            cpu.set_register(1, handle);
             runtime
-                .dispatch(slot, 0, &mut cpu, &mut StubServices)
+                .dispatch(37, 0, &mut cpu, &mut StubServices)
                 .unwrap();
-            assert_eq!(cpu.register(0) as i32, -1, "slot {slot}");
+            if cpu.register(0) == 0 {
+                break;
+            }
+            assert_eq!(cpu.register(0), 1);
+            assert!(Instant::now() < deadline, "loopback connect timed out");
+            thread::sleep(Duration::from_millis(1));
         }
 
         let payload = runtime.allocate(4, 1).unwrap();
-        runtime.memory.write(payload, b"test").unwrap();
+        runtime.memory.write(payload, b"ping").unwrap();
+        cpu.set_register(0, handle);
         cpu.set_register(1, payload.0);
         cpu.set_register(2, 4);
         runtime
             .dispatch(89, 0, &mut cpu, &mut StubServices)
             .unwrap();
-        assert_eq!(cpu.register(0) as i32, -1);
+        assert_eq!(cpu.register(0), 4);
+
+        let output = runtime.allocate(4, 1).unwrap();
+        loop {
+            cpu.set_register(0, handle);
+            cpu.set_register(1, output.0);
+            cpu.set_register(2, 4);
+            runtime
+                .dispatch(87, 0, &mut cpu, &mut StubServices)
+                .unwrap();
+            if cpu.register(0) == 4 {
+                break;
+            }
+            assert_eq!(cpu.register(0) as i32, -1);
+            assert!(Instant::now() < deadline, "loopback receive timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(runtime.memory.read(output, 4).unwrap(), b"pong");
+
+        cpu.set_register(0, handle);
+        runtime
+            .dispatch(86, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0);
+        server.join().unwrap();
+
+        runtime
+            .dispatch(82, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0);
     }
 
     #[test]
@@ -3419,7 +4002,6 @@ mod tests {
         let output_len = runtime.allocate(4, 4).unwrap();
         let stack = runtime.allocate(4, 4).unwrap();
         runtime.memory.write_u32(stack, output_len.0).unwrap();
-        let heap_cursor_before = runtime.heap_cursor;
         let free_before = runtime.memory.read_u32(data_slot_address(111)).unwrap();
 
         let mut cpu = ArmCpu::new();
@@ -3433,7 +4015,7 @@ mod tests {
 
         let arena = GuestAddr(runtime.memory.read_u32(output).unwrap());
         assert_eq!(cpu.register(0), 0);
-        assert_eq!(arena.0 % 8, 0);
+        assert_eq!(arena, PLATFORM_MEMORY_BASE);
         assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 32);
         assert_eq!(runtime.memory.read(arena, 32).unwrap(), vec![0; 32]);
 
@@ -3446,17 +4028,102 @@ mod tests {
             .unwrap();
 
         assert_eq!(cpu.register(0), 0);
-        assert_eq!(runtime.heap_cursor, heap_cursor_before);
         assert_eq!(
             runtime.memory.read_u32(data_slot_address(111)).unwrap(),
             free_before
         );
-        assert_eq!(runtime.memory.read(arena, 32).unwrap(), vec![0; 32]);
+        assert!(runtime.memory.read(arena, 32).is_err());
         cpu.set_register(0, 1_015);
         assert!(matches!(
             runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
             Err(Error::Abi(message)) if message.contains("unknown arena")
         ));
+    }
+
+    #[test]
+    fn guest_allocator_reuses_and_merges_freed_blocks() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+
+        let first = runtime.allocate_guest_block(24).unwrap().unwrap();
+        let second = runtime.allocate_guest_block(16).unwrap().unwrap();
+        runtime.free_guest_block(first, 24).unwrap();
+        let reused = runtime.allocate_guest_block(16).unwrap().unwrap();
+        assert_eq!(reused, first);
+
+        runtime.free_guest_block(reused, 16).unwrap();
+        runtime.free_guest_block(second, 16).unwrap();
+        let heap = runtime.guest_heap_state().unwrap();
+        let (blocks, terminator) = runtime.read_free_blocks(heap).unwrap();
+        assert_eq!(
+            blocks,
+            [FreeBlock {
+                offset: 0,
+                len: DEFAULT_HEAP_LEN as u32,
+            }]
+        );
+        assert_eq!(terminator, DEFAULT_HEAP_LEN as u32);
+        assert_eq!(heap.free_left, DEFAULT_HEAP_LEN as u32);
+    }
+
+    #[test]
+    fn guest_allocator_follows_staged_and_switched_heap_variables() {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        let initial_span = DEFAULT_HEAP_LEN as u32;
+        let staged_free_left = initial_span + 0x100;
+
+        runtime
+            .memory
+            .write_u32(data_slot_address(110), PLATFORM_MEMORY_BASE.0 + 0x100)
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(data_slot_address(111), staged_free_left)
+            .unwrap();
+        assert_eq!(runtime.allocate_guest_block(16).unwrap(), Some(HEAP_BASE));
+        let staged = runtime.guest_heap_state().unwrap();
+        let (_, staged_terminator) = runtime.read_free_blocks(staged).unwrap();
+        assert_eq!(staged_terminator, initial_span);
+        assert_eq!(staged.free_left, staged_free_left - 16);
+
+        runtime
+            .memory
+            .map(
+                PLATFORM_MEMORY_BASE,
+                0x100,
+                Permissions::READ_WRITE,
+                "test external arena",
+            )
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(PLATFORM_MEMORY_BASE, 0x100)
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(PLATFORM_MEMORY_BASE.checked_add(4).unwrap(), 0x100)
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(data_slot_address(108), PLATFORM_MEMORY_BASE.0)
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(data_slot_address(110), PLATFORM_MEMORY_BASE.0 + 0x100)
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(data_slot_address(111), 0x100)
+            .unwrap();
+        runtime.memory.write_u32(data_slot_address(146), 0).unwrap();
+
+        assert_eq!(
+            runtime.allocate_guest_block(16).unwrap(),
+            Some(PLATFORM_MEMORY_BASE)
+        );
+        assert_eq!(runtime.read_platform_data_slot(146).unwrap(), 16);
+        assert_eq!(runtime.read_platform_data_slot(111).unwrap(), 0xf0);
     }
 
     #[test]
