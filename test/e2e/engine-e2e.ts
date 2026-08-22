@@ -85,7 +85,7 @@ export class SkyEngineE2e {
     this.defaultScreenPath = path.join(tmpDir, "screen.ppm");
     this.bin = resolveSkyEngineBin(options.bin);
     this.workDir = options.workDir ?? process.env.SKYENGINE_WORK_DIR ?? ".";
-    this.timeoutMs = options.timeoutMs ?? Number(process.env.VMRP_TIMEOUT_MS ?? 30_000);
+    this.timeoutMs = options.timeoutMs ?? Number(process.env.SKYENGINE_TIMEOUT_MS ?? 30_000);
     this.dnsMap = options.dnsMap;
     this.screenSize = options.screen;
     this.memorySize = options.memory;
@@ -133,7 +133,7 @@ export class SkyEngineE2e {
 
   async close(): Promise<void> {
     await this.stop();
-    if (process.env.VMRP_E2E_KEEP_TMP !== "1") {
+    if (process.env.SKYENGINE_E2E_KEEP_TMP !== "1") {
       await rm(this.tmpDir, { recursive: true, force: true });
     }
   }
@@ -182,7 +182,7 @@ export class SkyEngineE2e {
    * ENTER/SELECT, ESC/ESCAPE/POWER, SOFTLEFT/LEFT_SOFT, SOFTRIGHT/RIGHT_SOFT,
    * UP, DOWN, LEFT, RIGHT, SEND, STAR/*, POUND/HASH/#, digits 0-9, letters A-Z.
    *
-   * holdMs: 显式物理按住时长(毫秒),覆盖 VMRP_E2E_KEY_HOLD_MS；显式时长可
+   * holdMs: 显式物理按住时长(毫秒),覆盖 SKYENGINE_E2E_KEY_HOLD_MS；显式时长可
    * 表达重复键或长按菜单。KEY 响应携带运行时线程取走 KEYDOWN 时的 draw
    * baseline，避免把排队期间无关的 timer 帧误当作按键结果。
    */
@@ -381,20 +381,20 @@ export class SkyEngineE2e {
   }
 }
 
-/** CMake's documented native output for each host platform. */
+/** Cargo's optimized binary used by the CPU-intensive compatibility tests. */
 export function defaultSkyEngineBin(): string {
   return process.platform === "win32"
-    ? "build/Release/skyengine.exe"
-    : "build/skyengine";
+    ? "target/release/skyengine.exe"
+    : "target/release/skyengine";
 }
 
 /**
  * Keep direct spawn callers on the same executable selection as SkyEngineE2e.
- * CI flattens packaged binaries into build/, so VMRP_BIN must win over the
- * multi-config Windows default even when no SkyEngineE2e instance is created.
+ * Explicit SKYENGINE_BIN overrides must win over the Cargo release default even
+ * when no SkyEngineE2e instance is created.
  */
 export function resolveSkyEngineBin(bin?: string): string {
-  return bin ?? process.env.VMRP_BIN ?? defaultSkyEngineBin();
+  return bin ?? process.env.SKYENGINE_BIN ?? defaultSkyEngineBin();
 }
 
 function controlEndpoint(tmpDir: string): string {
@@ -412,11 +412,11 @@ function controlEndpoint(tmpDir: string): string {
  * 导致数据竞争。SkyEngineWorkspace 在临时目录中复制一份模板,把该目录作为
  * SkyEngine 的 --work-dir,实现文件级隔离。
  *
- * 生命周期须覆盖整个 it()(而非单个 VmrpE2e 实例):opglqa/font.test.ts
+ * 生命周期须覆盖整个 it()(而非单个 SkyEngineE2e 实例):opglqa/font.test.ts
  * 会在同一用例内重启第二个 SkyEngine 实例并验证第一次启动落盘的文件被复用。
  */
 export class SkyEngineWorkspace {
-  /** 传给 VmrpE2e.start 的 workDir。 */
+  /** 传给 SkyEngineE2e.start 的 workDir。 */
   readonly dir: string;
 
   private constructor(dir: string) {
@@ -444,7 +444,7 @@ export class SkyEngineWorkspace {
   }
 
   async dispose(): Promise<void> {
-    if (process.env.VMRP_E2E_KEEP_TMP !== "1") {
+    if (process.env.SKYENGINE_E2E_KEEP_TMP !== "1") {
       await rm(this.dir, { recursive: true, force: true });
     }
   }

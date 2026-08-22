@@ -45,15 +45,15 @@ describe("设备日期配置", () => {
     expect(result.stderr).toContain(`invalid device date '${date}'`);
   });
 
-  it("同步启动遵循 VMRP_BIN 指定的 CI 产物路径", () => {
-    const savedVmrpBin = process.env.VMRP_BIN;
+  it("同步启动遵循 SKYENGINE_BIN 指定的 CI 产物路径", () => {
+    const savedSkyEngineBin = process.env.SKYENGINE_BIN;
     const ciArtifactBin = "build/skyengine.exe";
     try {
-      process.env.VMRP_BIN = ciArtifactBin;
+      process.env.SKYENGINE_BIN = ciArtifactBin;
       expect(resolveSkyEngineBin()).toBe(ciArtifactBin);
     } finally {
-      if (savedVmrpBin === undefined) delete process.env.VMRP_BIN;
-      else process.env.VMRP_BIN = savedVmrpBin;
+      if (savedSkyEngineBin === undefined) delete process.env.SKYENGINE_BIN;
+      else process.env.SKYENGINE_BIN = savedSkyEngineBin;
     }
   });
 

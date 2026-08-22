@@ -4,7 +4,7 @@ import fs from "fs";
 import { readFile } from "fs/promises";
 
 describe("wbrw 输入文字", () => {
-  const targetURL = process.env.VMRP_WBRW_TEST_URL ?? "http://task.jysafe.cn/so1/?m=wodemo2&k=2009&type=all";
+  const targetURL = process.env.SKYENGINE_WBRW_TEST_URL ?? "http://task.jysafe.cn/so1/?m=wodemo2&k=2009&type=all";
   let engine: SkyEngineE2e | undefined;
   let ws: SkyEngineWorkspace | undefined;
 
@@ -51,7 +51,7 @@ describe("wbrw 输入文字", () => {
       // 回车访问
       await engine.key('ENTER', { timeoutMs: 1_000, holdMs: 120 });
       await engine.delay(20_000);
-      if (process.env.VMRP_WBRW_REDRAW_AFTER_IMAGE === "1") {
+      if (process.env.SKYENGINE_WBRW_REDRAW_AFTER_IMAGE === "1") {
         await engine.key('DOWN', { timeoutMs: 1_000, holdMs: 120 });
         await engine.delay(1_000);
       }
@@ -130,7 +130,7 @@ describe("wbrw 输入文字", () => {
       // 回车访问
       await engine.key('ENTER', { timeoutMs: 1_000, holdMs: 120 });
       await engine.delay(10_000);
-      if (process.env.VMRP_WBRW_REDRAW_AFTER_IMAGE === "1") {
+      if (process.env.SKYENGINE_WBRW_REDRAW_AFTER_IMAGE === "1") {
         await engine.key('DOWN', { timeoutMs: 1_000, holdMs: 120 });
         await engine.delay(1_000);
       }

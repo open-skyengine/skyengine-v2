@@ -5,7 +5,7 @@ set -e
 OUT="${1:?usage: repro-tutorial.sh <outdir>}"
 shift || true
 mkdir -p "$OUT"
-ROOT="${VMRP_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+ROOT="${SKYENGINE_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 WS=$(mktemp -d /tmp/gzwdzjs-ws-XXXXXX)
 cp -rL "$ROOT/test/fixtures/mythroad" "$WS/mythroad"
 cp "$ROOT/test/fixtures/gzwdzjs.mrp" "$WS/"
@@ -17,7 +17,7 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 SKYENGINE_E2E_SOCKET="$SOCK" \
 "$ROOT/build/skyengine" --work-dir "$WS" --memory 2M "$WS/gzwdzjs.mrp" \
   >"$OUT/stdout.log" 2>"$OUT/stderr.log" &
-VMRP_PID=$!
+SKYENGINE_PID=$!
 
 # 环境中没有 socat,用 python3 实现同样的"发送一行命令并读取一行响应"。
 cmd() { python3 - "$SOCK" "$1" <<'PYEOF'
@@ -50,7 +50,7 @@ for i in 1 2 3 4 5; do cmd "KEY ENTER"; sleep 1; cmd "SCREEN $OUT/enter2-$i.ppm"
 cmd "SCREEN $OUT/tutorial.ppm"
 cmd "KEY LEFT_SOFT"; sleep 5
 cmd "SCREEN $OUT/start.ppm"
-cmd "QUIT" || kill $VMRP_PID
-wait $VMRP_PID 2>/dev/null || true
+cmd "QUIT" || kill $SKYENGINE_PID
+wait $SKYENGINE_PID 2>/dev/null || true
 rm -rf "$WS"
 echo "done: $OUT"

@@ -449,14 +449,14 @@ fn parse_i32(value: Option<&str>, label: &str) -> std::result::Result<i32, Strin
 }
 
 fn default_key_hold_ms() -> u64 {
-    std::env::var("VMRP_E2E_KEY_HOLD_MS")
+    std::env::var("SKYENGINE_E2E_KEY_HOLD_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_KEY_HOLD_MS)
 }
 
 fn default_pointer_hold_ms() -> u64 {
-    std::env::var("VMRP_E2E_HOLD_MS")
+    std::env::var("SKYENGINE_E2E_HOLD_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_POINTER_HOLD_MS)
