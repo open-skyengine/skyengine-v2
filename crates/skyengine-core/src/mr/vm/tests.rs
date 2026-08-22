@@ -58,6 +58,18 @@ fn work_paths_map_the_guest_c_drive_to_the_runtime_root() {
         safe_work_path(root, b"c:\\mythroad\\system\\font.uc2"),
         Some(PathBuf::from("device/mythroad/system/font.uc2"))
     );
+    assert_eq!(
+        safe_work_path(root, b"X:/mythroad/file"),
+        Some(root.join("disk/x/mythroad/file"))
+    );
+    assert_eq!(
+        safe_work_path(root, b"y:\\cache\\file"),
+        Some(root.join("disk/y/cache/file"))
+    );
+    assert_eq!(
+        safe_work_path(root, b"Z:/data/file"),
+        Some(root.join("disk/z/data/file"))
+    );
     assert_eq!(safe_work_path(root, b"D:/mythroad/file"), None);
     assert_eq!(safe_work_path(root, b"C:/../file"), None);
 }

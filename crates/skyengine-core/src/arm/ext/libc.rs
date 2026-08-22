@@ -213,9 +213,40 @@ impl ExtRuntime {
                 index += 1;
                 continue;
             }
+            let mut left_aligned = false;
+            let mut show_sign = false;
+            let mut space_sign = false;
+            let mut alternate = false;
+            let mut zero_padded = false;
+            while let Some(flag) = format.get(index) {
+                match flag {
+                    b'-' => left_aligned = true,
+                    b'+' => show_sign = true,
+                    b'#' => alternate = true,
+                    b'0' => zero_padded = true,
+                    b' ' => space_sign = true,
+                    _ => break,
+                }
+                index += 1;
+            }
+            let width_start = index;
+            while format.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            let width = parse_decimal_usize(&format[width_start..index]);
+            let precision = if format.get(index) == Some(&b'.') {
+                index += 1;
+                let precision_start = index;
+                while format.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                Some(parse_decimal_usize(&format[precision_start..index]))
+            } else {
+                None
+            };
             while format
                 .get(index)
-                .is_some_and(|byte| b"-+ #0.123456789hl".contains(byte))
+                .is_some_and(|byte| matches!(byte, b'h' | b'l'))
             {
                 index += 1;
             }
@@ -224,23 +255,77 @@ impl ExtRuntime {
                 .ok_or_else(|| Error::Abi("sprintf format ends after '%'".into()))?;
             index += 1;
             let argument = next_argument(&self.memory)?;
-            match specifier {
+            let (mut field, numeric_prefix_len) = match specifier {
                 b's' => {
-                    output.extend_from_slice(&self.read_c_string(GuestAddr(argument), 1024 * 1024)?)
+                    let mut value = self.read_c_string(GuestAddr(argument), 1024 * 1024)?;
+                    if let Some(precision) = precision {
+                        value.truncate(precision);
+                    }
+                    (value, 0)
                 }
-                b'c' => output.push(argument as u8),
-                b'd' | b'i' => output.extend_from_slice((argument as i32).to_string().as_bytes()),
-                b'u' => output.extend_from_slice(argument.to_string().as_bytes()),
-                b'x' => output.extend_from_slice(format!("{argument:x}").as_bytes()),
-                b'X' => output.extend_from_slice(format!("{argument:X}").as_bytes()),
-                b'p' => output.extend_from_slice(format!("0x{argument:08x}").as_bytes()),
+                b'c' => (vec![argument as u8], 0),
+                b'd' | b'i' => {
+                    let value = argument as i32;
+                    let sign = if value < 0 {
+                        b"-".as_slice()
+                    } else if show_sign {
+                        b"+".as_slice()
+                    } else if space_sign {
+                        b" ".as_slice()
+                    } else {
+                        b"".as_slice()
+                    };
+                    let mut field = sign.to_vec();
+                    field.extend_from_slice(value.unsigned_abs().to_string().as_bytes());
+                    apply_numeric_precision(&mut field, sign.len(), precision);
+                    (field, sign.len())
+                }
+                b'u' => {
+                    let mut field = argument.to_string().into_bytes();
+                    apply_numeric_precision(&mut field, 0, precision);
+                    (field, 0)
+                }
+                b'x' | b'X' => {
+                    let prefix: &[u8] = if alternate && argument != 0 {
+                        if specifier == b'x' { b"0x" } else { b"0X" }
+                    } else {
+                        b""
+                    };
+                    let mut field = prefix.to_vec();
+                    let digits = if specifier == b'x' {
+                        format!("{argument:x}")
+                    } else {
+                        format!("{argument:X}")
+                    };
+                    field.extend_from_slice(digits.as_bytes());
+                    apply_numeric_precision(&mut field, prefix.len(), precision);
+                    (field, prefix.len())
+                }
+                b'p' => (format!("0x{argument:08x}").into_bytes(), 2),
                 other => {
                     return Err(Error::Abi(format!(
                         "unsupported sprintf specifier {:?}",
                         char::from(other)
                     )));
                 }
+            };
+            let padding = width.saturating_sub(field.len());
+            if padding != 0 {
+                if left_aligned {
+                    field.extend(std::iter::repeat_n(b' ', padding));
+                } else if zero_padded
+                    && precision.is_none()
+                    && matches!(specifier, b'd' | b'i' | b'u' | b'x' | b'X' | b'p')
+                {
+                    field.splice(
+                        numeric_prefix_len..numeric_prefix_len,
+                        std::iter::repeat_n(b'0', padding),
+                    );
+                } else {
+                    field.splice(0..0, std::iter::repeat_n(b' ', padding));
+                }
             }
+            output.extend_from_slice(&field);
         }
         self.memory.write(destination, &output)?;
         self.memory
@@ -248,6 +333,29 @@ impl ExtRuntime {
         cpu.set_register(0, output.len() as u32);
         Ok(())
     }
+}
+
+fn parse_decimal_usize(bytes: &[u8]) -> usize {
+    bytes.iter().fold(0_usize, |value, byte| {
+        value
+            .saturating_mul(10)
+            .saturating_add(usize::from(byte - b'0'))
+    })
+}
+
+fn apply_numeric_precision(field: &mut Vec<u8>, prefix_len: usize, precision: Option<usize>) {
+    let Some(precision) = precision else {
+        return;
+    };
+    let digit_count = field.len().saturating_sub(prefix_len);
+    if precision == 0 && field.get(prefix_len..).is_some_and(|digits| digits == b"0") {
+        field.truncate(prefix_len);
+        return;
+    }
+    field.splice(
+        prefix_len..prefix_len,
+        std::iter::repeat_n(b'0', precision.saturating_sub(digit_count)),
+    );
 }
 
 fn compare_bytes(left: &[u8], right: &[u8]) -> i32 {

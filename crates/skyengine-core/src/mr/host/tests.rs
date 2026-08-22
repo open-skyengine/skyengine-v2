@@ -61,6 +61,18 @@ fn resolves_device_files_inside_the_mythroad_directory() {
         safe_work_path(Path::new("device"), b"C:/root.dat"),
         Some(PathBuf::from("device/root.dat"))
     );
+    assert_eq!(
+        safe_work_path(Path::new("device"), b"X:/cache/index.dat"),
+        Some(PathBuf::from("device/disk/x/cache/index.dat"))
+    );
+    assert_eq!(
+        safe_work_path(Path::new("device"), b"y:\\data\\save.dat"),
+        Some(PathBuf::from("device/disk/y/data/save.dat"))
+    );
+    assert_eq!(
+        safe_work_path(Path::new("device"), b"Z:/root.dat"),
+        Some(PathBuf::from("device/disk/z/root.dat"))
+    );
 }
 
 #[test]

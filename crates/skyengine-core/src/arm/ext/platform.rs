@@ -35,7 +35,19 @@ impl ExtRuntime {
     }
 
     pub(super) fn return_platform_storage_info(&mut self, cpu: &mut ArmCpu) -> Result<()> {
-        self.memory.read(GuestAddr(cpu.register(1)), 1)?;
+        let input_len = cpu.register(2) as usize;
+        let input = self.memory.read(GuestAddr(cpu.register(1)), input_len)?;
+        let supported_drive = matches!(
+            input.as_slice(),
+            [b'C' | b'X' | b'Y' | b'Z']
+                | [b'C' | b'X' | b'Y' | b'Z', 0]
+                | [b'C' | b'X' | b'Y' | b'Z', b':']
+                | [b'C' | b'X' | b'Y' | b'Z', b':', 0]
+        );
+        if !supported_drive {
+            cpu.set_register(0, u32::MAX);
+            return Ok(());
+        }
         let output = GuestAddr(cpu.register(3));
         if output.0 == 0 {
             return Err(Error::Abi(
@@ -60,7 +72,7 @@ impl ExtRuntime {
         let input_len = cpu.register(2) as usize;
         let input = self.memory.read(GuestAddr(cpu.register(1)), input_len)?;
         match input.as_slice() {
-            b"C" | b"Y" | b"Z" => {}
+            b"C" | b"X" | b"Y" | b"Z" => {}
             _ => {
                 cpu.set_register(0, u32::MAX);
                 return Ok(());

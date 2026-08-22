@@ -727,16 +727,21 @@ fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
     if path.starts_with('/') || path.starts_with('\\') {
         return None;
     }
+    let mut resolved = work_dir.to_path_buf();
     if path.len() >= 2 && path.as_bytes()[1] == b':' {
-        if !matches!(path.as_bytes()[0], b'C' | b'c') {
-            return None;
+        match path.as_bytes()[0].to_ascii_uppercase() {
+            b'C' => {}
+            drive @ (b'X' | b'Y' | b'Z') => {
+                resolved.push("disk");
+                resolved.push(char::from(drive.to_ascii_lowercase()).to_string());
+            }
+            _ => return None,
         }
         path = &path[2..];
         if !path.is_empty() && !path.starts_with('/') && !path.starts_with('\\') {
             return None;
         }
     }
-    let mut resolved = work_dir.to_path_buf();
     for component in path
         .split(['/', '\\'])
         .filter(|component| !matches!(*component, "" | "."))

@@ -209,7 +209,7 @@ impl ExtRuntime {
                     self.return_platform_sim_info(cpu)?
                 }
                 // Disk geometry used by the guest's startup space check.
-                1_305 if cpu.register(2) == 1 => self.return_platform_storage_info(cpu)?,
+                1_305 => self.return_platform_storage_info(cpu)?,
                 // Optional platform control/query without input or output buffers.
                 1_223 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
                     cpu.set_register(0, u32::MAX)

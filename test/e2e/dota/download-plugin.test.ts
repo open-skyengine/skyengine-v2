@@ -126,7 +126,10 @@ describe("dota pixel flow", () => {
     fs.rmSync(ws.path('mythroad/plugins/brwgui.mrp'), { force: true });
     fs.rmSync(ws.path('mythroad/plugins/brwmain.mrp'), { force: true });
     fs.rmSync(ws.path('mythroad/plugins/brwshell.mrp'), { force: true });
-    engine = await SkyEngineE2e.start("test/fixtures/dota.mrp", { workDir: ws.dir });
+    engine = await SkyEngineE2e.start("test/fixtures/dota.mrp", {
+      workDir: ws.dir,
+      dnsMap: "10.0.0.172->159.75.119.124;rop.skymobiapp.com->159.75.119.124;spd.skymobiapp.com->159.75.119.124;proxy.51mrp.com->159.75.119.124;proxy2.51mrp.com->159.75.119.124"
+    });
 
     await engine.delay(6000);
     const boot = await engine.screen("bgm-select");

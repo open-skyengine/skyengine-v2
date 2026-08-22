@@ -439,22 +439,34 @@ fn platform_audio_volume_accepts_supported_levels() {
 fn platform_storage_info_reports_sufficient_available_space() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
-    let drive = runtime.allocate(1, 1).unwrap();
-    runtime.memory.write(drive, b"C").unwrap();
+    let drive = runtime.allocate(3, 1).unwrap();
     let output = runtime.allocate(4, 4).unwrap();
     let output_len = runtime.allocate(4, 4).unwrap();
     let stack = runtime.allocate(4, 4).unwrap();
     runtime.memory.write_u32(stack, output_len.0).unwrap();
 
     let mut cpu = ArmCpu::new();
-    cpu.set_register(0, 1_305);
     cpu.set_register(1, drive.0);
-    cpu.set_register(2, 1);
     cpu.set_register(3, output.0);
     cpu.set_register(13, stack.0);
-    runtime
-        .dispatch(38, 0, &mut cpu, &mut StubServices)
-        .unwrap();
+
+    for selector in [
+        &b"C"[..],
+        &b"C\0"[..],
+        &b"C:"[..],
+        &b"C:\0"[..],
+        &b"X\0"[..],
+        &b"Y:"[..],
+        &b"Z:\0"[..],
+    ] {
+        runtime.memory.write(drive, selector).unwrap();
+        cpu.set_register(0, 1_305);
+        cpu.set_register(2, selector.len() as u32);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0, "selector {selector:?}");
+    }
 
     let info = GuestAddr(runtime.memory.read_u32(output).unwrap());
     let block_size = runtime
@@ -465,11 +477,81 @@ fn platform_storage_info_reports_sufficient_available_space() {
         .memory
         .read_u32(info.checked_add(12).unwrap())
         .unwrap();
-    assert_eq!(cpu.register(0), 0);
     assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 16);
     assert_eq!(block_size, PLATFORM_STORAGE_BLOCK_SIZE);
     assert_eq!(available_blocks, PLATFORM_STORAGE_AVAILABLE_BLOCKS);
     assert!(u64::from(block_size) * u64::from(available_blocks) / 1024 > 2048);
+
+    runtime.memory.write(drive, b"D\0").unwrap();
+    cpu.set_register(0, 1_305);
+    cpu.set_register(2, 2);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0) as i32, -1);
+}
+
+#[test]
+fn sprintf_honors_numeric_width_and_zero_padding() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let destination = runtime.allocate(32, 1).unwrap();
+    let format = runtime.allocate(16, 1).unwrap();
+    runtime.memory.write(format, b"%04d%02d%02d\0").unwrap();
+    let stack = runtime.allocate(4, 4).unwrap();
+    runtime.memory.write_u32(stack, 20).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, destination.0);
+    cpu.set_register(1, format.0);
+    cpu.set_register(2, 2012);
+    cpu.set_register(3, 6);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(17, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), 8);
+    assert_eq!(runtime.memory.read(destination, 9).unwrap(), b"20120620\0");
+}
+
+#[test]
+fn sprintf_combines_flags_width_and_precision() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let destination = runtime.allocate(64, 1).unwrap();
+    let format = runtime.allocate(40, 1).unwrap();
+    runtime
+        .memory
+        .write(format, b"%+05d|% 4d|%-4u|%#06x|%08.5d\0")
+        .unwrap();
+    let stack = runtime.allocate(12, 4).unwrap();
+    runtime.memory.write_u32(stack, 3).unwrap();
+    runtime
+        .memory
+        .write_u32(stack.checked_add(4).unwrap(), 0x2a)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(stack.checked_add(8).unwrap(), 12)
+        .unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, destination.0);
+    cpu.set_register(1, format.0);
+    cpu.set_register(2, (-12_i32) as u32);
+    cpu.set_register(3, 7);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(17, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    let expected = b"-0012|   7|3   |0x002a|   00012\0";
+    assert_eq!(cpu.register(0), (expected.len() - 1) as u32);
+    assert_eq!(
+        runtime.memory.read(destination, expected.len()).unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -488,7 +570,7 @@ fn platform_storage_drive_query_resolves_supported_volumes() {
     cpu.set_register(3, output.0);
     cpu.set_register(13, stack.0);
 
-    for supported_volume in [b'Y', b'Z', b'C'] {
+    for supported_volume in [b'C', b'X', b'Y', b'Z'] {
         runtime.memory.write(volume, &[supported_volume]).unwrap();
         cpu.set_register(0, 1_204);
         runtime
@@ -510,7 +592,7 @@ fn platform_storage_drive_query_resolves_supported_volumes() {
         );
     }
 
-    runtime.memory.write(volume, b"X").unwrap();
+    runtime.memory.write(volume, b"D").unwrap();
     cpu.set_register(0, 1_204);
     runtime
         .dispatch(38, 0, &mut cpu, &mut StubServices)

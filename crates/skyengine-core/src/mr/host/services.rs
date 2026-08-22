@@ -1,5 +1,9 @@
 use super::*;
 
+const FILE_INFO_FILE: i32 = 1;
+const FILE_INFO_DIRECTORY: i32 = 2;
+const FILE_INFO_INVALID: i32 = 8;
+
 pub(super) struct PackageServices<'a> {
     pub(super) package: Arc<Package>,
     pub(super) work_dir: PathBuf,
@@ -82,17 +86,17 @@ impl NativeServices for PackageServices<'_> {
 
     fn file_info(&mut self, name: &[u8]) -> Result<i32> {
         let Some(path) = self.file_path(name) else {
-            return Ok(0);
+            return Ok(-1);
         };
         match fs::metadata(path) {
-            Ok(metadata) if metadata.is_file() => Ok(1),
-            Ok(metadata) if metadata.is_dir() => Ok(2),
-            Ok(_) => Ok(0),
-            Err(_) if is_mrp_file_name(name) => Ok(0),
+            Ok(metadata) if metadata.is_file() => Ok(FILE_INFO_FILE),
+            Ok(metadata) if metadata.is_dir() => Ok(FILE_INFO_DIRECTORY),
+            Ok(_) => Ok(FILE_INFO_INVALID),
+            Err(_) if is_mrp_file_name(name) => Ok(FILE_INFO_INVALID),
             Err(_) => Ok(if self.read_current_package_file(name)?.is_some() {
-                1
+                FILE_INFO_FILE
             } else {
-                0
+                FILE_INFO_INVALID
             }),
         }
     }
