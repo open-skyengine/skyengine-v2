@@ -7,19 +7,13 @@ describe("opglqa 进入主菜单", () => {
   let ws: SkyEngineWorkspace | undefined;
 
   const expectMainScreen = async (name: string) => {
-    for (let i = 0; i < 8; i++) {
-      const screen = await engine!.screen(name);
-      // rgb(144, 212, 248)
-      if (screen.pixel(9, 188).join(",") === "144,212,248") {
-        return;
-      }
-      // Font installation briefly presents a black transition frame after the
-      // success dialog closes; wait for the first stable main-screen paint.
-      await engine!.delay(500);
-    }
-    const screen = await engine!.screen(name);
-    // rgb(144, 212, 248)
-    expect(screen.pixel(9, 188)).toEqual([144, 212, 248]);
+    // Font installation briefly presents a black transition frame while the
+    // downloaded font index is finalized. Wait for the stable main-screen paint.
+    await engine!.waitForPixel(9, 188, [144, 212, 248], {
+      name,
+      timeoutMs: 20_000,
+      intervalMs: 500
+    });
   };
 
   afterEach(async () => {
@@ -46,7 +40,10 @@ describe("opglqa 进入主菜单", () => {
     fs.rmSync(ws.path('mythroad/system/gb12v2.adl'), { force: true });
     fs.rmSync(ws.path('mythroad/system/___sftmp.mrp'), { force: true });
     fs.rmSync(ws.path('mythroad/vld/77ae410'), { force: true, recursive: true });
-    engine = await SkyEngineE2e.start("test/fixtures/opglqa_v4450.mrp", { workDir: ws.dir });
+    engine = await SkyEngineE2e.start("test/fixtures/opglqa_v4450.mrp", {
+      workDir: ws.dir,
+      dnsMap: "spd.skymobiapp.com->159.75.119.124"
+    });
     {
       await engine.delay(1_000);
       const screen = await engine.screen("download-font");
@@ -73,7 +70,10 @@ describe("opglqa 进入主菜单", () => {
 
     await engine.close();
     await engine.delay(1_000);
-    engine = await SkyEngineE2e.start("test/fixtures/opglqa_v4450.mrp", { workDir: ws.dir });
+    engine = await SkyEngineE2e.start("test/fixtures/opglqa_v4450.mrp", {
+      workDir: ws.dir,
+      dnsMap: "spd.skymobiapp.com->159.75.119.124"
+    });
     {
       // 直接进入主界面。
       await expectMainScreen("main-screen2");

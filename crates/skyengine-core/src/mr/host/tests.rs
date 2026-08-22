@@ -35,7 +35,7 @@ fn resolves_other_relative_files_from_the_work_directory() {
             b"installed.mrp",
             b"app/data.dat",
         ),
-        Some(PathBuf::from("device/mythroad/app/data.dat"))
+        Some(PathBuf::from("device/app/data.dat"))
     );
 }
 
@@ -43,19 +43,41 @@ fn resolves_other_relative_files_from_the_work_directory() {
 fn resolves_device_files_inside_the_mythroad_directory() {
     assert_eq!(
         safe_work_path(Path::new("device"), b"gxdzc\\res.temp"),
-        Some(PathBuf::from("device/mythroad/gxdzc/res.temp"))
+        Some(PathBuf::from("device/gxdzc/res.temp"))
     );
     assert_eq!(
         safe_work_path(Path::new("device"), b"mythroad/gxdzc/res.pak"),
         Some(PathBuf::from("device/mythroad/gxdzc/res.pak"))
     );
+    assert_eq!(
+        safe_work_path(Path::new("device"), b"C:/mythroad/gxdzc/res.pak"),
+        Some(PathBuf::from("device/mythroad/gxdzc/res.pak"))
+    );
+    assert_eq!(
+        safe_work_path(Path::new("device"), b"c:\\mythroad\\gxdzc\\res.pak"),
+        Some(PathBuf::from("device/mythroad/gxdzc/res.pak"))
+    );
+    assert_eq!(
+        safe_work_path(Path::new("device"), b"C:/root.dat"),
+        Some(PathBuf::from("device/root.dat"))
+    );
 }
 
 #[test]
-fn selects_device_info_from_the_declared_package_platform() {
-    assert_eq!(device_info_profile(1), DeviceInfoProfile::DeterministicMtk);
-    assert_eq!(device_info_profile(0), DeviceInfoProfile::Unavailable);
-    assert_eq!(device_info_profile(2), DeviceInfoProfile::Unavailable);
+fn selects_device_info_from_the_declared_package_platform_and_version() {
+    assert_eq!(
+        device_info_profile(1, 1_000),
+        DeviceInfoProfile::DeterministicMtk
+    );
+    assert_eq!(device_info_profile(1, 999), DeviceInfoProfile::Unavailable);
+    assert_eq!(
+        device_info_profile(0, 1_000),
+        DeviceInfoProfile::Unavailable
+    );
+    assert_eq!(
+        device_info_profile(2, 1_000),
+        DeviceInfoProfile::Unavailable
+    );
 }
 
 #[test]
@@ -72,6 +94,13 @@ fn resolves_application_directory_paths_to_package_entries() {
 }
 
 #[test]
+fn identifies_nested_package_paths_case_insensitively() {
+    assert!(is_mrp_file_name(b"gwy.mrp"));
+    assert!(is_mrp_file_name(b"C:\\mythroad\\plugins\\PAY.MRP"));
+    assert!(!is_mrp_file_name(b"gxdzc\\res.list"));
+}
+
+#[test]
 fn rejects_parent_paths_for_native_files() {
     assert_eq!(
         native_file_path(
@@ -83,7 +112,9 @@ fn rejects_parent_paths_for_native_files() {
         None
     );
     assert_eq!(safe_work_path(Path::new("device"), b"..\\app.mrp"), None);
-    assert_eq!(safe_work_path(Path::new("device"), b"C:\\app.mrp"), None);
+    assert_eq!(safe_work_path(Path::new("device"), b"D:\\app.mrp"), None);
+    assert_eq!(safe_work_path(Path::new("device"), b"C:app.mrp"), None);
+    assert_eq!(safe_work_path(Path::new("device"), b"C:/../app.mrp"), None);
 }
 
 #[test]

@@ -96,6 +96,6 @@ describe("设备日期配置", () => {
     // 当前宿主年份晚于反汇编确认的 2012 门禁，初始化应在首帧前返回。
     await engine.delay(500);
     expect(await engine.drawCount()).toBe(0);
-    expect((await engine.screen("host-date-black")).uniqueColorCount()).toBe(1);
+    expect((await engine.screenDraw(0, "host-date-black")).uniqueColorCount()).toBe(1);
   }, 10_000);
 });

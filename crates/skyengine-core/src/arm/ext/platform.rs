@@ -59,17 +59,24 @@ impl ExtRuntime {
     pub(super) fn return_platform_storage_drive(&mut self, cpu: &mut ArmCpu) -> Result<()> {
         let input_len = cpu.register(2) as usize;
         let input = self.memory.read(GuestAddr(cpu.register(1)), input_len)?;
-        if input != b"Y" {
+        match input.as_slice() {
+            b"C" | b"Y" | b"Z" => {}
+            _ => {
+                cpu.set_register(0, u32::MAX);
+                return Ok(());
+            }
+        };
+        let output = GuestAddr(cpu.register(3));
+        let output_len = GuestAddr(self.memory.read_u32(GuestAddr(cpu.register(13)))?);
+        if output.0 == 0 && output_len.0 == 0 {
             cpu.set_register(0, u32::MAX);
             return Ok(());
         }
-        let output = GuestAddr(cpu.register(3));
         if output.0 == 0 {
             return Err(Error::Abi(
                 "platform storage drive query has a null output pointer".into(),
             ));
         }
-        let output_len = GuestAddr(self.memory.read_u32(GuestAddr(cpu.register(13)))?);
         if output_len.0 == 0 {
             return Err(Error::Abi(
                 "platform storage drive query has a null output-length pointer".into(),

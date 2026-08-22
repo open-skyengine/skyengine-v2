@@ -348,14 +348,28 @@ pub(super) fn lua_index(value: Option<&Value>, len: usize, default: i64) -> Resu
 }
 
 pub(super) fn safe_work_path(work_dir: &std::path::Path, bytes: &[u8]) -> Option<PathBuf> {
-    let path = std::str::from_utf8(bytes).ok()?;
-    let path = std::path::Path::new(path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    let mut path = std::str::from_utf8(bytes).ok()?;
+    if path.starts_with('/') || path.starts_with('\\') {
         return None;
     }
-    Some(work_dir.join(path))
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        if !matches!(path.as_bytes()[0], b'C' | b'c') {
+            return None;
+        }
+        path = &path[2..];
+        if !path.is_empty() && !path.starts_with('/') && !path.starts_with('\\') {
+            return None;
+        }
+    }
+    let mut resolved = work_dir.to_path_buf();
+    for component in path
+        .split(['/', '\\'])
+        .filter(|component| !matches!(*component, "" | "."))
+    {
+        if component == ".." || component.contains('\0') || component.contains(':') {
+            return None;
+        }
+        resolved.push(component);
+    }
+    Some(resolved)
 }

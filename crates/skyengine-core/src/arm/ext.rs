@@ -10,7 +10,7 @@ use std::{
 
 use flate2::read::GzDecoder;
 
-use crate::{Error, Framebuffer, Package, ResourceLimits, Result};
+use crate::{DeviceDate, DnsMapping, Error, Framebuffer, Package, ResourceLimits, Result};
 
 use super::{ArmCpu, GuestAddr, GuestMemory, Permissions};
 mod dispatch;
@@ -38,7 +38,8 @@ const PLATFORM_SIM_INFO_LEN: usize = 12;
 const PLATFORM_STORAGE_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a10);
 const PLATFORM_STORAGE_INFO_LEN: usize = 16;
 const PLATFORM_STORAGE_DRIVE_DATA: GuestAddr = GuestAddr(0x0100_1a20);
-const PLATFORM_STORAGE_DRIVE_LEN: usize = 2;
+const PLATFORM_STORAGE_DRIVE: &[u8] = b"C:/mythroad/";
+const PLATFORM_STORAGE_DRIVE_LEN: usize = PLATFORM_STORAGE_DRIVE.len();
 const PLATFORM_USER_INFO_LEN: usize = 64;
 // Common MTK EXT fixtures identify the 1.0.4 runtime through this encoded version.
 const PLATFORM_USER_INFO_VERSION: u32 = 101_040_000;
@@ -56,9 +57,9 @@ const DEFAULT_HEAP_LEN: usize = 4 * 1024 * 1024;
 const STACK_BASE: GuestAddr = GuestAddr(0x3000_0000);
 const STACK_LEN: usize = 256 * 1024;
 const PLATFORM_MEMORY_BASE: GuestAddr = GuestAddr(0x4000_0000);
+const DETACHED_GUEST_ALLOCATION_BASE: GuestAddr = GuestAddr(0x5000_0000);
 const SCREEN_BASE: GuestAddr = GuestAddr(HEAP_BASE.0 + MIN_GUEST_RAM_LEN as u32);
 const FREE_BLOCK_HEADER_LEN: u32 = 8;
-const ALLOCATED_BLOCK_HEADER_LEN: u32 = FREE_BLOCK_HEADER_LEN;
 const HEAP_ALIGNMENT: u32 = 8;
 const BITMAP_ENTRY_SIZE: u32 = 16;
 const SCREEN_BITMAP_ID: u32 = 30;
@@ -180,6 +181,16 @@ struct FreeBlock {
     len: u32,
 }
 
+#[derive(Clone, Debug)]
+struct GuestHeapSnapshot {
+    base: u32,
+    span: u32,
+    head: u32,
+    free_left: u32,
+    blocks: Vec<FreeBlock>,
+    terminator: u32,
+}
+
 #[derive(Debug)]
 enum NativeSocketState {
     Created,
@@ -199,6 +210,12 @@ pub(crate) struct ExtRuntime {
     modules: Vec<ModuleContext>,
     active_helper: Option<GuestFunction>,
     heap_len: usize,
+    guest_allocations: BTreeMap<u32, u32>,
+    guest_heap_snapshot: Option<GuestHeapSnapshot>,
+    detached_guest_allocations: BTreeMap<u32, (usize, u32)>,
+    detached_guest_allocation_cursor: u32,
+    dns_mappings: Arc<[DnsMapping]>,
+    device_date: DeviceDate,
     platform_memory_extensions: BTreeMap<u32, (usize, u32)>,
     platform_memory_cursor: u32,
     random_state: u32,
@@ -334,13 +351,19 @@ impl ExtRuntime {
                 value,
             )?;
         }
-        memory.write(PLATFORM_STORAGE_DRIVE_DATA, b"C\0")?;
+        memory.write(PLATFORM_STORAGE_DRIVE_DATA, PLATFORM_STORAGE_DRIVE)?;
 
         Ok(Self {
             memory,
             modules: Vec::new(),
             active_helper: None,
             heap_len,
+            guest_allocations: BTreeMap::new(),
+            guest_heap_snapshot: None,
+            detached_guest_allocations: BTreeMap::new(),
+            detached_guest_allocation_cursor: DETACHED_GUEST_ALLOCATION_BASE.0,
+            dns_mappings: Arc::from([]),
+            device_date: DeviceDate::default(),
             platform_memory_extensions: BTreeMap::new(),
             platform_memory_cursor: PLATFORM_MEMORY_BASE.0,
             random_state: 1,
@@ -558,6 +581,14 @@ impl ExtRuntime {
         Ok(())
     }
 
+    pub fn set_dns_mappings(&mut self, mappings: Arc<[DnsMapping]>) {
+        self.dns_mappings = mappings;
+    }
+
+    pub fn set_device_date(&mut self, device_date: DeviceDate) {
+        self.device_date = device_date;
+    }
+
     pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
         if !pressed && self.suppressed_ui_key_releases.remove(&code) {
             return None;
@@ -644,18 +675,35 @@ impl ExtRuntime {
         cpu.set_register(14, RETURN_SENTINEL);
         cpu.set_pc(function.address);
 
+        let trace_arm = std::env::var_os("SKYENGINE_TRACE_ARM").is_some();
         for instruction_count in 0..INSTRUCTION_BUDGET {
             let pc = cpu.pc().0;
             if pc == RETURN_SENTINEL {
                 return Ok(cpu.register(0));
             }
             if let Some(slot) = trap_slot(pc) {
-                self.dispatch(slot, function.module, &mut cpu, services)?;
+                if let Err(error) = self.dispatch(slot, function.module, &mut cpu, services) {
+                    let context = format!(
+                        " while dispatching module {} slot {slot} at LR {:#010x} (r0={:#010x}, r1={:#010x}, r2={:#010x}, r3={:#010x}, sp={:#010x})",
+                        function.module,
+                        cpu.register(14),
+                        cpu.register(0),
+                        cpu.register(1),
+                        cpu.register(2),
+                        cpu.register(3),
+                        cpu.register(13),
+                    );
+                    return Err(match error {
+                        Error::ArmFault(message) => Error::ArmFault(message + &context),
+                        Error::Abi(message) => Error::Abi(message + &context),
+                        other => other,
+                    });
+                }
                 let return_address = cpu.register(14);
                 cpu.set_pc(return_address);
                 continue;
             }
-            if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+            if trace_arm {
                 eprintln!(
                     "[arm-step] module={} n={} pc={pc:#010x} cpsr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r9={:#010x} sp={:#010x} lr={:#010x}",
                     function.module,

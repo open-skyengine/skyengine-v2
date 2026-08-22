@@ -46,3 +46,18 @@ fn sub_value_splits_numbers_and_byte_strings_into_little_endian_words() {
     assert_eq!(string[0].number(), Some(0x6e6b_6e75_u32 as f64));
     assert_eq!(string[1].number(), Some(0x0000_776f_u32 as f64));
 }
+
+#[test]
+fn work_paths_map_the_guest_c_drive_to_the_runtime_root() {
+    let root = std::path::Path::new("device");
+    assert_eq!(
+        safe_work_path(root, b"C:/mythroad/system/font.uc2"),
+        Some(PathBuf::from("device/mythroad/system/font.uc2"))
+    );
+    assert_eq!(
+        safe_work_path(root, b"c:\\mythroad\\system\\font.uc2"),
+        Some(PathBuf::from("device/mythroad/system/font.uc2"))
+    );
+    assert_eq!(safe_work_path(root, b"D:/mythroad/file"), None);
+    assert_eq!(safe_work_path(root, b"C:/../file"), None);
+}

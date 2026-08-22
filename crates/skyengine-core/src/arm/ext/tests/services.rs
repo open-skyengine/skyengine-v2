@@ -27,6 +27,25 @@ fn datetime_uses_the_deterministic_headless_baseline() {
 }
 
 #[test]
+fn datetime_uses_the_configured_device_date() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.set_device_date(DeviceDate::new(2000, 2, 29).unwrap());
+    let output = runtime.allocate(8, 2).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, output.0);
+
+    runtime
+        .dispatch(34, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(
+        runtime.memory.read(output, 8).unwrap(),
+        [0xd0, 0x07, 2, 29, 0, 0, 0, 2]
+    );
+}
+
+#[test]
 fn guest_character_bitmap_uses_lsb_first_bytes() {
     let mut runtime =
         ExtRuntime::new(16, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -196,16 +215,79 @@ fn headless_audio_stop_is_idempotent() {
 }
 
 #[test]
-fn dns_fails_deterministically_without_a_resolver_provider() {
+fn native_file_write_rejects_a_negative_handle_before_reading_input() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let mut cpu = ArmCpu::new();
+    cpu.set_register(0, u32::MAX);
+    cpu.set_register(1, u32::MAX);
+    cpu.set_register(2, u32::MAX);
+
+    runtime
+        .dispatch(43, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), u32::MAX);
+}
+
+#[test]
+fn dns_fails_deterministically_without_a_resolver_provider() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let hostname = runtime.allocate(16, 1).unwrap();
+    runtime
+        .memory
+        .write(hostname, b"missing.invalid\0")
+        .unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, hostname.0);
 
     runtime
         .dispatch(83, 0, &mut cpu, &mut StubServices)
         .unwrap();
 
     assert_eq!(cpu.register(0) as i32, -1);
+}
+
+#[test]
+fn dns_mapping_returns_a_network_order_ipv4_address() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.set_dns_mappings(Arc::from([DnsMapping {
+        source: "spd.skymobiapp.com".into(),
+        address: Ipv4Addr::new(159, 75, 119, 124),
+        port: None,
+    }]));
+    let hostname = runtime.allocate(21, 1).unwrap();
+    runtime
+        .memory
+        .write(hostname, b"SPD.SkyMobiApp.com.\0")
+        .unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, hostname.0);
+    cpu.set_register(1, 0x1000_0009);
+
+    runtime
+        .dispatch(83, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), u32::from_be_bytes([159, 75, 119, 124]));
+}
+
+#[test]
+fn endpoint_mapping_can_redirect_an_ip_and_port() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.set_dns_mappings(Arc::from([DnsMapping {
+        source: "211.155.236.18".into(),
+        address: Ipv4Addr::LOCALHOST,
+        port: Some(8088),
+    }]));
+
+    assert_eq!(
+        runtime.route_mapped_endpoint(u32::from_be_bytes([211, 155, 236, 18]), 6009),
+        (u32::from_be_bytes([127, 0, 0, 1]), 8088)
+    );
 }
 
 #[test]
@@ -317,6 +399,20 @@ fn platform_storage_query_reports_normal_mode() {
 }
 
 #[test]
+fn platform_rx_initialization_accepts_the_default_mode() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 1_214);
+
+    runtime
+        .dispatch(37, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), 0);
+}
+
+#[test]
 fn platform_audio_volume_accepts_supported_levels() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -377,30 +473,58 @@ fn platform_storage_info_reports_sufficient_available_space() {
 }
 
 #[test]
-fn platform_storage_drive_query_resolves_the_application_volume() {
+fn platform_storage_drive_query_resolves_supported_volumes() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let volume = runtime.allocate(1, 1).unwrap();
-    runtime.memory.write(volume, b"Y").unwrap();
     let output = runtime.allocate(4, 4).unwrap();
     let output_len = runtime.allocate(4, 4).unwrap();
     let stack = runtime.allocate(4, 4).unwrap();
     runtime.memory.write_u32(stack, output_len.0).unwrap();
 
     let mut cpu = ArmCpu::new();
-    cpu.set_register(0, 1_204);
     cpu.set_register(1, volume.0);
     cpu.set_register(2, 1);
     cpu.set_register(3, output.0);
     cpu.set_register(13, stack.0);
+
+    for supported_volume in [b'Y', b'Z', b'C'] {
+        runtime.memory.write(volume, &[supported_volume]).unwrap();
+        cpu.set_register(0, 1_204);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        let drive = GuestAddr(runtime.memory.read_u32(output).unwrap());
+        assert_eq!(cpu.register(0), 0, "volume {}", supported_volume as char);
+        assert_eq!(
+            runtime.memory.read_u32(output_len).unwrap(),
+            PLATFORM_STORAGE_DRIVE_LEN as u32
+        );
+        assert_eq!(
+            runtime
+                .memory
+                .read(drive, PLATFORM_STORAGE_DRIVE_LEN)
+                .unwrap(),
+            b"C:/mythroad/"
+        );
+    }
+
+    runtime.memory.write(volume, b"X").unwrap();
+    cpu.set_register(0, 1_204);
     runtime
         .dispatch(38, 0, &mut cpu, &mut StubServices)
         .unwrap();
+    assert_eq!(cpu.register(0) as i32, -1);
 
-    let drive = GuestAddr(runtime.memory.read_u32(output).unwrap());
-    assert_eq!(cpu.register(0), 0);
-    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 2);
-    assert_eq!(runtime.memory.read(drive, 2).unwrap(), b"C\0");
+    runtime.memory.write(volume, b"C").unwrap();
+    runtime.memory.write_u32(stack, 0).unwrap();
+    cpu.set_register(0, 1_204);
+    cpu.set_register(3, 0);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0) as i32, -1);
 }
 
 #[test]

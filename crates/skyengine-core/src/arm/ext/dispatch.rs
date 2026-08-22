@@ -113,11 +113,18 @@ impl ExtRuntime {
             }
             34 => {
                 let output = GuestAddr(cpu.register(0));
-                self.memory.write_u16(output, 2012)?;
+                self.memory.write_u16(output, self.device_date.year)?;
                 self.memory.write(
                     output.checked_add(2)?,
                     // month, day, hour, minute, second, weekday (Sunday = 0)
-                    &[6, 20, 0, 0, 0, 3],
+                    &[
+                        self.device_date.month,
+                        self.device_date.day,
+                        0,
+                        0,
+                        0,
+                        self.device_date.weekday(),
+                    ],
                 )?;
                 cpu.set_register(0, 0);
             }
@@ -156,6 +163,9 @@ impl ExtRuntime {
                 // Report the normal storage profile. 1002 denotes USB mass-storage
                 // mode, in which applications must not access their regular volume.
                 (1_218, 0) => cpu.set_register(0, 1_001),
+                // RX initialization announces its default platform mode and does
+                // not consume a result beyond whether the call is accepted.
+                (1_214, 0) => cpu.set_register(0, 0),
                 // Network request compatibility version used by message.ext.
                 (1_205, 0) => cpu.set_register(0, 1_001),
                 // Native audio wrappers use a five-step multimedia volume. The
@@ -204,6 +214,10 @@ impl ExtRuntime {
                 1_223 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
                     cpu.set_register(0, u32::MAX)
                 }
+                // Vendor initialization notification with no input or output buffers.
+                2_011 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
+                    cpu.set_register(0, 0)
+                }
                 // Optional vendor capability probe. The baseline headless profile
                 // does not provide it, so report the ABI failure value.
                 0x0009_0003
@@ -241,6 +255,10 @@ impl ExtRuntime {
             }
             43 => {
                 let handle = cpu.register(0) as i32;
+                if handle < 0 {
+                    cpu.set_register(0, u32::MAX);
+                    return Ok(());
+                }
                 let bytes = self
                     .memory
                     .read(GuestAddr(cpu.register(1)), cpu.register(2) as usize)?;
@@ -391,10 +409,8 @@ impl ExtRuntime {
                 cpu.set_register(0, 0);
             }
             83 => {
-                // DNS completion is asynchronous in the guest ABI. The baseline
-                // profile has no resolver/event provider, so fail the request
-                // immediately and let the caller select its offline path.
-                cpu.set_register(0, u32::MAX);
+                let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
+                cpu.set_register(0, self.resolve_mapped_host(&name).unwrap_or(u32::MAX));
             }
             84 => {
                 let socket_type = cpu.register(0);
@@ -407,12 +423,9 @@ impl ExtRuntime {
                 cpu.set_register(0, handle.map_or(u32::MAX, |handle| handle as u32));
             }
             85 => {
-                let result = self.connect_native_socket(
-                    cpu.register(0) as i32,
-                    cpu.register(1),
-                    cpu.register(2),
-                    cpu.register(3),
-                );
+                let (ip, port) = self.route_mapped_endpoint(cpu.register(1), cpu.register(2));
+                let result =
+                    self.connect_native_socket(cpu.register(0) as i32, ip, port, cpu.register(3));
                 cpu.set_register(0, result as u32);
             }
             86 => {
@@ -642,7 +655,17 @@ impl ExtRuntime {
                 };
                 let output = match prepared_output {
                     Some(output) => output,
-                    None => self.allocate(bytes.len(), 8)?,
+                    None => {
+                        let Some(output) = self.allocate_guest_block(bytes.len())? else {
+                            let len_pointer = GuestAddr(cpu.register(1));
+                            if len_pointer.0 != 0 {
+                                self.memory.write_u32(len_pointer, 0)?;
+                            }
+                            cpu.set_register(0, 0);
+                            return Ok(());
+                        };
+                        output
+                    }
                 };
                 self.memory.write(output, &bytes)?;
                 let len_pointer = GuestAddr(cpu.register(1));

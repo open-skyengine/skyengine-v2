@@ -8,4 +8,4 @@ pub mod runtime;
 pub use display::{DisplayEvent, Framebuffer, PlatformDisplay};
 pub use error::{Error, Result};
 pub use package::{Package, PackageEntry, PackageHeader, ResourceLimits};
-pub use runtime::{Runtime, RuntimeConfig, RuntimeState};
+pub use runtime::{DeviceDate, DnsMapping, Runtime, RuntimeConfig, RuntimeState};

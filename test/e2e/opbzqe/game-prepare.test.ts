@@ -24,6 +24,9 @@ describe("opbzqe 进入主菜单", () => {
     if (!fs.existsSync(ws.path('mythroad/plugins/advbar.mrp'))) {
       fs.cpSync('test/fixtures/plugins/advbar.mrp', ws.path('mythroad/plugins/advbar.mrp'));
     }
+    // This package probes its font and plugins through C-drive-relative paths.
+    fs.cpSync(ws.path('mythroad/system'), ws.path('system'), { recursive: true });
+    fs.cpSync(ws.path('mythroad/plugins'), ws.path('plugins'), { recursive: true });
     engine = await SkyEngineE2e.start("test/fixtures/opbzqe.mrp", { workDir: ws.dir });
 
     await vi.waitFor(async () => {
@@ -41,7 +44,11 @@ describe("opbzqe 进入主菜单", () => {
     await engine.delay(1_000);
 
     // 进入主菜单
-    const wake = await engine.screen("menu");
+    const wake = await engine.waitForPixel(110, 27, [128, 48, 40], {
+      name: "menu",
+      timeoutMs: 10_000,
+      intervalMs: 500
+    });
     // rgb(128, 48, 40)
     expect(wake.pixel(110, 27)).toEqual([128, 48, 40]);
     expect(wake.pixel(120, 20)).toEqual([176, 120, 120]);

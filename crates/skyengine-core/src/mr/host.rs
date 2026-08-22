@@ -10,7 +10,7 @@ use std::{
 use encoding_rs::GBK;
 
 use crate::{
-    Framebuffer, Package, PlatformDisplay, Result,
+    DnsMapping, Framebuffer, Package, PlatformDisplay, Result,
     arm::{DeviceInfoProfile, ExtLifecycleRequest, ExtRuntime, GuestAddr, NativeServices},
 };
 
@@ -57,6 +57,8 @@ pub(crate) struct MrHost {
     pub work_dir: PathBuf,
     font: Arc<[u8]>,
     memory_limit: u32,
+    dns_mappings: Arc<[DnsMapping]>,
+    device_date: crate::DeviceDate,
     bitmaps: BTreeMap<i32, Bitmap>,
     directory_searches: BTreeMap<i32, DirectorySearch>,
     next_directory_handle: i32,
@@ -68,22 +70,30 @@ pub(crate) struct MrHost {
     ext_runtime: Option<ExtRuntime>,
 }
 
+pub(crate) struct MrHostConfig {
+    pub work_dir: PathBuf,
+    pub font: Arc<[u8]>,
+    pub memory_limit: u32,
+    pub dns_mappings: Arc<[DnsMapping]>,
+    pub device_date: crate::DeviceDate,
+}
+
 impl MrHost {
     pub fn new(
         package: Arc<Package>,
         framebuffer: Framebuffer,
         display: Box<dyn PlatformDisplay>,
-        work_dir: PathBuf,
-        font: Arc<[u8]>,
-        memory_limit: u32,
+        config: MrHostConfig,
     ) -> Self {
         Self {
             package,
             framebuffer,
             display,
-            work_dir,
-            font,
-            memory_limit,
+            work_dir: config.work_dir,
+            font: config.font,
+            memory_limit: config.memory_limit,
+            dns_mappings: config.dns_mappings,
+            device_date: config.device_date,
             bitmaps: BTreeMap::new(),
             directory_searches: BTreeMap::new(),
             next_directory_handle: 1,
@@ -501,7 +511,10 @@ impl MrHost {
                         )?;
                         runtime.set_device_info_profile(device_info_profile(
                             self.package.header().platform,
+                            self.package.header().version,
                         ))?;
+                        runtime.set_dns_mappings(self.dns_mappings.clone());
+                        runtime.set_device_date(self.device_date);
                         let (previous_package, previous_entry) = self
                             .application_stack
                             .last()
@@ -692,30 +705,42 @@ fn package_entry_path(internal_name: &[u8], guest_name: &[u8]) -> Option<Vec<u8>
     Some(path)
 }
 
-fn device_info_profile(platform: u8) -> DeviceInfoProfile {
-    match platform {
-        // The package header explicitly declares the common MTK/MStar ABI.
-        1 => DeviceInfoProfile::DeterministicMtk,
-        _ => DeviceInfoProfile::Unavailable,
+fn is_mrp_file_name(path: &[u8]) -> bool {
+    let name = path
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or_default();
+    name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".mrp")
+}
+
+fn device_info_profile(platform: u8, version: u32) -> DeviceInfoProfile {
+    // Versions from 1000 onward use the common MTK/MStar device-info ABI.
+    if platform == 1 && version >= 1_000 {
+        DeviceInfoProfile::DeterministicMtk
+    } else {
+        DeviceInfoProfile::Unavailable
     }
 }
 
 fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
-    let path = std::str::from_utf8(bytes).ok()?;
+    let mut path = std::str::from_utf8(bytes).ok()?;
     if path.starts_with('/') || path.starts_with('\\') {
         return None;
     }
-    let components = path
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        if !matches!(path.as_bytes()[0], b'C' | b'c') {
+            return None;
+        }
+        path = &path[2..];
+        if !path.is_empty() && !path.starts_with('/') && !path.starts_with('\\') {
+            return None;
+        }
+    }
+    let mut resolved = work_dir.to_path_buf();
+    for component in path
         .split(['/', '\\'])
         .filter(|component| !matches!(*component, "" | "."))
-        .collect::<Vec<_>>();
-    let mut resolved = work_dir.to_path_buf();
-    resolved.push("mythroad");
-    let components = match components.as_slice() {
-        ["mythroad", tail @ ..] => tail,
-        components => components,
-    };
-    for &component in components {
+    {
         match component {
             ".." => return None,
             component if component.contains('\0') || component.contains(':') => return None,

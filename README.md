@@ -59,7 +59,9 @@ cargo run -p skyengine -- run \
 ```
 
 The output is a binary P6 PPM image. `--frame-output` implies headless mode. Useful overrides are
-`--entry NAME`, `--work-dir DIR`, `--font FILE`, and `--screen WIDTHxHEIGHT`.
+`--entry NAME`, `--work-dir DIR`, `--font FILE`, `--screen WIDTHxHEIGHT`,
+`--dns-map 'HOST->IPv4[:PORT];...'`, and `--device-date YYYY-M-D|host`. The guest path
+`C:/` maps to `--work-dir`, so `C:/mythroad/...` maps to its `mythroad/...` subtree.
 
 ## Run With SDL2
 

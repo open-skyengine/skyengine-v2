@@ -88,6 +88,7 @@ impl NativeServices for PackageServices<'_> {
             Ok(metadata) if metadata.is_file() => Ok(1),
             Ok(metadata) if metadata.is_dir() => Ok(2),
             Ok(_) => Ok(0),
+            Err(_) if is_mrp_file_name(name) => Ok(0),
             Err(_) => Ok(if self.read_current_package_file(name)?.is_some() {
                 1
             } else {
@@ -143,6 +144,14 @@ impl NativeServices for PackageServices<'_> {
         let write = mode & 2 != 0 || mode & 4 != 0;
         if !read && !write {
             return Ok(-1);
+        }
+        if mode & 8 != 0 {
+            let Some(parent) = path.parent() else {
+                return Ok(-1);
+            };
+            if fs::create_dir_all(parent).is_err() {
+                return Ok(-1);
+            }
         }
         let host_file = OpenOptions::new()
             .read(read)

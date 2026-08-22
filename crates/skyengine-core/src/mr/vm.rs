@@ -6,7 +6,7 @@ use crate::{
 
 use super::{
     chunk::{Constant, MrChunk, Prototype},
-    host::MrHost,
+    host::{MrHost, MrHostConfig},
     value::{Cell, Closure, ClosureRef, Table, TableRef, Value},
 };
 
@@ -52,21 +52,18 @@ enum CallResult {
 }
 
 impl MrVm {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         package: Arc<Package>,
         framebuffer: Framebuffer,
         display: Box<dyn PlatformDisplay>,
-        work_dir: PathBuf,
-        font: Arc<[u8]>,
-        memory_limit: u32,
+        host_config: MrHostConfig,
         limits: ResourceLimits,
     ) -> Self {
         let globals = Table::new();
         let mut vm = Self {
             globals,
             frames: Vec::new(),
-            host: MrHost::new(package, framebuffer, display, work_dir, font, memory_limit),
+            host: MrHost::new(package, framebuffer, display, host_config),
             limits,
             instruction_count: 0,
             final_values: Vec::new(),

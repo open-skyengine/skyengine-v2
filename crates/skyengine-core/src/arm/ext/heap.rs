@@ -10,34 +10,91 @@ impl ExtRuntime {
         let len = u32::try_from(len.max(1)).map_err(|_| {
             Error::ArmFault(format!("guest allocation length {len} does not fit u32"))
         })?;
-        self.allocate_heap_block(len, alignment)?.ok_or_else(|| {
+        let heap_base = self.read_platform_data_slot(108)?;
+        let heap_end = self.read_platform_data_slot(110)?;
+        if heap_base == 0 && heap_end == 0 {
+            let block_len = align_heap_len(len)?;
+            return self
+                .allocate_detached_guest_block(block_len)?
+                .ok_or_else(|| {
+                    Error::ArmFault(format!(
+                        "detached guest memory exhausted while allocating {len} bytes"
+                    ))
+                });
+        }
+        let (address, consumed) = self.allocate_heap_block(len, alignment)?.ok_or_else(|| {
             Error::ArmFault(format!("guest heap exhausted while allocating {len} bytes"))
-        })
+        })?;
+        self.track_guest_heap_allocation(address, consumed);
+        Ok(address)
     }
 
     pub(super) fn allocate_guest_block(&mut self, len: usize) -> Result<Option<GuestAddr>> {
-        let len = u32::try_from(len.max(1)).map_err(|_| {
-            Error::ArmFault(format!("guest allocation length {len} does not fit u32"))
-        })?;
-        self.allocate_heap_block(len, HEAP_ALIGNMENT)
+        let block_len = aligned_heap_len(len)?;
+        let heap_base = self.read_platform_data_slot(108)?;
+        let heap_end = self.read_platform_data_slot(110)?;
+        if heap_base == 0 && heap_end == 0 {
+            return self.allocate_detached_guest_block(block_len);
+        }
+        let allocation = self.allocate_heap_block(block_len, HEAP_ALIGNMENT)?;
+        if let Some((address, consumed)) = allocation {
+            self.track_guest_heap_allocation(address, consumed);
+        }
+        Ok(allocation.map(|(address, _)| address))
+    }
+
+    fn track_guest_heap_allocation(&mut self, address: GuestAddr, block_len: u32) {
+        let allocation_start = u64::from(address.0);
+        let allocation_end = allocation_start + u64::from(block_len);
+        self.guest_allocations.retain(|tracked_start, tracked_len| {
+            let tracked_start = u64::from(*tracked_start);
+            let tracked_end = tracked_start + u64::from(*tracked_len);
+            tracked_end <= allocation_start || tracked_start >= allocation_end
+        });
+        self.guest_allocations.insert(address.0, block_len);
+    }
+
+    fn allocate_detached_guest_block(&mut self, block_len: u32) -> Result<Option<GuestAddr>> {
+        let active_len = self
+            .detached_guest_allocations
+            .values()
+            .try_fold(0_usize, |total, (len, _)| total.checked_add(*len))
+            .ok_or_else(|| Error::ArmFault("detached guest allocation length overflow".into()))?;
+        let block_len_usize = block_len as usize;
+        if active_len
+            .checked_add(block_len_usize)
+            .is_none_or(|total| total > self.heap_len)
+        {
+            return Ok(None);
+        }
+
+        let previous_cursor = self.detached_guest_allocation_cursor;
+        let address = GuestAddr(previous_cursor);
+        let end = previous_cursor
+            .checked_add(block_len)
+            .ok_or_else(|| Error::ArmFault("detached guest allocation address overflow".into()))?;
+        self.memory.map(
+            address,
+            block_len_usize,
+            Permissions::READ_WRITE,
+            "detached guest allocation",
+        )?;
+        self.detached_guest_allocation_cursor = end;
+        self.detached_guest_allocations
+            .insert(address.0, (block_len_usize, previous_cursor));
+        Ok(Some(address))
     }
 
     pub(super) fn allocate_heap_block(
         &mut self,
-        payload_len: u32,
+        required: u32,
         alignment: u32,
-    ) -> Result<Option<GuestAddr>> {
-        let required = allocated_heap_len(payload_len)?;
+    ) -> Result<Option<(GuestAddr, u32)>> {
         let heap = self.guest_heap_state()?;
-        let (mut blocks, terminator) = self.read_free_blocks(heap)?;
+        let (mut blocks, terminator, recovered_len) = self.read_free_blocks(heap)?;
         let mask = alignment - 1;
         let Some((index, start)) = blocks.iter().enumerate().find_map(|(index, block)| {
-            let payload_start = block
-                .offset
-                .checked_add(ALLOCATED_BLOCK_HEADER_LEN)?
-                .checked_add(mask)
-                .map(|value| value & !mask)?;
-            let start = payload_start.checked_sub(ALLOCATED_BLOCK_HEADER_LEN)?;
+            let start = block.offset.checked_add(mask).map(|value| value & !mask)?;
             let end = start.checked_add(required)?;
             let block_end = block.offset.checked_add(block.len)?;
             (end <= block_end).then_some((index, start))
@@ -74,49 +131,82 @@ impl ExtRuntime {
                 .ok_or_else(|| Error::Abi("guest replacement free-byte count overflow".into()))
         })?;
         let consumed = block.len - replacement_len;
-        let free_left = heap.free_left.checked_sub(consumed).ok_or_else(|| {
-            Error::Abi(format!(
-                "guest free-byte count {:#x} is smaller than allocation cost {consumed:#x}",
-                heap.free_left
-            ))
-        })?;
+        let discarded_prefix = if prefix_len < FREE_BLOCK_HEADER_LEN {
+            prefix_len
+        } else {
+            0
+        };
+        let reclaim_len = consumed
+            .checked_sub(discarded_prefix)
+            .ok_or_else(|| Error::Abi("guest reclaimable allocation length underflow".into()))?;
+        let free_left = heap
+            .free_left
+            .checked_sub(recovered_len)
+            .and_then(|free_left| free_left.checked_sub(consumed))
+            .ok_or_else(|| {
+                Error::Abi(format!(
+                    "guest free-byte count {:#x} is smaller than allocation cost {:#x}",
+                    heap.free_left,
+                    recovered_len.saturating_add(consumed),
+                ))
+            })?;
         blocks.splice(index..=index, replacement);
         self.write_free_blocks(heap, &blocks, terminator, free_left)?;
-        let block_end = start
-            .checked_add(consumed)
-            .ok_or_else(|| Error::Abi("guest allocated-block end overflow".into()))?;
-        let header = GuestAddr(heap.base.wrapping_add(start));
-        self.memory.write_u32(header, block_end)?;
-        self.memory.write_u32(header.checked_add(4)?, consumed)?;
-        let payload = header.checked_add(ALLOCATED_BLOCK_HEADER_LEN)?;
-        let zero_len = consumed
-            .checked_sub(ALLOCATED_BLOCK_HEADER_LEN)
-            .ok_or_else(|| Error::Abi("guest allocated block is smaller than its header".into()))?;
-        self.memory.write(payload, &vec![0; zero_len as usize])?;
-        Ok(Some(payload))
+        let address = GuestAddr(heap.base.wrapping_add(start));
+        self.memory.write(address, &vec![0; required as usize])?;
+        Ok(Some((address, reclaim_len)))
     }
 
-    pub(super) fn free_guest_block(&mut self, address: GuestAddr, _len: usize) -> Result<()> {
-        if address.0 == 0 {
+    pub(super) fn free_guest_block(&mut self, address: GuestAddr, len: usize) -> Result<()> {
+        if address.0 <= 1 {
+            return Ok(());
+        }
+        if let Some((len, previous_cursor)) =
+            self.detached_guest_allocations.get(&address.0).copied()
+        {
+            let end = address
+                .0
+                .checked_add(u32::try_from(len).map_err(|_| {
+                    Error::Abi(format!(
+                        "detached guest allocation length {len} exceeds u32"
+                    ))
+                })?)
+                .ok_or_else(|| Error::Abi("detached guest allocation end overflow".into()))?;
+            self.memory.unmap(address, len)?;
+            self.detached_guest_allocations.remove(&address.0);
+            if end == self.detached_guest_allocation_cursor {
+                self.detached_guest_allocation_cursor = previous_cursor;
+            }
+            return Ok(());
+        }
+        let heap_base = self.read_platform_data_slot(108)?;
+        let heap_end = self.read_platform_data_slot(110)?;
+        if heap_base == 0 && heap_end == 0 {
             return Ok(());
         }
         let heap = self.guest_heap_state()?;
-        let header_address = address
-            .0
-            .checked_sub(ALLOCATED_BLOCK_HEADER_LEN)
-            .map(GuestAddr)
-            .ok_or_else(|| Error::Abi("freed guest address underflows its block header".into()))?;
-        let offset = header_address.0.checked_sub(heap.base).ok_or_else(|| {
-            Error::Abi(format!(
-                "freed guest block {:#010x} is below the active heap {:#010x}",
-                address.0, heap.base
-            ))
-        })?;
-        let block_len = self.memory.read_u32(header_address.checked_add(4)?)?;
+        let Some(offset) = address.0.checked_sub(heap.base) else {
+            self.guest_allocations.remove(&address.0);
+            return Ok(());
+        };
+        if offset >= heap.span {
+            self.guest_allocations.remove(&address.0);
+            return Ok(());
+        }
+        let block_len = match self.guest_allocations.get(&address.0).copied() {
+            Some(block_len) => block_len,
+            None if len != 0 => aligned_heap_len(len)?,
+            None => {
+                return Err(Error::Abi(format!(
+                    "free references unknown guest allocation {:#010x}",
+                    address.0
+                )));
+            }
+        };
         let end = offset
             .checked_add(block_len)
             .ok_or_else(|| Error::Abi("freed guest block offset overflow".into()))?;
-        if block_len < ALLOCATED_BLOCK_HEADER_LEN
+        if block_len < FREE_BLOCK_HEADER_LEN
             || offset >= heap.span
             || end > heap.span
             || offset % HEAP_ALIGNMENT != 0
@@ -129,9 +219,15 @@ impl ExtRuntime {
                 heap.base.wrapping_add(heap.span),
             )));
         }
-        self.clear_freed_ram_package(address, (block_len - ALLOCATED_BLOCK_HEADER_LEN) as usize)?;
 
-        let (mut blocks, mut terminator) = self.read_free_blocks(heap)?;
+        let (mut blocks, mut terminator, recovered_len) = self.read_free_blocks(heap)?;
+        if blocks.iter().any(|block| {
+            let block_end = block.offset + block.len;
+            block.offset <= offset && end <= block_end
+        }) {
+            self.guest_allocations.remove(&address.0);
+            return Ok(());
+        }
         blocks.push(FreeBlock {
             offset,
             len: block_len,
@@ -165,9 +261,13 @@ impl ExtRuntime {
         }
         let free_left = heap
             .free_left
-            .checked_add(block_len)
+            .checked_sub(recovered_len)
+            .and_then(|free_left| free_left.checked_add(block_len))
             .ok_or_else(|| Error::Abi("guest free-byte count overflow".into()))?;
-        self.write_free_blocks(heap, &merged, terminator, free_left)
+        self.clear_freed_ram_package(address, block_len as usize)?;
+        self.write_free_blocks(heap, &merged, terminator, free_left)?;
+        self.guest_allocations.remove(&address.0);
+        Ok(())
     }
 
     pub(super) fn clear_freed_ram_package(&mut self, address: GuestAddr, len: usize) -> Result<()> {
@@ -184,6 +284,72 @@ impl ExtRuntime {
             self.memory.write_u32(data_slot_address(105), 0)?;
         }
         Ok(())
+    }
+
+    pub(super) fn reserve_guest_heap_range(&mut self, address: GuestAddr, len: u32) -> Result<()> {
+        let heap = self.guest_heap_state()?;
+        let Some(offset) = address.0.checked_sub(heap.base) else {
+            return Ok(());
+        };
+        if offset >= heap.span {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::Abi("reserved guest range overflow".into()))?;
+        if end > heap.span {
+            return Err(Error::Abi(format!(
+                "reserved guest range {:#010x}..{:#010x} exceeds the active heap",
+                address.0,
+                address.0.wrapping_add(len),
+            )));
+        }
+
+        let (blocks, terminator, recovered_len) = self.read_free_blocks(heap)?;
+        let mut retained = Vec::with_capacity(blocks.len() + 1);
+        let mut reserved_len = 0_u32;
+        for block in blocks {
+            let block_end = block
+                .offset
+                .checked_add(block.len)
+                .ok_or_else(|| Error::Abi("guest free-block range overflow".into()))?;
+            let overlap_start = block.offset.max(offset);
+            let overlap_end = block_end.min(end);
+            if overlap_start >= overlap_end {
+                retained.push(block);
+                continue;
+            }
+
+            let prefix_len = overlap_start - block.offset;
+            let suffix_len = block_end - overlap_end;
+            let mut retained_len = 0_u32;
+            if prefix_len >= FREE_BLOCK_HEADER_LEN {
+                retained.push(FreeBlock {
+                    offset: block.offset,
+                    len: prefix_len,
+                });
+                retained_len += prefix_len;
+            }
+            if suffix_len >= FREE_BLOCK_HEADER_LEN {
+                retained.push(FreeBlock {
+                    offset: overlap_end,
+                    len: suffix_len,
+                });
+                retained_len += suffix_len;
+            }
+            reserved_len = reserved_len
+                .checked_add(block.len - retained_len)
+                .ok_or_else(|| Error::Abi("reserved guest byte count overflow".into()))?;
+        }
+        if recovered_len == 0 && reserved_len == 0 {
+            return Ok(());
+        }
+        let free_left = heap
+            .free_left
+            .checked_sub(recovered_len)
+            .and_then(|free_left| free_left.checked_sub(reserved_len))
+            .ok_or_else(|| Error::Abi("guest free-byte count underflow while reserving".into()))?;
+        self.write_free_blocks(heap, &retained, terminator, free_left)
     }
 
     pub(super) fn guest_heap_state(&self) -> Result<GuestHeapState> {
@@ -213,13 +379,18 @@ impl ExtRuntime {
         })
     }
 
-    pub(super) fn read_free_blocks(&self, heap: GuestHeapState) -> Result<(Vec<FreeBlock>, u32)> {
+    pub(super) fn read_free_blocks(
+        &self,
+        heap: GuestHeapState,
+    ) -> Result<(Vec<FreeBlock>, u32, u32)> {
         let mut blocks = Vec::new();
         let mut seen = BTreeSet::new();
         let mut offset = heap.head;
+        let mut recovered_len = 0_u32;
         loop {
             if offset == heap.span {
-                return Ok((blocks, offset));
+                validate_free_block_ranges(&blocks, heap.span)?;
+                return Ok((blocks, offset, recovered_len));
             }
             let header_end = offset
                 .checked_add(FREE_BLOCK_HEADER_LEN)
@@ -239,30 +410,103 @@ impl ExtRuntime {
             let next = self.memory.read_u32(address)?;
             let len = self.memory.read_u32(address.checked_add(4)?)?;
             if next == 0 && len == 0 {
-                return Ok((blocks, offset));
+                validate_free_block_ranges(&blocks, heap.span)?;
+                return Ok((blocks, offset, recovered_len));
             }
             let block_end = offset
                 .checked_add(len)
                 .ok_or_else(|| Error::Abi("guest free-block range overflow".into()))?;
             if len < FREE_BLOCK_HEADER_LEN || block_end > heap.span {
-                return Err(Error::Abi(format!(
-                    "guest free block at offset {offset:#x} has invalid length {len:#x} for heap span {:#x}",
-                    heap.span
-                )));
+                let (recovered, next, removed_len) = self
+                    .recover_corrupted_free_header(heap, offset)
+                    .ok_or_else(|| {
+                        Error::Abi(format!(
+                            "guest free block at offset {offset:#x} has invalid length {len:#x} for heap span {:#x}",
+                            heap.span,
+                        ))
+                    })?;
+                blocks.extend(recovered);
+                recovered_len = recovered_len
+                    .checked_add(removed_len)
+                    .ok_or_else(|| Error::Abi("recovered guest free-byte count overflow".into()))?;
+                offset = next;
+                continue;
             }
-            if next <= offset || next > heap.span {
-                return Err(Error::Abi(format!(
-                    "guest free block at offset {offset:#x} has invalid next offset {next:#x}"
-                )));
-            }
-            if next != heap.span && block_end > next {
-                return Err(Error::Abi(format!(
-                    "guest free block {offset:#x}..{block_end:#x} overlaps its successor {next:#x}"
-                )));
+            if next > heap.span {
+                let (recovered, next, removed_len) = self
+                    .recover_corrupted_free_header(heap, offset)
+                    .ok_or_else(|| {
+                        Error::Abi(format!(
+                            "guest free block at offset {offset:#x} has invalid next offset {next:#x}"
+                        ))
+                    })?;
+                blocks.extend(recovered);
+                recovered_len = recovered_len
+                    .checked_add(removed_len)
+                    .ok_or_else(|| Error::Abi("recovered guest free-byte count overflow".into()))?;
+                offset = next;
+                continue;
             }
             blocks.push(FreeBlock { offset, len });
             offset = next;
         }
+    }
+
+    fn recover_corrupted_free_header(
+        &self,
+        heap: GuestHeapState,
+        corrupted_offset: u32,
+    ) -> Option<(Vec<FreeBlock>, u32, u32)> {
+        let snapshot = self.guest_heap_snapshot.as_ref()?;
+        if snapshot.base != heap.base
+            || snapshot.span != heap.span
+            || snapshot.head != heap.head
+            || snapshot.free_left != heap.free_left
+        {
+            return None;
+        }
+
+        let ram_address = self.memory.read_u32(data_slot_address(104)).ok()?;
+        let ram_len = self.memory.read_u32(data_slot_address(105)).ok()?;
+        if ram_address == 0 || ram_len == 0 {
+            return None;
+        }
+        let ram_start = ram_address.checked_sub(heap.base)? & !(HEAP_ALIGNMENT - 1);
+        let ram_end = ram_address
+            .checked_add(ram_len)?
+            .checked_sub(heap.base)?
+            .checked_add(HEAP_ALIGNMENT - 1)?
+            & !(HEAP_ALIGNMENT - 1);
+        if ram_end > heap.span || corrupted_offset < ram_start || corrupted_offset >= ram_end {
+            return None;
+        }
+
+        let index = snapshot
+            .blocks
+            .iter()
+            .position(|block| block.offset == corrupted_offset)?;
+        let block = snapshot.blocks[index];
+        let block_end = block.offset.checked_add(block.len)?;
+        let overlap_end = block_end.min(ram_end);
+        if overlap_end <= block.offset {
+            return None;
+        }
+        let suffix_len = block_end - overlap_end;
+        let recovered = if suffix_len >= FREE_BLOCK_HEADER_LEN {
+            vec![FreeBlock {
+                offset: overlap_end,
+                len: suffix_len,
+            }]
+        } else {
+            Vec::new()
+        };
+        let retained_len = recovered.first().map_or(0, |block| block.len);
+        let removed_len = block.len.checked_sub(retained_len)?;
+        let next = snapshot
+            .blocks
+            .get(index + 1)
+            .map_or(snapshot.terminator, |block| block.offset);
+        Some((recovered, next, removed_len))
     }
 
     pub(super) fn write_free_blocks(
@@ -278,35 +522,64 @@ impl ExtRuntime {
                 heap.span
             )));
         }
+        validate_free_block_ranges(blocks, heap.span)?;
         let head = blocks.first().map_or(terminator, |block| block.offset);
         for (index, block) in blocks.iter().copied().enumerate() {
             let next = blocks
                 .get(index + 1)
                 .map_or(terminator, |block| block.offset);
-            let block_end = block
-                .offset
-                .checked_add(block.len)
-                .ok_or_else(|| Error::Abi("guest free-block range overflow".into()))?;
-            if block_end > next {
-                return Err(Error::Abi(format!(
-                    "guest free block {:#x}..{block_end:#x} exceeds its successor {next:#x}",
-                    block.offset
-                )));
-            }
             let address = GuestAddr(heap.base.wrapping_add(block.offset));
             self.memory.write_u32(address, next)?;
             self.memory.write_u32(address.checked_add(4)?, block.len)?;
         }
         self.memory.write_u32(heap.head_variable, head)?;
-        self.memory.write_u32(heap.free_left_variable, free_left)
+        self.memory.write_u32(heap.free_left_variable, free_left)?;
+        self.guest_heap_snapshot = Some(GuestHeapSnapshot {
+            base: heap.base,
+            span: heap.span,
+            head,
+            free_left,
+            blocks: blocks.to_vec(),
+            terminator,
+        });
+        Ok(())
     }
 }
 
-fn allocated_heap_len(payload_len: u32) -> Result<u32> {
-    payload_len
-        .checked_add(ALLOCATED_BLOCK_HEADER_LEN)
-        .ok_or_else(|| Error::ArmFault("guest allocation length overflow".into()))?
-        .checked_add(HEAP_ALIGNMENT - 1)
+fn validate_free_block_ranges(blocks: &[FreeBlock], heap_span: u32) -> Result<()> {
+    let mut ordered = blocks.to_vec();
+    ordered.sort_unstable_by_key(|block| block.offset);
+    let mut previous_end = 0;
+    for block in ordered {
+        let end = block
+            .offset
+            .checked_add(block.len)
+            .ok_or_else(|| Error::Abi("guest free-block range overflow".into()))?;
+        if end > heap_span {
+            return Err(Error::Abi(format!(
+                "guest free block at offset {:#x} exceeds heap span {heap_span:#x}",
+                block.offset
+            )));
+        }
+        if block.offset < previous_end {
+            return Err(Error::Abi(format!(
+                "guest free block at offset {:#x} overlaps the preceding range ending at {previous_end:#x}",
+                block.offset
+            )));
+        }
+        previous_end = end;
+    }
+    Ok(())
+}
+
+pub(super) fn aligned_heap_len(len: usize) -> Result<u32> {
+    let len = u32::try_from(len.max(1))
+        .map_err(|_| Error::ArmFault(format!("guest allocation length {len} does not fit u32")))?;
+    align_heap_len(len.max(FREE_BLOCK_HEADER_LEN))
+}
+
+fn align_heap_len(len: u32) -> Result<u32> {
+    len.checked_add(HEAP_ALIGNMENT - 1)
         .map(|value| value & !(HEAP_ALIGNMENT - 1))
         .ok_or_else(|| Error::ArmFault("guest allocation length alignment overflow".into()))
 }

@@ -18,7 +18,7 @@ fn guest_allocator_reuses_and_merges_freed_blocks() {
     runtime.free_guest_block(reused, 16).unwrap();
     runtime.free_guest_block(second, 16).unwrap();
     let heap = runtime.guest_heap_state().unwrap();
-    let (blocks, terminator) = runtime.read_free_blocks(heap).unwrap();
+    let (blocks, terminator, _) = runtime.read_free_blocks(heap).unwrap();
     assert_eq!(
         blocks,
         [FreeBlock {
@@ -31,32 +31,217 @@ fn guest_allocator_reuses_and_merges_freed_blocks() {
 }
 
 #[test]
-fn guest_allocator_preserves_forward_block_links_before_payloads() {
+fn internal_guest_heap_allocations_can_be_freed_by_the_guest() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+
+    let output = runtime.allocate(32, 8).unwrap();
+
+    assert_eq!(runtime.guest_allocations.get(&output.0), Some(&32));
+    runtime.free_guest_block(output, 32).unwrap();
+    assert!(!runtime.guest_allocations.contains_key(&output.0));
+}
+
+#[test]
+fn guest_managed_allocations_can_be_freed_with_an_explicit_length() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let output = runtime.allocate_guest_block(24).unwrap().unwrap();
+    runtime.guest_allocations.remove(&output.0);
+
+    runtime.free_guest_block(output, 24).unwrap();
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, _, _) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [FreeBlock {
+            offset: 0,
+            len: DEFAULT_HEAP_LEN as u32,
+        }]
+    );
+}
+
+#[test]
+fn guest_allocator_returns_raw_addresses_and_reclaims_small_blocks() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
 
     let first = runtime.allocate_guest_block(1).unwrap().unwrap();
     let second = runtime.allocate_guest_block(15).unwrap().unwrap();
-    let third = runtime.allocate_guest_block(24).unwrap().unwrap();
+    runtime.free_guest_block(GuestAddr(1), 0).unwrap();
+    runtime
+        .free_guest_block(HEAP_BASE.checked_add(DEFAULT_HEAP_LEN as u32).unwrap(), 0)
+        .unwrap();
+    assert_eq!(first, HEAP_BASE);
+    assert_eq!(second, HEAP_BASE.checked_add(8).unwrap());
+
+    runtime.free_guest_block(first, 1).unwrap();
+    assert_eq!(runtime.allocate_guest_block(1).unwrap(), Some(first));
+    runtime.free_guest_block(second, usize::MAX).unwrap();
+    runtime.free_guest_block(second, 15).unwrap();
+    runtime.memory.write_u32(data_slot_address(108), 0).unwrap();
+    runtime.memory.write_u32(data_slot_address(110), 0).unwrap();
+    runtime.free_guest_block(GuestAddr(0x3b108), 0).unwrap();
+}
+
+#[test]
+fn guest_allocator_ignores_platform_owned_memory() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.memory.write(SCREEN_BASE, &[0xaa; 16]).unwrap();
+
+    runtime.free_guest_block(SCREEN_BASE, 16).unwrap();
+
+    assert_eq!(runtime.memory.read(SCREEN_BASE, 16).unwrap(), &[0xaa; 16]);
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, _, _) = runtime.read_free_blocks(heap).unwrap();
     assert_eq!(
-        first,
-        HEAP_BASE.checked_add(ALLOCATED_BLOCK_HEADER_LEN).unwrap()
+        blocks,
+        [FreeBlock {
+            offset: 0,
+            len: DEFAULT_HEAP_LEN as u32,
+        }]
     );
-    assert!(first.0 < second.0 && second.0 < third.0);
+}
+
+#[test]
+fn guest_allocator_accepts_an_acyclic_out_of_order_free_list() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let span = DEFAULT_HEAP_LEN as u32;
+    for (offset, next, len) in [(0x20, 0, 8), (0, 0x28, 0x10), (0x28, span, span - 0x28)] {
+        let address = HEAP_BASE.checked_add(offset).unwrap();
+        runtime.memory.write_u32(address, next).unwrap();
+        runtime
+            .memory
+            .write_u32(address.checked_add(4).unwrap(), len)
+            .unwrap();
+    }
+    runtime
+        .memory
+        .write_u32(data_slot_address(146), 0x20)
+        .unwrap();
 
     let heap = runtime.guest_heap_state().unwrap();
-    let mut offset = 0;
-    while offset < heap.span {
-        let address = GuestAddr(heap.base.checked_add(offset).unwrap());
-        let next = runtime.memory.read_u32(address).unwrap();
-        assert!(
-            next > offset,
-            "block link did not advance at offset {offset:#x}"
-        );
-        assert!(next <= heap.span, "block link exceeded the heap span");
-        offset = next;
-    }
-    assert_eq!(offset, heap.span);
+    let (blocks, terminator, _) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [
+            FreeBlock {
+                offset: 0x20,
+                len: 8
+            },
+            FreeBlock {
+                offset: 0,
+                len: 0x10
+            },
+            FreeBlock {
+                offset: 0x28,
+                len: span - 0x28
+            }
+        ]
+    );
+    assert_eq!(terminator, span);
+    assert_eq!(
+        runtime.allocate_guest_block(8).unwrap(),
+        Some(HEAP_BASE.checked_add(0x20).unwrap())
+    );
+}
+
+#[test]
+fn guest_allocator_does_not_attach_a_discarded_prefix_to_the_returned_block() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let span = DEFAULT_HEAP_LEN as u32;
+    runtime
+        .memory
+        .write_u32(HEAP_BASE.checked_add(4).unwrap(), span)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(HEAP_BASE.checked_add(8).unwrap(), span - 4)
+        .unwrap();
+    runtime.memory.write_u32(data_slot_address(146), 4).unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(111), span - 4)
+        .unwrap();
+
+    let output = runtime.allocate_guest_block(1).unwrap().unwrap();
+
+    assert_eq!(output, HEAP_BASE.checked_add(8).unwrap());
+    assert_eq!(runtime.guest_allocations.get(&output.0), Some(&8));
+    runtime.free_guest_block(output, 1).unwrap();
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, _, _) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [FreeBlock {
+            offset: 8,
+            len: span - 8,
+        }]
+    );
+}
+
+#[test]
+fn guest_allocator_reconciles_tracking_after_guest_heap_reset() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let first = runtime.allocate_guest_block(16).unwrap().unwrap();
+    assert!(runtime.guest_allocations.contains_key(&first.0));
+
+    runtime
+        .memory
+        .write_u32(HEAP_BASE, DEFAULT_HEAP_LEN as u32)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(HEAP_BASE.checked_add(4).unwrap(), DEFAULT_HEAP_LEN as u32)
+        .unwrap();
+    runtime.memory.write_u32(data_slot_address(146), 0).unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(111), DEFAULT_HEAP_LEN as u32)
+        .unwrap();
+
+    let reused = runtime.allocate_guest_block(8).unwrap().unwrap();
+    assert_eq!(reused, first);
+    assert_eq!(runtime.guest_allocations.get(&reused.0), Some(&8));
+    runtime.free_guest_block(reused, 8).unwrap();
+}
+
+#[test]
+fn guest_allocator_excludes_an_active_ram_package_that_overwrites_a_free_header() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let first = runtime.allocate_guest_block(24).unwrap().unwrap();
+    let free_head = runtime.read_platform_data_slot(146).unwrap();
+    let header = HEAP_BASE.checked_add(free_head).unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(104), header.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(105), 32)
+        .unwrap();
+    runtime.memory.write(header, &[0xaa; 32]).unwrap();
+
+    let second = runtime.allocate_guest_block(8).unwrap().unwrap();
+
+    assert_eq!(first, HEAP_BASE);
+    assert_eq!(second, HEAP_BASE.checked_add(56).unwrap());
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, _) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [FreeBlock {
+            offset: 64,
+            len: DEFAULT_HEAP_LEN as u32 - 64,
+        }]
+    );
+    assert_eq!(terminator, DEFAULT_HEAP_LEN as u32);
 }
 
 #[test]
@@ -74,14 +259,11 @@ fn guest_allocator_follows_staged_and_switched_heap_variables() {
         .memory
         .write_u32(data_slot_address(111), staged_free_left)
         .unwrap();
-    assert_eq!(
-        runtime.allocate_guest_block(16).unwrap(),
-        Some(HEAP_BASE.checked_add(ALLOCATED_BLOCK_HEADER_LEN).unwrap())
-    );
+    assert_eq!(runtime.allocate_guest_block(16).unwrap(), Some(HEAP_BASE));
     let staged = runtime.guest_heap_state().unwrap();
-    let (_, staged_terminator) = runtime.read_free_blocks(staged).unwrap();
+    let (_, staged_terminator, _) = runtime.read_free_blocks(staged).unwrap();
     assert_eq!(staged_terminator, initial_span);
-    assert_eq!(staged.free_left, staged_free_left - 24);
+    assert_eq!(staged.free_left, staged_free_left - 16);
 
     runtime
         .memory
@@ -116,14 +298,10 @@ fn guest_allocator_follows_staged_and_switched_heap_variables() {
 
     assert_eq!(
         runtime.allocate_guest_block(16).unwrap(),
-        Some(
-            PLATFORM_MEMORY_BASE
-                .checked_add(ALLOCATED_BLOCK_HEADER_LEN)
-                .unwrap()
-        )
+        Some(PLATFORM_MEMORY_BASE)
     );
-    assert_eq!(runtime.read_platform_data_slot(146).unwrap(), 24);
-    assert_eq!(runtime.read_platform_data_slot(111).unwrap(), 0xe8);
+    assert_eq!(runtime.read_platform_data_slot(146).unwrap(), 16);
+    assert_eq!(runtime.read_platform_data_slot(111).unwrap(), 0xf0);
 }
 
 #[test]
@@ -157,6 +335,15 @@ fn unavailable_platform_extension_clears_its_output_fields() {
         .dispatch(38, 0, &mut cpu, &mut StubServices)
         .unwrap();
     assert_eq!(cpu.register(0) as i32, -1);
+
+    cpu.set_register(0, 2_011);
+    cpu.set_register(1, 0);
+    cpu.set_register(2, 0);
+    cpu.set_register(3, 0);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 0);
 
     cpu.set_register(0, 0x0009_0003);
     runtime
@@ -338,6 +525,77 @@ fn reads_the_compact_ram_package_payload() {
 }
 
 #[test]
+fn package_file_buffers_are_guest_owned_and_can_be_freed() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let name = runtime.allocate(10, 1).unwrap();
+    runtime.memory.write(name, b"owned.bin\0").unwrap();
+    let output_len = runtime.allocate(4, 4).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, name.0);
+    cpu.set_register(1, output_len.0);
+
+    runtime
+        .dispatch(125, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    let output = GuestAddr(cpu.register(0));
+    assert_eq!(runtime.memory.read(output, 11).unwrap(), b"guest-owned");
+    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 11);
+    assert!(runtime.guest_allocations.contains_key(&output.0));
+
+    cpu.set_register(0, output.0);
+    runtime.dispatch(1, 0, &mut cpu, &mut StubServices).unwrap();
+    assert_eq!(cpu.register(0), 0);
+    assert!(!runtime.guest_allocations.contains_key(&output.0));
+}
+
+#[test]
+fn package_file_read_uses_detached_allocation_after_guest_heap_teardown() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let name = runtime.allocate(10, 1).unwrap();
+    runtime.memory.write(name, b"owned.bin\0").unwrap();
+    let output_len = runtime.allocate(4, 4).unwrap();
+    runtime.memory.write_u32(output_len, u32::MAX).unwrap();
+    runtime.memory.write_u32(data_slot_address(108), 0).unwrap();
+    runtime.memory.write_u32(data_slot_address(110), 0).unwrap();
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, name.0);
+    cpu.set_register(1, output_len.0);
+    runtime
+        .dispatch(125, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    let output = GuestAddr(cpu.register(0));
+    assert_eq!(output, DETACHED_GUEST_ALLOCATION_BASE);
+    assert_eq!(runtime.memory.read(output, 11).unwrap(), b"guest-owned");
+    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 11);
+    assert!(runtime.detached_guest_allocations.contains_key(&output.0));
+
+    cpu.set_register(0, output.0);
+    runtime.dispatch(1, 0, &mut cpu, &mut StubServices).unwrap();
+    assert!(!runtime.detached_guest_allocations.contains_key(&output.0));
+    assert!(runtime.memory.read(output, 1).is_err());
+}
+
+#[test]
+fn internal_allocator_uses_detached_memory_after_guest_heap_teardown() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.memory.write_u32(data_slot_address(108), 0).unwrap();
+    runtime.memory.write_u32(data_slot_address(110), 0).unwrap();
+
+    let output = runtime.allocate(5, 4).unwrap();
+
+    assert_eq!(output, DETACHED_GUEST_ALLOCATION_BASE);
+    assert_eq!(runtime.memory.read(output, 8).unwrap(), vec![0; 8]);
+    runtime.free_guest_block(output, 5).unwrap();
+    assert!(runtime.memory.read(output, 1).is_err());
+}
+
+#[test]
 fn compact_ram_package_writes_into_four_and_eight_byte_aligned_wrappers() {
     let expected = b"MRPGCMAPguest module";
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -356,15 +614,16 @@ fn compact_ram_package_writes_into_four_and_eight_byte_aligned_wrappers() {
     for alignment in [4, 8] {
         let mut runtime =
             ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        if alignment == 4 {
+            runtime.allocate(4, 4).unwrap();
+        }
         let aligned_len = (expected.len() + 7) & !7;
-        let prepared_offset = if alignment == 4 { 4 } else { 0 };
-        let prepared = runtime
-            .allocate(aligned_len + prepared_offset, alignment)
-            .unwrap()
-            .checked_add(prepared_offset as u32)
-            .unwrap();
+        let prepared = runtime.allocate(aligned_len, alignment).unwrap();
         assert_eq!(prepared.0 % 8, if alignment == 4 { 4 } else { 0 });
-        runtime.memory.write_u32(prepared, 0).unwrap();
+        runtime
+            .memory
+            .write_u32(prepared, if alignment == 4 { 0 } else { 0x40 })
+            .unwrap();
         runtime
             .memory
             .write_u32(prepared.checked_add(4).unwrap(), aligned_len as u32)

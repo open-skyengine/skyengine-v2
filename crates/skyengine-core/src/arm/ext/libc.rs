@@ -1,4 +1,4 @@
-use super::*;
+use super::{heap::aligned_heap_len, *};
 
 impl ExtRuntime {
     pub(super) fn dispatch_libc(&mut self, slot: u32, cpu: &mut ArmCpu) -> Result<()> {
@@ -24,6 +24,27 @@ impl ExtRuntime {
                 } else if new_len <= old_len {
                     cpu.set_register(0, source.0);
                 } else {
+                    let allocated_len = self
+                        .guest_allocations
+                        .get(&source.0)
+                        .copied()
+                        .or_else(|| {
+                            self.detached_guest_allocations
+                                .get(&source.0)
+                                .map(|(len, _)| *len as u32)
+                        })
+                        .ok_or_else(|| {
+                            Error::Abi(format!(
+                                "realloc references unknown guest allocation {:#010x}",
+                                source.0
+                            ))
+                        })?;
+                    if aligned_heap_len(old_len)? > allocated_len {
+                        return Err(Error::Abi(format!(
+                            "realloc old length {old_len} exceeds allocation at {:#010x}",
+                            source.0
+                        )));
+                    }
                     let Some(output) = self.allocate_guest_block(new_len)? else {
                         cpu.set_register(0, 0);
                         return Ok(());

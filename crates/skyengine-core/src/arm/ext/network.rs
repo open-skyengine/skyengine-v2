@@ -1,6 +1,38 @@
 use super::*;
 
 impl ExtRuntime {
+    pub(super) fn resolve_mapped_host(&self, name: &[u8]) -> Option<u32> {
+        let name = std::str::from_utf8(name).ok()?.trim_end_matches('.');
+        let mapping = self
+            .dns_mappings
+            .iter()
+            .find(|mapping| mapping.source.eq_ignore_ascii_case(name))?;
+        Some(u32::from_be_bytes(mapping.address.octets()))
+    }
+
+    pub(super) fn route_mapped_endpoint(&self, ip: u32, port: u32) -> (u32, u32) {
+        let address = Ipv4Addr::from(ip.to_be_bytes());
+        if let Some(mapping) = self.dns_mappings.iter().find(|mapping| {
+            mapping
+                .source
+                .parse::<Ipv4Addr>()
+                .is_ok_and(|source| source == address)
+        }) {
+            return (
+                u32::from_be_bytes(mapping.address.octets()),
+                mapping.port.map_or(port, u32::from),
+            );
+        }
+        if let Some(mapping) = self
+            .dns_mappings
+            .iter()
+            .find(|mapping| mapping.port.is_some() && mapping.address == address)
+        {
+            return (ip, u32::from(mapping.port.unwrap()));
+        }
+        (ip, port)
+    }
+
     pub(super) fn allocate_native_socket_handle(&mut self) -> Result<Option<i32>> {
         if self.native_sockets.len() >= MAX_NATIVE_SOCKETS {
             return Ok(None);

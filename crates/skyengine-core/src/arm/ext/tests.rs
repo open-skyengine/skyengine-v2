@@ -3,8 +3,8 @@ use super::*;
 struct StubServices;
 
 impl NativeServices for StubServices {
-    fn read_package_file(&mut self, _package_name: &[u8], _name: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+    fn read_package_file(&mut self, _package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok((name == b"owned.bin").then(|| b"guest-owned".to_vec()))
     }
 
     fn file_info(&mut self, _name: &[u8]) -> Result<i32> {

@@ -185,7 +185,7 @@ impl ExtRuntime {
     }
 
     pub(super) fn compact_ram_output_target(
-        &self,
+        &mut self,
         package_address: GuestAddr,
         package_len: usize,
         output_len: usize,
@@ -228,9 +228,7 @@ impl ExtRuntime {
             {
                 continue;
             }
-            if self.memory.read_u32(candidate)? == 0
-                && self.memory.read_u32(candidate.checked_add(4)?)? == aligned_len
-            {
+            if self.memory.read_u32(candidate.checked_add(4)?)? == aligned_len {
                 candidates.push(candidate);
             }
         }
@@ -238,7 +236,10 @@ impl ExtRuntime {
         candidates.dedup();
         match candidates.as_slice() {
             [] => Ok(None),
-            [candidate] => Ok(Some(*candidate)),
+            [candidate] => {
+                self.reserve_guest_heap_range(*candidate, aligned_len)?;
+                Ok(Some(*candidate))
+            }
             _ => Err(Error::Abi(format!(
                 "compact RAM MRP output has ambiguous prepared buffers: {candidates:?}"
             ))),

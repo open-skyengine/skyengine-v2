@@ -188,38 +188,63 @@ impl GuestMemory {
             ));
         }
 
-        let index = self.locate_index(address, len, Permissions(0))?;
-        let region = self.regions.remove(index);
-        let start = (address.0 - region.base) as usize;
-        let end = start + len;
-        let mut before_and_middle = region.bytes;
-        let after = before_and_middle.split_off(end);
-        let middle = before_and_middle.split_off(start);
+        let segments = self.segments(address, len, Permissions(0))?;
+        let mapping_name = &self.regions[segments[0].0].name;
+        if segments
+            .iter()
+            .any(|(index, _, _)| self.regions[*index].name != *mapping_name)
+        {
+            return Err(Error::ArmFault(format!(
+                "permission range at {:#010x} ({} bytes) crosses guest mappings",
+                address.0, len
+            )));
+        }
 
-        let mut replacements = Vec::with_capacity(3);
-        if !before_and_middle.is_empty() {
+        let requested_start = u64::from(address.0);
+        let requested_end = requested_start + len as u64;
+        let mut replacements = Vec::with_capacity(self.regions.len() + segments.len() * 2);
+        for region in std::mem::take(&mut self.regions) {
+            let region_start = u64::from(region.base);
+            let region_end = region.end();
+            if requested_start >= region_end || region_start >= requested_end {
+                replacements.push(region);
+                continue;
+            }
+
+            let overlap_start = (requested_start.max(region_start) - region_start) as usize;
+            let overlap_end = (requested_end.min(region_end) - region_start) as usize;
+            let Region {
+                base,
+                mut bytes,
+                permissions: current_permissions,
+                name,
+            } = region;
+            let after = bytes.split_off(overlap_end);
+            let middle = bytes.split_off(overlap_start);
+            if !bytes.is_empty() {
+                replacements.push(Region {
+                    base,
+                    bytes,
+                    permissions: current_permissions,
+                    name: name.clone(),
+                });
+            }
             replacements.push(Region {
-                base: region.base,
-                bytes: before_and_middle,
-                permissions: region.permissions,
-                name: region.name.clone(),
+                base: base + overlap_start as u32,
+                bytes: middle,
+                permissions: current_permissions.union(permissions),
+                name: name.clone(),
             });
+            if !after.is_empty() {
+                replacements.push(Region {
+                    base: base + overlap_end as u32,
+                    bytes: after,
+                    permissions: current_permissions,
+                    name,
+                });
+            }
         }
-        replacements.push(Region {
-            base: address.0,
-            bytes: middle,
-            permissions: region.permissions.union(permissions),
-            name: region.name.clone(),
-        });
-        if !after.is_empty() {
-            replacements.push(Region {
-                base: address.0 + len as u32,
-                bytes: after,
-                permissions: region.permissions,
-                name: region.name,
-            });
-        }
-        self.regions.splice(index..index, replacements);
+        self.regions = replacements;
         Ok(())
     }
 
@@ -415,6 +440,26 @@ mod tests {
         assert_eq!(memory.read_u32(GuestAddr(0x1000)).unwrap(), 0x4030_2010);
         memory.write_u16(GuestAddr(0x1002), 0x8877).unwrap();
         assert_eq!(memory.read_u16(GuestAddr(0x1002)).unwrap(), 0x8877);
+    }
+
+    #[test]
+    fn extends_permissions_across_regions_split_by_an_earlier_change() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map(GuestAddr(0x1000), 16, Permissions::READ_WRITE, "heap")
+            .unwrap();
+        memory
+            .add_permissions(GuestAddr(0x1004), 4, Permissions::EXECUTE)
+            .unwrap();
+
+        memory
+            .add_permissions(GuestAddr(0x1002), 10, Permissions::EXECUTE)
+            .unwrap();
+
+        assert!(memory.fetch_u16(GuestAddr(0x1000)).is_err());
+        assert_eq!(memory.fetch_u16(GuestAddr(0x1002)).unwrap(), 0);
+        assert_eq!(memory.fetch_u16(GuestAddr(0x100a)).unwrap(), 0);
+        assert!(memory.fetch_u16(GuestAddr(0x100c)).is_err());
     }
 
     #[test]
