@@ -79,6 +79,8 @@ const STACK_BASE: GuestAddr = GuestAddr(0x3000_0000);
 const STACK_LEN: usize = 256 * 1024;
 const PLATFORM_MEMORY_BASE: GuestAddr = GuestAddr(0x4000_0000);
 const DETACHED_GUEST_ALLOCATION_BASE: GuestAddr = GuestAddr(0x5000_0000);
+const LEGACY_KEYPAD_REGISTERS: GuestAddr = GuestAddr(0x8011_0000);
+const LEGACY_KEYPAD_REGISTERS_LEN: usize = 16;
 const SCREEN_BASE: GuestAddr = GuestAddr(HEAP_BASE.0 + MIN_GUEST_RAM_LEN as u32);
 const FREE_BLOCK_HEADER_LEN: u32 = 8;
 const HEAP_ALIGNMENT: u32 = 8;
@@ -640,6 +642,14 @@ impl ExtRuntime {
             "guest RAM",
         )?;
         memory.map(STACK_BASE, STACK_LEN, Permissions::READ_WRITE, "EXT stack")?;
+        // Legacy MTK key scanners read three active-low 16-bit registers from
+        // this fixed MMIO window. Host key events below keep the bits current.
+        memory.map_bytes(
+            LEGACY_KEYPAD_REGISTERS,
+            vec![u8::MAX; LEGACY_KEYPAD_REGISTERS_LEN],
+            Permissions::READ_WRITE,
+            "legacy keypad registers",
+        )?;
         let screen_len = usize::from(screen_width)
             .checked_mul(usize::from(screen_height))
             .and_then(|pixels| pixels.checked_mul(2))
@@ -1056,6 +1066,7 @@ impl ExtRuntime {
         pressed: bool,
         services: &mut dyn NativeServices,
     ) -> Result<Option<(i32, i32, i32)>> {
+        self.set_legacy_keypad_state(code, pressed)?;
         if !pressed && self.suppressed_ui_key_releases.remove(&code) {
             return Ok(None);
         }
@@ -1104,6 +1115,20 @@ impl ExtRuntime {
                 _ => Ok(None),
             },
         }
+    }
+
+    fn set_legacy_keypad_state(&mut self, code: i32, pressed: bool) -> Result<()> {
+        let Ok(code) = u32::try_from(code) else {
+            return Ok(());
+        };
+        if code >= 42 {
+            return Ok(());
+        }
+        let register = LEGACY_KEYPAD_REGISTERS.checked_add(4 + code / 16 * 4)?;
+        let mask = 1_u16 << (code % 16);
+        let value = self.memory.read_u16(register)?;
+        self.memory
+            .write_u16(register, if pressed { value & !mask } else { value | mask })
     }
 
     pub fn route_text_input(&mut self, text: &str) -> Result<Option<(i32, i32, i32)>> {

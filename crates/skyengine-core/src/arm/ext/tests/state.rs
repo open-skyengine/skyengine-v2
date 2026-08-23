@@ -5,6 +5,25 @@ use flate2::{Compression, write::GzEncoder};
 use super::*;
 
 #[test]
+fn legacy_keypad_registers_default_to_idle_and_track_key_events() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+
+    for (code, offset, mask) in [(0, 4, 1_u16), (17, 8, 2_u16), (41, 12, 512_u16)] {
+        let register = LEGACY_KEYPAD_REGISTERS.checked_add(offset).unwrap();
+        assert_eq!(runtime.memory.read_u16(register).unwrap(), u16::MAX);
+        runtime
+            .route_key_event(code, true, &mut StubServices)
+            .unwrap();
+        assert_eq!(runtime.memory.read_u16(register).unwrap(), !mask);
+        runtime
+            .route_key_event(code, false, &mut StubServices)
+            .unwrap();
+        assert_eq!(runtime.memory.read_u16(register).unwrap(), u16::MAX);
+    }
+}
+
+#[test]
 fn guest_allocator_reuses_and_merges_freed_blocks() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

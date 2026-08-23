@@ -48,6 +48,29 @@ function hasFourthMenuRow(screen: PpmImage): boolean {
   return differingPixels(screen, { x: 5, y: 105, width: 118, height: 16 }, MENU_BACKGROUND) > 8;
 }
 
+function isKeyBindingScreen(screen: PpmImage): boolean {
+  return (
+    screen.pixel(150, 53).toString() === MENU_BACKGROUND.toString() &&
+    differingPixels(screen, { x: 0, y: 45, width: 120, height: 16 }, MENU_BACKGROUND) > 16
+  );
+}
+
+function changedPixels(
+  before: PpmImage,
+  after: PpmImage,
+  rect: { x: number; y: number; width: number; height: number },
+): number {
+  let count = 0;
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      const first = before.pixel(x, y);
+      const second = after.pixel(x, y);
+      if (first[0] !== second[0] || first[1] !== second[1] || first[2] !== second[2]) count++;
+    }
+  }
+  return count;
+}
+
 describe("dsm_gm", () => {
   let engine: SkyEngineE2e | undefined;
   let ws: SkyEngineWorkspace | undefined;
@@ -128,5 +151,62 @@ describe("dsm_gm", () => {
       { name: "saved-main-menu", timeoutMs: 2_000, intervalMs: 50 },
     );
     expectSelectedMenuRow(saved, 65);
+  });
+
+  it("按键绑定", async () => {
+    ws = await SkyEngineWorkspace.create();
+    engine = await SkyEngineE2e.start("test/fixtures/dsm_gm.mrp", {
+      workDir: ws.dir,
+      dnsMap:
+        "rop.skymobiapp.com->159.75.119.124;" +
+        "spd.skymobiapp.com->159.75.119.124;" +
+        "proxy.51mrp.com->127.0.0.1;" +
+        "proxy2.51mrp.com->127.0.0.1",
+    });
+
+    const initial = await engine.waitForScreen(
+      (screen) => isSelectedMenuRow(screen, 45) && hasFourthMenuRow(screen),
+      { name: "key-initial-menu", timeoutMs: 10_000, intervalMs: 250 },
+    );
+    expectSelectedMenuRow(initial, 45);
+
+    await engine.key("DOWN", { timeoutMs: 1_000, holdMs: 80 });
+    const selectedSettings = await engine.waitForScreen((screen) => isSelectedMenuRow(screen, 65), {
+      name: "key-selected-settings",
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+    expectSelectedMenuRow(selectedSettings, 65);
+
+    await engine.key("ENTER", { timeoutMs: 1_000, holdMs: 80 });
+    const settings = await engine.waitForScreen(
+      (screen) => isSelectedMenuRow(screen, 45) && !hasFourthMenuRow(screen),
+      { name: "key-settings-menu", timeoutMs: 1_000, intervalMs: 50 },
+    );
+    expectSelectedMenuRow(settings, 45);
+
+    await engine.key("UP", { timeoutMs: 1_000, holdMs: 80 });
+    const selectedBinding = await engine.waitForScreen((screen) => isSelectedMenuRow(screen, 85), {
+      name: "key-selected-binding",
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+    expectSelectedMenuRow(selectedBinding, 85);
+
+    await engine.key("ENTER", { timeoutMs: 1_000, holdMs: 80 });
+    const bindingUp = await engine.waitForScreen(isKeyBindingScreen, {
+      name: "key-binding-up",
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+
+    await engine.key("LEFT_SOFT", { timeoutMs: 1_000, holdMs: 80 });
+    const bindingDown = await engine.waitForScreen(
+      (screen) =>
+        isKeyBindingScreen(screen) &&
+        changedPixels(bindingUp, screen, { x: 82, y: 45, width: 22, height: 16 }) > 4,
+      { name: "key-binding-down", timeoutMs: 1_000, intervalMs: 50 },
+    );
+    expect(changedPixels(bindingUp, bindingDown, { x: 82, y: 45, width: 22, height: 16 })).toBeGreaterThan(4);
   });
 });
