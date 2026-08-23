@@ -49,6 +49,32 @@ fn v80_division_uses_integer_semantics_without_changing_v50() {
     );
 }
 
+#[test]
+fn legacy_pcall_alias_is_registered_and_protects_native_calls() {
+    let (mut vm, root, _) = immediate_restart_vm();
+    assert!(vm.global(b"_pCall").raw_equal(&Value::Native("_pCall")));
+
+    let result = vm
+        .call_value(
+            Value::Native("_pCall"),
+            vec![Value::Native("error"), bytes(b"expected failure")],
+            None,
+            false,
+        )
+        .unwrap();
+    let CallResult::Immediate(values) = result else {
+        panic!("native protected call must return immediately");
+    };
+    assert!(values[0].raw_equal(&Value::Boolean(false)));
+    assert!(
+        values[1]
+            .bytes()
+            .is_some_and(|error| error.ends_with(b"expected failure"))
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn lifecycle_test_root(label: &str) -> std::path::PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -613,7 +613,7 @@ impl MrVm {
                 self.push_frame(closure, Vec::new(), target)?;
                 Ok(CallResult::Pushed)
             }
-            Value::Native("pcall") => self.protected_call(args, target),
+            Value::Native("pcall" | "_pCall") => self.protected_call(args, target),
             Value::Native(name) => {
                 let values = match self.call_native(name, &args) {
                     Ok(values) => values,

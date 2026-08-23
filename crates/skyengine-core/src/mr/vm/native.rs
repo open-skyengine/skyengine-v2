@@ -20,6 +20,7 @@ impl MrVm {
             "assert",
             "error",
             "pcall",
+            "_pCall",
             "dofile",
             "collectgarbage",
             "_gc",

@@ -33,6 +33,21 @@ function expectSelectedMenuRow(screen: PpmImage, y: number): void {
   expect(differingPixels(screen, { x: 26, y, width: 96, height: 16 }, SELECTED_BACKGROUND)).toBeGreaterThan(16);
 }
 
+function isSelectedMenuRow(screen: PpmImage, y: number): boolean {
+  const highlight = screen.pixel(150, y + 8);
+  return (
+    highlight[0] === SELECTED_BACKGROUND[0] &&
+    highlight[1] === SELECTED_BACKGROUND[1] &&
+    highlight[2] === SELECTED_BACKGROUND[2] &&
+    differingPixels(screen, { x: 5, y, width: 16, height: 16 }, MENU_BACKGROUND) > 8 &&
+    differingPixels(screen, { x: 26, y, width: 96, height: 16 }, SELECTED_BACKGROUND) > 16
+  );
+}
+
+function hasFourthMenuRow(screen: PpmImage): boolean {
+  return differingPixels(screen, { x: 5, y: 105, width: 118, height: 16 }, MENU_BACKGROUND) > 8;
+}
+
 describe("dsm_gm", () => {
   let engine: SkyEngineE2e | undefined;
   let ws: SkyEngineWorkspace | undefined;
@@ -72,5 +87,46 @@ describe("dsm_gm", () => {
     await engine.delay(250);
     const movedTwice = await engine.screen("moved-twice-menu");
     expectSelectedMenuRow(movedTwice, 85);
+  });
+
+  it("保存设置", async () => {
+    ws = await SkyEngineWorkspace.create();
+    engine = await SkyEngineE2e.start("test/fixtures/dsm_gm.mrp", {
+      workDir: ws.dir,
+      dnsMap:
+        "rop.skymobiapp.com->159.75.119.124;" +
+        "spd.skymobiapp.com->159.75.119.124;" +
+        "proxy.51mrp.com->127.0.0.1;" +
+        "proxy2.51mrp.com->127.0.0.1",
+    });
+
+    const initial = await engine.waitForScreen(
+      (screen) => isSelectedMenuRow(screen, 45) && hasFourthMenuRow(screen),
+      { name: "save-initial-menu", timeoutMs: 10_000, intervalMs: 250 },
+    );
+    expectSelectedMenuRow(initial, 45);
+
+    await engine.key("DOWN", { timeoutMs: 1_000, holdMs: 80 });
+    const selectedSettings = await engine.waitForScreen((screen) => isSelectedMenuRow(screen, 65), {
+      name: "save-selected-settings",
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+    expectSelectedMenuRow(selectedSettings, 65);
+
+    await engine.key("ENTER", { timeoutMs: 1_000, holdMs: 80 });
+    const settings = await engine.waitForScreen(
+      (screen) => isSelectedMenuRow(screen, 45) && !hasFourthMenuRow(screen),
+      { name: "settings-menu", timeoutMs: 1_000, intervalMs: 50 },
+    );
+    expectSelectedMenuRow(settings, 45);
+
+    // 右软键保存设置并返回主菜单。
+    await engine.key("RIGHT_SOFT", { timeoutMs: 1_000, holdMs: 80 });
+    const saved = await engine.waitForScreen(
+      (screen) => isSelectedMenuRow(screen, 65) && hasFourthMenuRow(screen),
+      { name: "saved-main-menu", timeoutMs: 2_000, intervalMs: 50 },
+    );
+    expectSelectedMenuRow(saved, 65);
   });
 });
