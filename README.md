@@ -39,6 +39,13 @@ To exercise the SDL renderer without a window server:
 SDL_VIDEODRIVER=dummy cargo test -p skyengine-sdl
 ```
 
+E2E tests use SDL's `dummy` driver by default. To mirror the captured framebuffer into a visible
+SDL window while checking or developing a test flow, select a real video driver explicitly:
+
+```bash
+SDL_VIDEODRIVER=x11 pnpm vitest run test/e2e/geyaxz/boot-to-home.test.ts
+```
+
 ## Inspect A Package
 
 ```bash

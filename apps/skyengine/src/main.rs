@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::OsStr,
     fs::File,
     io::{BufWriter, Write},
     net::{Ipv4Addr, SocketAddrV4},
@@ -139,8 +140,21 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     if let Some(socket_path) = env::var_os("SKYENGINE_E2E_SOCKET") {
         #[cfg(unix)]
         {
-            let display = e2e::E2eDisplay::new(PathBuf::from(socket_path), width, height)?;
-            return Runtime::load(config, Box::new(display))?.run();
+            let display: Box<dyn PlatformDisplay> =
+                if e2e_sdl_preview_enabled(env::var_os("SDL_VIDEODRIVER").as_deref()) {
+                    // Initialize SDL before binding the E2E socket so a failed preview
+                    // does not leave a detached control-server thread behind.
+                    let preview = SdlDisplay::new(width, height, 2)?;
+                    let control = e2e::E2eDisplay::new(PathBuf::from(socket_path), width, height)?;
+                    Box::new(E2eSdlDisplay { control, preview })
+                } else {
+                    Box::new(e2e::E2eDisplay::new(
+                        PathBuf::from(socket_path),
+                        width,
+                        height,
+                    )?)
+                };
+            return Runtime::load(config, display)?.run();
         }
         #[cfg(not(unix))]
         {
@@ -153,6 +167,43 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
 
     let display = SdlDisplay::new(width, height, 2)?;
     Runtime::load(config, Box::new(display))?.run()
+}
+
+fn e2e_sdl_preview_enabled(video_driver: Option<&OsStr>) -> bool {
+    video_driver != Some(OsStr::new("dummy"))
+}
+
+#[cfg(unix)]
+struct E2eSdlDisplay {
+    control: e2e::E2eDisplay,
+    preview: SdlDisplay,
+}
+
+#[cfg(unix)]
+impl PlatformDisplay for E2eSdlDisplay {
+    fn resize(&mut self, width: u16, height: u16) -> Result<()> {
+        self.preview.resize(width, height)?;
+        self.control.resize(width, height)
+    }
+
+    fn present(&mut self, framebuffer: &Framebuffer) -> Result<()> {
+        // Publish the frame to the test only after SDL has presented it, keeping
+        // automated steps and the visible preview on the same frame.
+        self.preview.present(framebuffer)?;
+        self.control.present(framebuffer)
+    }
+
+    fn poll_event(&mut self) -> Result<Option<skyengine_core::DisplayEvent>> {
+        if let Some(event) = self.control.poll_event()? {
+            return Ok(Some(event));
+        }
+        self.preview.poll_event()
+    }
+
+    fn wait_timeout(&mut self, milliseconds: u32) {
+        // E2E wait_timeout also wakes early for scheduled key/button releases.
+        self.control.wait_timeout(milliseconds);
+    }
 }
 
 fn take_flag(args: &mut Vec<std::ffi::OsString>, name: &str) -> bool {
@@ -358,6 +409,14 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e2e_sdl_preview_is_disabled_only_for_the_dummy_driver() {
+        assert!(!e2e_sdl_preview_enabled(Some(OsStr::new("dummy"))));
+        assert!(e2e_sdl_preview_enabled(Some(OsStr::new("x11"))));
+        assert!(e2e_sdl_preview_enabled(Some(OsStr::new("wayland"))));
+        assert!(e2e_sdl_preview_enabled(None));
+    }
 
     #[test]
     fn parses_supported_memory_profiles() {
