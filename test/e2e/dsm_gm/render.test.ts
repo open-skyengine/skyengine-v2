@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import {
   SkyEngineE2e,
   SkyEngineWorkspace,
@@ -78,6 +80,17 @@ function isUpdateDialingScreen(screen: PpmImage): boolean {
     screen.pixel(150, 53).toString() === MENU_BACKGROUND.toString() &&
     iconPixels > 3_000 &&
     progressPixels > 1_000
+  );
+}
+
+function isUpdatedApplicationList(screen: PpmImage): boolean {
+  return (
+    isSelectedMenuRow(screen, 45) &&
+    [65, 85, 105, 125, 145, 165, 185].every(
+      (y) =>
+        differingPixels(screen, { x: 5, y, width: 16, height: 16 }, MENU_BACKGROUND) > 8 &&
+        differingPixels(screen, { x: 26, y, width: 150, height: 16 }, MENU_BACKGROUND) > 16,
+    )
   );
 }
 
@@ -240,11 +253,7 @@ describe("dsm_gm", () => {
     ws = await SkyEngineWorkspace.create();
     engine = await SkyEngineE2e.start("test/fixtures/dsm_gm.mrp", {
       workDir: ws.dir,
-      dnsMap:
-        "rop.skymobiapp.com->159.75.119.124;" +
-        "spd.skymobiapp.com->159.75.119.124;" +
-        "proxy.51mrp.com->127.0.0.1;" +
-        "proxy2.51mrp.com->127.0.0.1",
+      dnsMap: "10.0.0.172->159.75.119.124:13230",
     });
 
     const initial = await engine.waitForScreen(
@@ -272,12 +281,15 @@ describe("dsm_gm", () => {
     });
     expect(isUpdateDialingScreen(dialing)).toBe(true);
 
-    await engine.key("RIGHT_SOFT", { timeoutMs: 1_000, holdMs: 80 });
-    const cancelled = await engine.waitForScreen(isUpdateMenu, {
-      name: "update-cancelled",
-      timeoutMs: 1_000,
-      intervalMs: 50,
+    const updated = await engine.waitForScreen(isUpdatedApplicationList, {
+      name: "public-update-result",
+      timeoutMs: 15_000,
+      intervalMs: 100,
     });
-    expectSelectedMenuRow(cancelled, 45);
+    expect(isUpdatedApplicationList(updated)).toBe(true);
+    expect(changedPixels(dialing, updated, { x: 0, y: 42, width: 240, height: 164 })).toBeGreaterThan(5_000);
+
+    const updatedPackage = await readFile(path.join(ws.dir, "mythroad", "applist.mrp"));
+    expect(updatedPackage.subarray(0, 4).toString("ascii")).toBe("MRPG");
   });
 });

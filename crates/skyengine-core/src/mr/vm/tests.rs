@@ -308,6 +308,178 @@ fn c_string_helpers_stop_at_nul() {
 }
 
 #[test]
+fn mutable_string_update_uses_one_based_offsets() {
+    let buffer = Value::Buffer(std::rc::Rc::new(std::cell::RefCell::new(vec![0; 5])));
+    string_update(&[buffer.clone(), bytes(b"abc"), Value::Number(2.0)]).unwrap();
+    assert_eq!(buffer.bytes().unwrap().as_ref(), b"\0abc\0");
+}
+
+#[test]
+fn empty_string_update_is_a_noop_after_network_cleanup() {
+    string_update(&[
+        bytes(b""),
+        bytes(b""),
+        Value::Number(1.0),
+        Value::Number(4_814.0),
+    ])
+    .unwrap();
+}
+
+#[test]
+fn pure_mr_file_objects_write_and_remove_work_files() {
+    let (mut vm, root, _) = immediate_restart_vm();
+    let Value::Table(sys) = vm.global(b"sys") else {
+        panic!("sys must be a table");
+    };
+    assert!(
+        sys.borrow()
+            .get(&bytes(b"rm"))
+            .raw_equal(&Value::Native("file_remove"))
+    );
+
+    let file = vm
+        .call_native("file_open", &[bytes(b"applist.mrp"), Value::Number(10.0)])
+        .unwrap()
+        .remove(0);
+    assert!(matches!(file, Value::Table(_)));
+    let written = vm
+        .call_native("file_write", &[file.clone(), bytes(b"MRPG\0")])
+        .unwrap();
+    assert_eq!(written[0].number(), Some(5.0));
+    assert_eq!(
+        vm.call_native("file_close", &[file]).unwrap()[0].number(),
+        Some(0.0)
+    );
+    let path = root.join("mythroad/applist.mrp");
+    assert_eq!(std::fs::read(&path).unwrap(), b"MRPG\0");
+
+    let file = vm
+        .call_native("file_open", &[bytes(b"applist.mrp"), Value::Number(1.0)])
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        vm.call_native(
+            "file_seek",
+            &[file.clone(), Value::Number(1.0), Value::Number(0.0)],
+        )
+        .unwrap()[0]
+            .number(),
+        Some(1.0)
+    );
+    assert!(
+        vm.call_native("file_read", &[file.clone(), Value::Number(3.0)])
+            .unwrap()[0]
+            .raw_equal(&bytes(b"RPG"))
+    );
+    vm.call_native("file_close", &[file]).unwrap();
+    assert_eq!(
+        vm.call_native("file_remove", &[bytes(b"applist.mrp")])
+            .unwrap()[0]
+            .number(),
+        Some(0.0)
+    );
+    assert!(!path.exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_com_300_compiles_an_executable_network_callback() {
+    let source = br#"print("code frame received")
+def progress(data)
+  p = tonumber(data)
+  if p == nil then
+    p = 0
+  end
+  if g_dialog then
+    if g_dialog.update then
+      g_dialog.update(g_dialog, nil, data .. "%", p)
+    end
+  end
+  if win then
+    if win.refresh then
+      win.refresh()
+    end
+  end
+end
+cmd.progress = progress"#;
+    let (mut vm, root, _) = immediate_restart_vm();
+    let commands = Table::new();
+    vm.set_global(b"cmd", Value::Table(commands.clone()))
+        .unwrap();
+
+    let compiled = vm
+        .call_native(
+            "TestCom1",
+            &[
+                Value::Number(300.0),
+                Value::Bytes(Arc::from(source.as_slice())),
+            ],
+        )
+        .unwrap()
+        .remove(0);
+    assert!(matches!(compiled, Value::Closure(_)));
+    assert!(vm.global(b"_loads").raw_equal(&Value::Native("_loads")));
+    let compiled = vm.call_native("_loads", &[compiled]).unwrap().remove(0);
+    let CallResult::Pushed = vm.call_value(compiled, Vec::new(), None, false).unwrap() else {
+        panic!("compiled source must execute as an MR frame");
+    };
+    vm.run_frames().unwrap();
+    assert!(matches!(
+        commands.borrow().get(&bytes(b"progress")),
+        Value::Closure(_)
+    ));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn load_pack_installs_a_text_entry_loader_until_the_handle_is_released() {
+    let (mut vm, root, _) = immediate_restart_vm();
+    let package_path = root.join("mythroad/applist.mrp");
+    write_lifecycle_test_package(
+        &package_path,
+        br#"list = {{t = "APP", e = "talkcat", ic = 1}}"#,
+    );
+
+    let handle = vm
+        .call_native("LoadPack", &[bytes(b"applist.mrp")])
+        .unwrap()
+        .remove(0);
+    assert!(handle.raw_equal(&Value::Native("loaded_pack")));
+    assert!(
+        vm.global(b"loadfile")
+            .raw_equal(&Value::Native("load_pack_file"))
+    );
+    let entry = vm
+        .call_native("load_pack_file", &[bytes(b"start.mr")])
+        .unwrap()
+        .remove(0);
+    let CallResult::Pushed = vm.call_value(entry, Vec::new(), None, false).unwrap() else {
+        panic!("loaded text entry must execute as an MR frame");
+    };
+    vm.run_frames().unwrap();
+    let Value::Table(list) = vm.global(b"list") else {
+        panic!("loaded entry must create the application list");
+    };
+    let Value::Table(application) = list.borrow().get(&Value::Number(1.0)) else {
+        panic!("application list must contain the first record");
+    };
+    assert!(
+        application
+            .borrow()
+            .get(&bytes(b"e"))
+            .raw_equal(&bytes(b"talkcat"))
+    );
+
+    vm.call_native("LoadPack", &[handle]).unwrap();
+    assert!(vm.global(b"loadfile").raw_equal(&Value::Nil));
+    assert!(vm.host.read_loaded_pack(b"start.mr").is_err());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn sub_value_splits_numbers_and_byte_strings_into_little_endian_words() {
     let number_bits = 0x1122_3344_aabb_ccdd_u64;
     let number = string_sub_value(&[Value::Number(f64::from_bits(number_bits))]).unwrap();

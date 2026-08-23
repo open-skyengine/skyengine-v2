@@ -3,6 +3,7 @@ use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 use super::chunk::Prototype;
 
 pub type Cell = Rc<RefCell<Value>>;
+pub type BufferRef = Rc<RefCell<Vec<u8>>>;
 pub type TableRef = Rc<RefCell<Table>>;
 pub type ClosureRef = Rc<Closure>;
 
@@ -12,6 +13,7 @@ pub enum Value {
     Boolean(bool),
     Number(f64),
     Bytes(Arc<[u8]>),
+    Buffer(BufferRef),
     Table(TableRef),
     Closure(ClosureRef),
     Native(&'static str),
@@ -24,6 +26,15 @@ impl fmt::Debug for Value {
             Self::Boolean(value) => value.fmt(formatter),
             Self::Number(value) => value.fmt(formatter),
             Self::Bytes(value) => write!(formatter, "{:?}", String::from_utf8_lossy(value)),
+            Self::Buffer(value) => {
+                let value = value.borrow();
+                write!(
+                    formatter,
+                    "buffer(len={}, head={:02x?})",
+                    value.len(),
+                    &value[..value.len().min(16)]
+                )
+            }
             Self::Table(value) => write!(formatter, "table:{:p}", Rc::as_ptr(value)),
             Self::Closure(value) => write!(formatter, "closure:{:p}", Rc::as_ptr(value)),
             Self::Native(name) => write!(formatter, "native:{name}"),
@@ -44,6 +55,12 @@ impl Value {
         match self {
             Self::Number(value) => Some(*value),
             Self::Bytes(value) => std::str::from_utf8(value).ok()?.trim().parse().ok(),
+            Self::Buffer(value) => std::str::from_utf8(&value.borrow())
+                .ok()?
+                .trim_matches(char::from(0))
+                .trim()
+                .parse()
+                .ok(),
             _ => None,
         }
     }
@@ -51,6 +68,7 @@ impl Value {
     pub fn bytes(&self) -> Option<Arc<[u8]>> {
         match self {
             Self::Bytes(value) => Some(value.clone()),
+            Self::Buffer(value) => Some(Arc::from(value.borrow().as_slice())),
             Self::Number(value) => Some(Arc::from(format_number(*value).into_bytes())),
             Self::Boolean(value) => {
                 Some(Arc::from(if *value { &b"true"[..] } else { &b"false"[..] }))
@@ -65,7 +83,7 @@ impl Value {
             Self::Nil => b"nil",
             Self::Boolean(_) => b"boolean",
             Self::Number(_) => b"number",
-            Self::Bytes(_) => b"string",
+            Self::Bytes(_) | Self::Buffer(_) => b"string",
             Self::Table(_) => b"table",
             Self::Closure(_) | Self::Native(_) => b"function",
         }
@@ -80,6 +98,7 @@ impl Value {
                 Some(Key::Number(normalized.to_bits()))
             }
             Self::Bytes(value) => Some(Key::Bytes(value.clone())),
+            Self::Buffer(value) => Some(Key::Bytes(Arc::from(value.borrow().as_slice()))),
             Self::Table(value) => Some(Key::Object(Rc::as_ptr(value) as usize)),
             Self::Closure(value) => Some(Key::Object(Rc::as_ptr(value) as usize)),
             Self::Native(name) => Some(Key::Native(name)),
@@ -93,6 +112,10 @@ impl Value {
             (Self::Boolean(left), Self::Boolean(right)) => left == right,
             (Self::Number(left), Self::Number(right)) => left == right,
             (Self::Bytes(left), Self::Bytes(right)) => left == right,
+            (Self::Buffer(left), Self::Buffer(right)) => *left.borrow() == *right.borrow(),
+            (Self::Bytes(left), Self::Buffer(right)) | (Self::Buffer(right), Self::Bytes(left)) => {
+                left.as_ref() == right.borrow().as_slice()
+            }
             (Self::Table(left), Self::Table(right)) => Rc::ptr_eq(left, right),
             (Self::Closure(left), Self::Closure(right)) => Rc::ptr_eq(left, right),
             (Self::Native(left), Self::Native(right)) => left == right,

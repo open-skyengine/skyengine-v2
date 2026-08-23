@@ -15,10 +15,10 @@ pub(super) fn native_tonumber(args: &[Value]) -> Value {
     if let Value::Number(value) = value {
         return Value::Number(*value);
     }
-    let Value::Bytes(value) = value else {
+    let Some(value) = value.bytes() else {
         return Value::Nil;
     };
-    let Ok(text) = std::str::from_utf8(value) else {
+    let Ok(text) = std::str::from_utf8(&value) else {
         return Value::Nil;
     };
     let text = text.trim();
@@ -114,6 +114,13 @@ pub(super) fn string_sub_value(args: &[Value]) -> Result<Vec<Value>> {
             raw[..len].copy_from_slice(&value[..len]);
             u64::from_le_bytes(raw)
         }
+        Value::Buffer(value) => {
+            let value = value.borrow();
+            let mut raw = [0_u8; 8];
+            let len = value.len().min(raw.len());
+            raw[..len].copy_from_slice(&value[..len]);
+            u64::from_le_bytes(raw)
+        }
         Value::Boolean(value) => u64::from(*value),
         Value::Nil => 0,
         other => {
@@ -126,6 +133,35 @@ pub(super) fn string_sub_value(args: &[Value]) -> Result<Vec<Value>> {
         Value::Number(f64::from(bits as u32)),
         Value::Number(f64::from((bits >> 32) as u32)),
     ])
+}
+
+pub(super) fn string_update(args: &[Value]) -> Result<Vec<Value>> {
+    let source = value_bytes(args.get(1))?;
+    let destination_len = args
+        .first()
+        .and_then(Value::bytes)
+        .map_or(0, |bytes| bytes.len());
+    let offset = lua_index(args.get(2), destination_len, 1)?;
+    let requested = args
+        .get(3)
+        .map(integer_number)
+        .transpose()?
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(source.len());
+    if requested == 0 || source.is_empty() || offset >= destination_len {
+        return Ok(Vec::new());
+    }
+    let Some(Value::Buffer(destination)) = args.first() else {
+        return Err(crate::Error::MrFault(
+            "string.update expects a buffer created by string.new".into(),
+        ));
+    };
+    let mut destination = destination.borrow_mut();
+    let len = requested
+        .min(source.len())
+        .min(destination.len().saturating_sub(offset));
+    destination[offset..offset + len].copy_from_slice(&source[..len]);
+    Ok(Vec::new())
 }
 
 pub(super) fn string_find(args: &[Value]) -> Result<Vec<Value>> {

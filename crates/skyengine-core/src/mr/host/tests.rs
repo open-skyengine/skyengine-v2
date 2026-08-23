@@ -1,5 +1,46 @@
 use super::*;
 
+#[test]
+fn standard_bmp_is_expanded_to_the_requested_bitmap_size() {
+    let mut bmp = vec![0_u8; 54];
+    bmp[0..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&58_u32.to_le_bytes());
+    bmp[10..14].copy_from_slice(&54_u32.to_le_bytes());
+    bmp[14..18].copy_from_slice(&40_u32.to_le_bytes());
+    bmp[18..22].copy_from_slice(&1_i32.to_le_bytes());
+    bmp[22..26].copy_from_slice(&1_i32.to_le_bytes());
+    bmp[26..28].copy_from_slice(&1_u16.to_le_bytes());
+    bmp[28..30].copy_from_slice(&24_u16.to_le_bytes());
+    bmp[34..38].copy_from_slice(&4_u32.to_le_bytes());
+    bmp.extend_from_slice(&[0x4a, 0x90, 0xe2, 0]);
+
+    let expected = ((0xe2_u16 >> 3) << 11) | ((0x90_u16 >> 2) << 5) | (0x4a_u16 >> 3);
+    assert_eq!(decode_bmp(&bmp, 2, 3).unwrap(), vec![expected; 6]);
+}
+
+#[test]
+fn sprite_frame_equal_to_frame_count_uses_the_last_frame() {
+    let mut host = test_host();
+    host.bitmaps.insert(
+        9,
+        Bitmap {
+            width: 1,
+            height: 2,
+            pixels: vec![0x1234, 0xabcd],
+            frame_height: Some(1),
+            transparent_color: None,
+        },
+    );
+    host.sprite_draw(&[
+        Value::Number(9.0),
+        Value::Number(2.0),
+        Value::Number(0.0),
+        Value::Number(0.0),
+    ])
+    .unwrap();
+    assert_eq!(host.framebuffer.pixels()[0], 0xabcd);
+}
+
 struct TestDisplay;
 
 impl PlatformDisplay for TestDisplay {
@@ -53,11 +94,34 @@ fn network_access_point_command_accepts_known_profiles() {
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].number(), Some(0.0));
+        assert_eq!(
+            host.socket_library.borrow().get(&bytes(b"state")).number(),
+            Some(2.0)
+        );
     }
     assert!(
         host.com(&[Value::Number(402.0), bytes(b"unknown")])
             .is_err()
     );
+}
+
+#[test]
+fn mr_timer_exposes_the_configured_callback_when_due() {
+    let mut host = test_host();
+    host.timer_start(&[
+        Value::Number(0.0),
+        Value::Number(200.0),
+        bytes(b"i_systemTimFunc"),
+    ])
+    .unwrap();
+    host.mr_timer_deadline = Some(Instant::now());
+
+    assert!(host.take_due_native_timer().unwrap());
+    assert_eq!(
+        host.take_due_mr_timer_callback().unwrap().as_ref(),
+        b"i_systemTimFunc"
+    );
+    assert!(host.take_due_mr_timer_callback().is_none());
 }
 
 fn native_file_test_root(label: &str) -> PathBuf {
@@ -757,7 +821,7 @@ fn application_replacement_is_cold_and_carries_the_latest_session_parameter() {
             height: 1,
             pixels: vec![0x1234],
             frame_height: None,
-            transparent_color: 0,
+            transparent_color: Some(0),
         },
     );
     host.directory_searches.insert(
@@ -971,7 +1035,7 @@ fn failed_staging_preserves_the_running_application_and_resources() {
             height: 1,
             pixels: vec![0x1234],
             frame_height: None,
-            transparent_color: 0,
+            transparent_color: Some(0),
         },
     );
     host.directory_searches.insert(

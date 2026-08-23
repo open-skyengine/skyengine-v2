@@ -12,6 +12,7 @@ use super::{
 
 mod native;
 mod stdlib;
+mod text;
 
 const RK_LIMIT: usize = 250;
 const SIGNATURE: &[u8; 4] = b"\x1bMRP";
@@ -96,6 +97,10 @@ impl MrVm {
     pub fn dispatch_native_timer(&mut self) -> Result<bool> {
         if !self.host.take_due_native_timer()? {
             return Ok(false);
+        }
+        if let Some(callback) = self.host.take_due_mr_timer_callback() {
+            self.call_global(&callback, Vec::new())?;
+            return Ok(true);
         }
         if self.native_entry || !self.call_global(b"dealtimer", Vec::new())? {
             self.host.dispatch_native_timer()?;
@@ -653,6 +658,7 @@ impl MrVm {
                 self.push_frame(closure, args, Some(target))?;
                 Ok(CallResult::Pushed)
             }
+            function @ Value::Native("dofile") => self.call_value(function, args, target, true),
             Value::Native(name) => match self.call_native(name, &args) {
                 Ok(mut values) => {
                     values.insert(0, Value::Boolean(true));
@@ -1009,6 +1015,14 @@ fn trace_value(value: &Value) -> String {
             std::rc::Rc::as_ptr(table),
             table.borrow().debug_entries()
         ),
+        Value::Buffer(buffer) => {
+            let buffer = buffer.borrow();
+            format!(
+                "buffer(len={}, head={:02x?})",
+                buffer.len(),
+                &buffer[..buffer.len().min(16)]
+            )
+        }
         _ => format!("{value:?}"),
     }
 }
@@ -1043,7 +1057,9 @@ fn compare(opcode: u8, left: &Value, right: &Value) -> Result<bool> {
     }
     let ordering = match (left, right) {
         (Value::Number(left), Value::Number(right)) => left.partial_cmp(right),
-        (Value::Bytes(left), Value::Bytes(right)) => Some(left.cmp(right)),
+        (Value::Bytes(_) | Value::Buffer(_), Value::Bytes(_) | Value::Buffer(_)) => {
+            Some(left.bytes().unwrap().cmp(&right.bytes().unwrap()))
+        }
         _ => None,
     }
     .ok_or_else(|| crate::Error::MrFault(format!("cannot compare {left:?} and {right:?}")))?;

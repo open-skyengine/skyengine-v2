@@ -5,7 +5,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use encoding_rs::GBK;
@@ -21,9 +21,10 @@ use crate::{
 
 use super::{
     chunk::{MrChunk, Prototype},
-    value::{Table, Value},
+    value::{Table, TableRef, Value},
 };
 
+mod network;
 mod services;
 
 use services::PackageServices;
@@ -38,7 +39,7 @@ struct Bitmap {
     height: usize,
     pixels: Vec<u16>,
     frame_height: Option<usize>,
-    transparent_color: u16,
+    transparent_color: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +110,14 @@ pub(crate) struct MrHost {
     previous_application: Option<(Vec<u8>, Vec<u8>)>,
     start_file_parameter: [u8; START_FILE_PARAMETER_LEN],
     ext_runtime: Option<ExtRuntime>,
+    socket_library: TableRef,
+    mr_sockets: BTreeMap<i32, network::MrSocket>,
+    next_mr_socket_handle: i32,
+    mr_timer_interval: Option<Duration>,
+    mr_timer_deadline: Option<Instant>,
+    mr_timer_callback: Option<Arc<[u8]>>,
+    mr_timer_pending: bool,
+    loaded_pack: Option<Arc<Package>>,
 }
 
 pub(crate) struct MrHostConfig {
@@ -146,6 +155,14 @@ impl MrHost {
             previous_application: None,
             start_file_parameter: [0; START_FILE_PARAMETER_LEN],
             ext_runtime: None,
+            socket_library: network::socket_library(),
+            mr_sockets: BTreeMap::new(),
+            next_mr_socket_handle: 1,
+            mr_timer_interval: None,
+            mr_timer_deadline: None,
+            mr_timer_callback: None,
+            mr_timer_pending: false,
+            loaded_pack: None,
         }
     }
 
@@ -250,16 +267,25 @@ impl MrHost {
                 Ok(Vec::new())
             }
             "TestCom" => Ok(vec![Value::Number(0.0)]),
+            "TestCom1" => self.test_com1(args),
             "_com" => self.com(args),
-            // Legacy MR networking owns its socket state in tcpip.mr. Closing
-            // the platform network service is therefore an idempotent no-op.
-            "_closeNet" => Ok(vec![Value::Number(0.0)]),
+            // tcpip.mr owns the protocol state machine; these functions expose
+            // the mutable buffers and host sockets that it drives.
+            "_closeNet" => self.close_network(),
+            "socket_tcp" => self.socket_tcp(),
+            "socket_connect" => self.socket_connect(args),
+            "socket_getstate" => self.socket_get_state(args),
+            "socket_getinfo" => self.socket_get_info(args),
+            "socket_send" => self.socket_send(args),
+            "socket_receive" => self.socket_receive(args),
+            "socket_close" => self.socket_close(args),
             "_strCom" => self.string_command(args),
             "LoadTable" => Ok(vec![Value::Nil]),
             "SaveTable" => Ok(vec![Value::Number(0.0)]),
             "LoadPack" => Ok(vec![Value::Nil]),
             "UAReset" => Ok(Vec::new()),
-            "TimerStart" | "TimerStop" => Ok(vec![Value::Number(0.0)]),
+            "TimerStart" => self.timer_start(args),
+            "TimerStop" => self.timer_stop(),
             "mr_c_load" => self.mr_c_load(args),
             "_gc" => Ok(Vec::new()),
             "Exit" => Ok(Vec::new()),
@@ -270,15 +296,41 @@ impl MrHost {
     }
 
     pub fn native_timer_due_in(&self) -> Option<Duration> {
-        self.ext_runtime.as_ref().and_then(ExtRuntime::timer_due_in)
+        let mr_due = self
+            .mr_timer_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        match (
+            mr_due,
+            self.ext_runtime.as_ref().and_then(ExtRuntime::timer_due_in),
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(due), None) | (None, Some(due)) => Some(due),
+            (None, None) => None,
+        }
     }
 
     pub fn take_due_native_timer(&mut self) -> Result<bool> {
-        let due = match self.ext_runtime.as_mut() {
+        let now = Instant::now();
+        let mr_due = self
+            .mr_timer_deadline
+            .is_some_and(|deadline| deadline <= now);
+        if mr_due {
+            self.mr_timer_deadline = self.mr_timer_interval.map(|interval| now + interval);
+            self.mr_timer_pending = true;
+            return Ok(true);
+        }
+        let native_due = match self.ext_runtime.as_mut() {
             Some(runtime) => runtime.take_due_timer()?,
             None => false,
         };
-        Ok(due)
+        Ok(mr_due || native_due)
+    }
+
+    pub fn take_due_mr_timer_callback(&mut self) -> Option<Arc<[u8]>> {
+        if !std::mem::take(&mut self.mr_timer_pending) {
+            return None;
+        }
+        self.mr_timer_callback.clone()
     }
 
     pub fn dispatch_native_timer(&mut self) -> Result<()> {
@@ -328,6 +380,88 @@ impl MrHost {
         };
         self.ext_runtime = Some(runtime);
         result
+    }
+
+    pub(super) fn mr_file_remove(&mut self, name: &[u8]) -> Result<i32> {
+        self.package_services().remove_file(name)
+    }
+
+    pub(super) fn mr_file_open(&mut self, name: &[u8], mode: u32) -> Result<i32> {
+        self.package_services().open_file(name, mode)
+    }
+
+    pub(super) fn mr_file_write(&mut self, handle: i32, bytes: &[u8]) -> Result<Option<usize>> {
+        self.package_services().write_file(handle, bytes)
+    }
+
+    pub(super) fn mr_file_read(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>> {
+        self.package_services().read_file(handle, len)
+    }
+
+    pub(super) fn mr_file_seek(
+        &mut self,
+        handle: i32,
+        offset: i32,
+        origin: u32,
+    ) -> Result<Option<u64>> {
+        self.package_services().seek_file(handle, offset, origin)
+    }
+
+    pub(super) fn mr_file_close(&mut self, handle: i32) -> Result<i32> {
+        self.package_services().close_file(handle)
+    }
+
+    pub(super) fn load_pack(&mut self, name: Option<&[u8]>) -> Result<bool> {
+        let Some(name) = name else {
+            self.loaded_pack = None;
+            return Ok(true);
+        };
+        let Some(path) = native_file_path(
+            &self.work_dir,
+            self.package.path(),
+            &self.package.header().internal_name,
+            name,
+        ) else {
+            return Ok(false);
+        };
+        self.loaded_pack = match Package::open(path, self.package.limits().clone()) {
+            Ok(package) => Some(Arc::new(package)),
+            Err(crate::Error::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(self.loaded_pack.is_some())
+    }
+
+    pub(super) fn read_loaded_pack(&self, name: &[u8]) -> Result<Vec<u8>> {
+        self.loaded_pack
+            .as_ref()
+            .ok_or_else(|| crate::Error::MrFault("no package is loaded".into()))?
+            .read_named(name)
+    }
+
+    fn read_active_pack_resource(&self, name: &[u8]) -> Result<Vec<u8>> {
+        match &self.loaded_pack {
+            Some(package) => package.read_named(name),
+            None => self.package.read_named(name),
+        }
+    }
+
+    fn package_services(&mut self) -> PackageServices<'_> {
+        PackageServices {
+            package: self.package.clone(),
+            work_dir: self.work_dir.clone(),
+            directory_searches: &mut self.directory_searches,
+            next_directory_handle: &mut self.next_directory_handle,
+            files: &mut self.native_files,
+            next_file_handle: &mut self.next_native_file_handle,
+            font: &self.font,
+            framebuffer: &mut self.framebuffer,
+            display: self.display.as_mut(),
+        }
     }
 
     pub fn lifecycle_request(&self) -> Result<Option<ExtLifecycleRequest>> {
@@ -530,6 +664,7 @@ impl MrHost {
         self.sdk_key = None;
         self.current_entry = prepared.entry;
         self.ext_runtime = prepared.ext_runtime;
+        self.reset_mr_platform_state();
         prepared.prepared_entry
     }
 
@@ -541,6 +676,18 @@ impl MrHost {
         self.native_files.clear();
         self.next_native_file_handle = 1;
         self.sdk_key = None;
+        self.reset_mr_platform_state();
+    }
+
+    fn reset_mr_platform_state(&mut self) {
+        self.socket_library = network::socket_library();
+        self.mr_sockets.clear();
+        self.next_mr_socket_handle = 1;
+        self.mr_timer_interval = None;
+        self.mr_timer_deadline = None;
+        self.mr_timer_callback = None;
+        self.mr_timer_pending = false;
+        self.loaded_pack = None;
     }
 
     pub fn set_current_entry(&mut self, entry: &[u8]) {
@@ -552,27 +699,32 @@ impl MrHost {
         let name = value_bytes(args.get(1))?;
         let width = positive_usize(args.get(4), "bitmap width")?;
         let height = positive_usize(args.get(5), "bitmap height")?;
-        let raw = self.package.read_named(&name)?;
+        let raw = self.read_active_pack_resource(&name)?;
         let pixel_count = width
             .checked_mul(height)
             .ok_or_else(|| crate::Error::Platform(format!("bitmap {id} dimensions overflow")))?;
         let byte_count = pixel_count
             .checked_mul(2)
             .ok_or_else(|| crate::Error::Platform(format!("bitmap {id} byte count overflow")))?;
-        if raw.len() < byte_count {
-            return Err(crate::Error::Platform(format!(
-                "bitmap {} contains {} bytes, needs {byte_count}",
-                String::from_utf8_lossy(&name),
-                raw.len()
-            )));
-        }
-        let pixels: Vec<u16> = raw[..byte_count]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pixel| u16::from_le_bytes([pixel[0], pixel[1]]))
-            .collect();
-        let transparent_color = pixels.first().copied().unwrap_or(0);
+        let (pixels, transparent_color) = if raw.starts_with(b"BM") {
+            (decode_bmp(&raw, width, height)?, None)
+        } else {
+            if raw.len() < byte_count {
+                return Err(crate::Error::Platform(format!(
+                    "bitmap {} contains {} bytes, needs {byte_count}",
+                    String::from_utf8_lossy(&name),
+                    raw.len()
+                )));
+            }
+            let pixels = raw[..byte_count]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pixel| u16::from_le_bytes([pixel[0], pixel[1]]))
+                .collect::<Vec<_>>();
+            let transparent_color = pixels.first().copied();
+            (pixels, transparent_color)
+        };
         self.bitmaps.insert(
             id,
             Bitmap {
@@ -619,6 +771,11 @@ impl MrHost {
         })?;
         let frame_height = bitmap.frame_height.unwrap_or(bitmap.height);
         let source_y = frame.saturating_mul(frame_height);
+        let source_y = if source_y == bitmap.height && frame > 0 {
+            (frame - 1).saturating_mul(frame_height)
+        } else {
+            source_y
+        };
         if source_y >= bitmap.height {
             return Ok(());
         }
@@ -632,7 +789,7 @@ impl MrHost {
                 height: frame_height.min(bitmap.height - source_y),
                 destination_x: x,
                 destination_y: y,
-                transparent_color: Some(bitmap.transparent_color),
+                transparent_color: bitmap.transparent_color,
             },
         );
         Ok(())
@@ -720,6 +877,7 @@ impl MrHost {
                         "unsupported network access point {access_point:?}"
                     )));
                 }
+                self.initialize_network();
                 Ok(vec![Value::Number(0.0)])
             }
             // Register the SDK compatibility key selected by start.mr.
@@ -731,6 +889,30 @@ impl MrHost {
                 "unsupported _com command {other} with arguments {args:?}"
             ))),
         }
+    }
+
+    fn timer_start(&mut self, args: &[Value]) -> Result<Vec<Value>> {
+        let milliseconds = integer(args.get(1))?;
+        if milliseconds <= 0 {
+            return Err(crate::Error::MrFault(format!(
+                "TimerStart interval must be positive, got {milliseconds}"
+            )));
+        }
+        let interval = Duration::from_millis(milliseconds as u64);
+        let callback = value_bytes(args.get(2))?;
+        self.mr_timer_interval = Some(interval);
+        self.mr_timer_deadline = Some(Instant::now() + interval);
+        self.mr_timer_callback = Some(callback);
+        self.mr_timer_pending = false;
+        Ok(vec![Value::Number(0.0)])
+    }
+
+    fn timer_stop(&mut self) -> Result<Vec<Value>> {
+        self.mr_timer_interval = None;
+        self.mr_timer_deadline = None;
+        self.mr_timer_callback = None;
+        self.mr_timer_pending = false;
+        Ok(vec![Value::Number(0.0)])
     }
 
     fn string_command(&mut self, args: &[Value]) -> Result<Vec<Value>> {
@@ -1019,6 +1201,86 @@ impl MrHost {
             }
         }
     }
+}
+
+fn decode_bmp(raw: &[u8], target_width: usize, target_height: usize) -> Result<Vec<u16>> {
+    if raw.len() < 54 {
+        return Err(crate::Error::Package("BMP header is truncated".into()));
+    }
+    let u16_at = |offset: usize| {
+        raw.get(offset..offset + 2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+    };
+    let u32_at = |offset: usize| {
+        raw.get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    let i32_at = |offset: usize| {
+        raw.get(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_le_bytes)
+    };
+    let pixel_offset = usize::try_from(u32_at(10).unwrap()).unwrap();
+    let source_width = i32_at(18).unwrap();
+    let signed_height = i32_at(22).unwrap();
+    let planes = u16_at(26).unwrap();
+    let bits_per_pixel = usize::from(u16_at(28).unwrap());
+    let compression = u32_at(30).unwrap();
+    if source_width <= 0
+        || signed_height == 0
+        || signed_height == i32::MIN
+        || planes != 1
+        || !matches!(bits_per_pixel, 24 | 32)
+        || compression != 0
+    {
+        return Err(crate::Error::Package(
+            "unsupported BMP dimensions or pixel format".into(),
+        ));
+    }
+    let source_width = usize::try_from(source_width).unwrap();
+    let source_height = usize::try_from(signed_height.abs()).unwrap();
+    let row_bits = source_width
+        .checked_mul(bits_per_pixel)
+        .ok_or_else(|| crate::Error::ResourceLimit("BMP row size overflows".into()))?;
+    let row_stride = row_bits
+        .checked_add(31)
+        .map(|bits| bits / 32 * 4)
+        .ok_or_else(|| crate::Error::ResourceLimit("BMP row stride overflows".into()))?;
+    let pixel_bytes = row_stride
+        .checked_mul(source_height)
+        .ok_or_else(|| crate::Error::ResourceLimit("BMP pixel range overflows".into()))?;
+    let pixel_end = pixel_offset
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| crate::Error::ResourceLimit("BMP pixel offset overflows".into()))?;
+    if pixel_end > raw.len() {
+        return Err(crate::Error::Package("BMP pixel data is truncated".into()));
+    }
+    let output_len = target_width
+        .checked_mul(target_height)
+        .ok_or_else(|| crate::Error::ResourceLimit("BMP output dimensions overflow".into()))?;
+    let bytes_per_pixel = bits_per_pixel / 8;
+    let bottom_up = signed_height > 0;
+    let mut pixels = Vec::with_capacity(output_len);
+    for target_y in 0..target_height {
+        let source_y = target_y * source_height / target_height;
+        let stored_y = if bottom_up {
+            source_height - 1 - source_y
+        } else {
+            source_y
+        };
+        let row = pixel_offset + stored_y * row_stride;
+        for target_x in 0..target_width {
+            let source_x = target_x * source_width / target_width;
+            let pixel = row + source_x * bytes_per_pixel;
+            let blue = u16::from(raw[pixel]);
+            let green = u16::from(raw[pixel + 1]);
+            let red = u16::from(raw[pixel + 2]);
+            pixels.push(((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3));
+        }
+    }
+    Ok(pixels)
 }
 
 fn package_entry_path(internal_name: &[u8], guest_name: &[u8]) -> Option<Vec<u8>> {
