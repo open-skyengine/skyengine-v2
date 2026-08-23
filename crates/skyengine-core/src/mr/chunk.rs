@@ -36,6 +36,7 @@ pub struct LocalVariable {
 
 #[derive(Clone, Debug)]
 pub struct Prototype {
+    pub profile: MrProfile,
     pub source: Option<Arc<[u8]>>,
     pub line_defined: u32,
     pub upvalue_count: u8,
@@ -262,6 +263,7 @@ fn load_prototype(
     )?;
 
     Ok(Arc::new(Prototype {
+        profile,
         source,
         line_defined,
         upvalue_count,

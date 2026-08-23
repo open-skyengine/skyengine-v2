@@ -15,6 +15,40 @@ impl PlatformDisplay for LifecycleTestDisplay {
     fn wait_timeout(&mut self, _milliseconds: u32) {}
 }
 
+#[test]
+fn v80_division_uses_integer_semantics_without_changing_v50() {
+    assert!(
+        arithmetic(
+            MrProfile::V80,
+            15,
+            &Value::Number(2.0),
+            &Value::Number(13.0),
+        )
+        .unwrap()
+        .raw_equal(&Value::Number(0.0))
+    );
+    assert!(
+        arithmetic(
+            MrProfile::V80,
+            15,
+            &Value::Number(-15.0),
+            &Value::Number(4.0),
+        )
+        .unwrap()
+        .raw_equal(&Value::Number(-3.0))
+    );
+    assert!(
+        arithmetic(
+            MrProfile::V50,
+            15,
+            &Value::Number(2.0),
+            &Value::Number(13.0),
+        )
+        .unwrap()
+        .raw_equal(&Value::Number(2.0 / 13.0))
+    );
+}
+
 fn lifecycle_test_root(label: &str) -> std::path::PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
 

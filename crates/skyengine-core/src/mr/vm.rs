@@ -5,7 +5,7 @@ use crate::{
 };
 
 use super::{
-    chunk::{Constant, MrChunk, Prototype},
+    chunk::{Constant, MrChunk, MrProfile, Prototype},
     host::{MrHost, MrHostConfig, PreparedEntry},
     value::{Cell, Closure, ClosureRef, Table, TableRef, Value},
 };
@@ -417,7 +417,8 @@ impl MrVm {
             12..=16 | 36..=38 => {
                 let left = self.rk(frame_index, b)?;
                 let right = self.rk(frame_index, c)?;
-                let value = arithmetic(opcode, &left, &right)?;
+                let profile = self.frames[frame_index].closure.prototype.profile;
+                let value = arithmetic(profile, opcode, &left, &right)?;
                 self.set_register(frame_index, a, value)?;
             }
             17 => {
@@ -1012,7 +1013,7 @@ fn trace_value(value: &Value) -> String {
     }
 }
 
-fn arithmetic(opcode: u8, left: &Value, right: &Value) -> Result<Value> {
+fn arithmetic(profile: MrProfile, opcode: u8, left: &Value, right: &Value) -> Result<Value> {
     if opcode >= 36 {
         let left = integer_number(left)?;
         let right = integer_number(right)?;
@@ -1029,6 +1030,7 @@ fn arithmetic(opcode: u8, left: &Value, right: &Value) -> Result<Value> {
         12 => left + right,
         13 => left - right,
         14 => left * right,
+        15 if profile == MrProfile::V80 => (left / right).trunc(),
         15 => left / right,
         16 => left.powf(right),
         _ => unreachable!(),
