@@ -128,11 +128,14 @@ impl PlatformDisplay for SdlDisplay {
                     code,
                     pressed: false,
                 }),
-                Event::MouseButtonDown { x, y, .. } => Some(DisplayEvent::Pointer {
-                    x,
-                    y,
-                    pressed: true,
-                }),
+                Event::MouseButtonDown { x, y, .. } => {
+                    eprintln!("[skyengine-sdl] click x={x} y={y}");
+                    Some(DisplayEvent::Pointer {
+                        x,
+                        y,
+                        pressed: true,
+                    })
+                }
                 Event::MouseButtonUp { x, y, .. } => Some(DisplayEvent::Pointer {
                     x,
                     y,

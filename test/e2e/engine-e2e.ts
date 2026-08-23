@@ -329,10 +329,11 @@ export class SkyEngineE2e {
     if (this.memorySize) args.push("--memory", this.memorySize);
     if (this.deviceDate) args.push("--device-date", this.deviceDate);
     args.push(mrpPath);
+    const videoDriver = process.env.SDL_VIDEODRIVER ?? "dummy";
     this.process = spawn(this.bin, args, {
       env: {
         ...process.env,
-        SDL_VIDEODRIVER: process.env.SDL_VIDEODRIVER ?? "dummy",
+        SDL_VIDEODRIVER: videoDriver,
         SDL_AUDIODRIVER: process.env.SDL_AUDIODRIVER ?? "dummy",
         SKYENGINE_E2E_SOCKET: this.socketPath,
         SKYENGINE_PPM_PATH: this.defaultScreenPath,
@@ -348,6 +349,11 @@ export class SkyEngineE2e {
     this.stderrLog = createWriteStream(this.stderrPath);
     this.process.stdout.pipe(this.stdoutLog);
     this.process.stderr.pipe(this.stderrLog);
+    if (videoDriver !== "dummy") {
+      // Visible E2E runs are interactive debugging sessions. Keep the artifact
+      // log while also showing SDL click coordinates and runtime errors live.
+      this.process.stderr.pipe(process.stderr, { end: false });
+    }
 
     await this.waitForSocket();
   }

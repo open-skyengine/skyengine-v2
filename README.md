@@ -46,6 +46,9 @@ SDL window while checking or developing a test flow, select a real video driver 
 SDL_VIDEODRIVER=x11 pnpm vitest run test/e2e/geyaxz/boot-to-home.test.ts
 ```
 
+Clicking the preview prints its logical screen coordinates as
+`[skyengine-sdl] click x=... y=...`, which can be used directly in E2E input steps.
+
 ## Inspect A Package
 
 ```bash
