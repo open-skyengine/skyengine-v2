@@ -43,6 +43,23 @@ fn test_services(host: &mut MrHost) -> services::PackageServices<'_> {
     }
 }
 
+#[test]
+fn network_access_point_command_accepts_known_profiles() {
+    let mut host = test_host();
+
+    for access_point in [b"cmwap".as_slice(), b"cmnet".as_slice()] {
+        let result = host
+            .com(&[Value::Number(402.0), bytes(access_point)])
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].number(), Some(0.0));
+    }
+    assert!(
+        host.com(&[Value::Number(402.0), bytes(b"unknown")])
+            .is_err()
+    );
+}
+
 fn native_file_test_root(label: &str) -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
 

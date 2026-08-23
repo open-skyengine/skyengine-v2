@@ -75,6 +75,26 @@ fn legacy_pcall_alias_is_registered_and_protects_native_calls() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn legacy_network_close_is_registered_and_returns_success() {
+    let (mut vm, root, _) = immediate_restart_vm();
+    assert!(
+        vm.global(b"_closeNet")
+            .raw_equal(&Value::Native("_closeNet"))
+    );
+
+    let result = vm
+        .call_value(Value::Native("_closeNet"), Vec::new(), None, false)
+        .unwrap();
+    let CallResult::Immediate(values) = result else {
+        panic!("native network close must return immediately");
+    };
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].number(), Some(0.0));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn lifecycle_test_root(label: &str) -> std::path::PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
 

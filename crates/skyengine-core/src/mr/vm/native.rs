@@ -38,6 +38,7 @@ impl MrVm {
             "DispUpEx",
             "TestCom",
             "_com",
+            "_closeNet",
             "_strCom",
             "LoadTable",
             "SaveTable",

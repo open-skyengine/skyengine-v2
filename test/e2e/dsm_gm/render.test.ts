@@ -55,6 +55,32 @@ function isKeyBindingScreen(screen: PpmImage): boolean {
   );
 }
 
+function isUpdateMenu(screen: PpmImage): boolean {
+  return (
+    isSelectedMenuRow(screen, 45) &&
+    differingPixels(screen, { x: 5, y: 65, width: 118, height: 16 }, MENU_BACKGROUND) > 8 &&
+    differingPixels(screen, { x: 5, y: 85, width: 118, height: 16 }, MENU_BACKGROUND) === 0
+  );
+}
+
+function isUpdateDialingScreen(screen: PpmImage): boolean {
+  const iconPixels = differingPixels(
+    screen,
+    { x: 90, y: 120, width: 60, height: 61 },
+    MENU_BACKGROUND,
+  );
+  const progressPixels = differingPixels(
+    screen,
+    { x: 7, y: 287, width: 226, height: 5 },
+    MENU_BACKGROUND,
+  );
+  return (
+    screen.pixel(150, 53).toString() === MENU_BACKGROUND.toString() &&
+    iconPixels > 3_000 &&
+    progressPixels > 1_000
+  );
+}
+
 function changedPixels(
   before: PpmImage,
   after: PpmImage,
@@ -208,5 +234,50 @@ describe("dsm_gm", () => {
       { name: "key-binding-down", timeoutMs: 1_000, intervalMs: 50 },
     );
     expect(changedPixels(bindingUp, bindingDown, { x: 82, y: 45, width: 22, height: 16 })).toBeGreaterThan(4);
+  });
+
+  it("更新列表", async () => {
+    ws = await SkyEngineWorkspace.create();
+    engine = await SkyEngineE2e.start("test/fixtures/dsm_gm.mrp", {
+      workDir: ws.dir,
+      dnsMap:
+        "rop.skymobiapp.com->159.75.119.124;" +
+        "spd.skymobiapp.com->159.75.119.124;" +
+        "proxy.51mrp.com->127.0.0.1;" +
+        "proxy2.51mrp.com->127.0.0.1",
+    });
+
+    const initial = await engine.waitForScreen(
+      (screen) => isSelectedMenuRow(screen, 45) && hasFourthMenuRow(screen),
+      { name: "update-initial-menu", timeoutMs: 10_000, intervalMs: 250 },
+    );
+    expectSelectedMenuRow(initial, 45);
+
+    await engine.key("ENTER", { timeoutMs: 1_000, holdMs: 80 });
+    const updateMenu = await engine.waitForScreen(isUpdateMenu, {
+      name: "update-menu",
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+    expectSelectedMenuRow(updateMenu, 45);
+    expect(
+      changedPixels(initial, updateMenu, { x: 26, y: 45, width: 96, height: 36 }),
+    ).toBeGreaterThan(100);
+
+    await engine.key("ENTER", { timeoutMs: 1_000, holdMs: 80 });
+    const dialing = await engine.waitForScreen(isUpdateDialingScreen, {
+      name: "update-dialing",
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+    expect(isUpdateDialingScreen(dialing)).toBe(true);
+
+    await engine.key("RIGHT_SOFT", { timeoutMs: 1_000, holdMs: 80 });
+    const cancelled = await engine.waitForScreen(isUpdateMenu, {
+      name: "update-cancelled",
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+    expectSelectedMenuRow(cancelled, 45);
   });
 });

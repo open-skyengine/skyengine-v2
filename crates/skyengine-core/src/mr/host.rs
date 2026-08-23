@@ -251,6 +251,9 @@ impl MrHost {
             }
             "TestCom" => Ok(vec![Value::Number(0.0)]),
             "_com" => self.com(args),
+            // Legacy MR networking owns its socket state in tcpip.mr. Closing
+            // the platform network service is therefore an idempotent no-op.
+            "_closeNet" => Ok(vec![Value::Number(0.0)]),
             "_strCom" => self.string_command(args),
             "LoadTable" => Ok(vec![Value::Nil]),
             "SaveTable" => Ok(vec![Value::Number(0.0)]),
@@ -707,6 +710,18 @@ impl MrHost {
         match command {
             // UI reset and screen mode notifications used by the baseline SDK.
             0 | 1 | 403 => Ok(vec![Value::Number(0.0)]),
+            // Select the SDK network access point. Host networking is already
+            // routed through the configured DNS/socket layer, so only validate
+            // the legacy profile name and acknowledge the selection.
+            402 => {
+                let access_point = value_bytes(args.get(1))?;
+                if !matches!(access_point.as_ref(), b"cmwap" | b"cmnet") {
+                    return Err(crate::Error::Platform(format!(
+                        "unsupported network access point {access_point:?}"
+                    )));
+                }
+                Ok(vec![Value::Number(0.0)])
+            }
             // Register the SDK compatibility key selected by start.mr.
             3629 => {
                 self.sdk_key = Some(integer(args.get(1))?);
