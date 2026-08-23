@@ -315,6 +315,46 @@ fn mutable_string_update_uses_one_based_offsets() {
 }
 
 #[test]
+fn mutable_string_update_moves_an_exclusive_source_range_with_overlap() {
+    let buffer = Value::Buffer(std::rc::Rc::new(std::cell::RefCell::new(
+        b"0123456789".to_vec(),
+    )));
+    string_update(&[
+        buffer.clone(),
+        buffer.clone(),
+        Value::Number(1.0),
+        Value::Number(4.0),
+        Value::Number(8.0),
+    ])
+    .unwrap();
+    assert_eq!(buffer.bytes().unwrap().as_ref(), b"3456456789");
+
+    let unchanged = buffer.bytes().unwrap();
+    string_update(&[
+        buffer.clone(),
+        buffer.clone(),
+        Value::Number(1.0),
+        Value::Number(8.0),
+        Value::Number(8.0),
+    ])
+    .unwrap();
+    assert_eq!(buffer.bytes().unwrap().as_ref(), unchanged.as_ref());
+}
+
+#[test]
+fn mutable_string_update_copies_a_source_suffix_with_destination_truncation() {
+    let buffer = Value::Buffer(std::rc::Rc::new(std::cell::RefCell::new(vec![0; 4])));
+    string_update(&[
+        buffer.clone(),
+        bytes(b"abcdef"),
+        Value::Number(2.0),
+        Value::Number(3.0),
+    ])
+    .unwrap();
+    assert_eq!(buffer.bytes().unwrap().as_ref(), b"\0cde");
+}
+
+#[test]
 fn empty_string_update_is_a_noop_after_network_cleanup() {
     string_update(&[
         bytes(b""),
@@ -430,6 +470,54 @@ cmd.progress = progress"#;
         Value::Closure(_)
     ));
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn text_network_callbacks_share_assigned_global_state() {
+    let source = br#"dl_written = 0
+def dl_file(data)
+  dl_written = dl_written + data
+end
+cmd.file = dl_file"#;
+    let (mut vm, root, _) = immediate_restart_vm();
+    let commands = Table::new();
+    vm.set_global(b"cmd", Value::Table(commands.clone()))
+        .unwrap();
+
+    let compiled = vm
+        .call_native(
+            "TestCom1",
+            &[
+                Value::Number(300.0),
+                Value::Bytes(Arc::from(source.as_slice())),
+            ],
+        )
+        .unwrap()
+        .remove(0);
+    let compiled = vm.call_native("_loads", &[compiled]).unwrap().remove(0);
+    let CallResult::Pushed = vm.call_value(compiled, Vec::new(), None, false).unwrap() else {
+        panic!("compiled source must execute as an MR frame");
+    };
+    vm.run_frames().unwrap();
+
+    let callback = commands.borrow().get(&bytes(b"file"));
+    let CallResult::Pushed = vm
+        .call_value(callback.clone(), vec![Value::Number(17.0)], None, false)
+        .unwrap()
+    else {
+        panic!("file callback must execute as an MR frame");
+    };
+    vm.run_frames().unwrap();
+    let CallResult::Pushed = vm
+        .call_value(callback, vec![Value::Number(25.0)], None, false)
+        .unwrap()
+    else {
+        panic!("file callback must execute as an MR frame");
+    };
+    vm.run_frames().unwrap();
+
+    assert_eq!(vm.global(b"dl_written").number(), Some(42.0));
     std::fs::remove_dir_all(root).unwrap();
 }
 

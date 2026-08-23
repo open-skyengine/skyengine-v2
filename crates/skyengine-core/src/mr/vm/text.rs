@@ -28,6 +28,7 @@ enum TokenKind {
     Assign,
     Equal,
     Concat,
+    Plus,
     Separator,
     Eof,
 }
@@ -66,6 +67,7 @@ enum Expression {
     Member(Box<Expression>, Arc<[u8]>),
     Call(Box<Expression>, Vec<Expression>),
     Concat(Box<Expression>, Box<Expression>),
+    Add(Box<Expression>, Box<Expression>),
     Equal(Box<Expression>, Box<Expression>),
     Table(Vec<TableField>),
 }
@@ -86,7 +88,7 @@ pub(super) fn compile(source: &[u8], limits: &ResourceLimits) -> Result<Arc<Prot
     }
     let tokens = lex(source, limits.max_mr_items)?;
     let statements = Parser::new(tokens, limits.max_mr_depth).parse()?;
-    let prototype = Compiler::new(limits, true, Vec::new(), &statements)?.finish(statements)?;
+    let prototype = Compiler::new(limits, true, Vec::new())?.finish(statements)?;
     let (prototypes, items) = prototype_budget(&prototype);
     if prototypes > limits.max_mr_prototypes {
         return Err(Error::ResourceLimit(format!(
@@ -137,6 +139,10 @@ fn lex(source: &[u8], max_tokens: usize) -> Result<Vec<Token>> {
             b',' => {
                 cursor += 1;
                 TokenKind::Comma
+            }
+            b'+' => {
+                cursor += 1;
+                TokenKind::Plus
             }
             b'=' if source.get(cursor + 1) == Some(&b'=') => {
                 cursor += 2;
@@ -367,11 +373,19 @@ impl Parser {
     }
 
     fn concat(&mut self) -> Result<Expression> {
-        let left = self.postfix()?;
+        let left = self.addition()?;
         if self.take(&TokenKind::Concat) {
             return Ok(Expression::Concat(Box::new(left), Box::new(self.concat()?)));
         }
         Ok(left)
+    }
+
+    fn addition(&mut self) -> Result<Expression> {
+        let mut expression = self.postfix()?;
+        while self.take(&TokenKind::Plus) {
+            expression = Expression::Add(Box::new(expression), Box::new(self.postfix()?));
+        }
+        Ok(expression)
     }
 
     fn postfix(&mut self) -> Result<Expression> {
@@ -501,7 +515,6 @@ impl<'a> Compiler<'a> {
         limits: &'a ResourceLimits,
         top_level: bool,
         parameters: Vec<Arc<[u8]>>,
-        statements: &[Statement],
     ) -> Result<Self> {
         if parameters.len() > MAX_REGISTER_COUNT {
             return Err(text_error(0, "too many function parameters"));
@@ -512,9 +525,6 @@ impl<'a> Compiler<'a> {
             if locals.insert(parameter.clone(), index).is_some() {
                 return Err(text_error(0, "duplicate function parameter"));
             }
-        }
-        if !top_level {
-            collect_locals(statements, &mut locals)?;
         }
         if locals.len() > MAX_REGISTER_COUNT {
             return Err(text_error(0, "too many local variables"));
@@ -567,8 +577,8 @@ impl<'a> Compiler<'a> {
                 if !self.top_level {
                     return Err(text_error(0, "nested function definitions are unsupported"));
                 }
-                let child = Compiler::new(self.limits, false, parameters.clone(), body)?
-                    .finish(body.clone())?;
+                let child =
+                    Compiler::new(self.limits, false, parameters.clone())?.finish(body.clone())?;
                 let prototype = self.prototypes.len();
                 self.prototypes.push(child);
                 let register = self.allocate(1)?;
@@ -675,6 +685,12 @@ impl<'a> Compiler<'a> {
                 self.expression_into(left, registers)?;
                 self.expression_into(right, registers + 1)?;
                 self.emit_abc(19, destination, registers, registers + 1)?;
+            }
+            Expression::Add(left, right) => {
+                let registers = self.allocate(2)?;
+                self.expression_into(left, registers)?;
+                self.expression_into(right, registers + 1)?;
+                self.emit_abc(12, destination, registers, registers + 1)?;
             }
             Expression::Equal(_, _) => {
                 return Err(text_error(
@@ -832,33 +848,6 @@ impl<'a> Compiler<'a> {
     }
 }
 
-fn collect_locals(statements: &[Statement], locals: &mut BTreeMap<Arc<[u8]>, usize>) -> Result<()> {
-    for statement in statements {
-        match statement {
-            Statement::Assign {
-                target: Expression::Name(name),
-                ..
-            } => {
-                if !locals.contains_key(name) {
-                    let index = locals.len();
-                    locals.insert(name.clone(), index);
-                }
-            }
-            Statement::If {
-                body, else_body, ..
-            } => {
-                collect_locals(body, locals)?;
-                collect_locals(else_body, locals)?;
-            }
-            Statement::Function { .. } => {
-                return Err(text_error(0, "nested function definitions are unsupported"));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn constants_equal(left: &Constant, right: &Constant) -> bool {
     match (left, right) {
         (Constant::Nil, Constant::Nil) => true,
@@ -938,6 +927,23 @@ end"#;
             |constant| matches!(constant, Constant::Bytes(bytes) if bytes.as_ref() == b"MRPG\0")
         ));
         assert!(prototype.code.len() >= 20);
+    }
+
+    #[test]
+    fn compiles_download_byte_counter_addition() {
+        let source = br#"def dl_file(data)
+  if dl_f then
+    dl_f.write(dl_f, data)
+    dl_written = dl_written + string.len(data)
+  end
+end"#;
+        let prototype = compile(source, &ResourceLimits::default()).unwrap();
+        assert!(
+            prototype.prototypes[0]
+                .code
+                .iter()
+                .any(|instruction| instruction & 0x3f == 12)
+        );
     }
 
     #[test]

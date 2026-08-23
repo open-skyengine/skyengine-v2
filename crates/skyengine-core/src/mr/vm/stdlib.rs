@@ -142,13 +142,9 @@ pub(super) fn string_update(args: &[Value]) -> Result<Vec<Value>> {
         .and_then(Value::bytes)
         .map_or(0, |bytes| bytes.len());
     let offset = lua_index(args.get(2), destination_len, 1)?;
-    let requested = args
-        .get(3)
-        .map(integer_number)
-        .transpose()?
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(source.len());
-    if requested == 0 || source.is_empty() || offset >= destination_len {
+    let source_start = lua_index(args.get(3), source.len(), 1)?;
+    let source_end = lua_index(args.get(4), source.len(), source.len() as i64 + 1)?;
+    if source_start >= source_end || offset >= destination_len {
         return Ok(Vec::new());
     }
     let Some(Value::Buffer(destination)) = args.first() else {
@@ -157,10 +153,10 @@ pub(super) fn string_update(args: &[Value]) -> Result<Vec<Value>> {
         ));
     };
     let mut destination = destination.borrow_mut();
-    let len = requested
-        .min(source.len())
+    let len = source_end
+        .saturating_sub(source_start)
         .min(destination.len().saturating_sub(offset));
-    destination[offset..offset + len].copy_from_slice(&source[..len]);
+    destination[offset..offset + len].copy_from_slice(&source[source_start..source_start + len]);
     Ok(Vec::new())
 }
 

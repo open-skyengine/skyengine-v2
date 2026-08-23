@@ -117,6 +117,7 @@ pub(crate) struct MrHost {
     mr_timer_deadline: Option<Instant>,
     mr_timer_callback: Option<Arc<[u8]>>,
     mr_timer_pending: bool,
+    mr_lifecycle_request: Option<ExtLifecycleRequest>,
     loaded_pack: Option<Arc<Package>>,
 }
 
@@ -162,6 +163,7 @@ impl MrHost {
             mr_timer_deadline: None,
             mr_timer_callback: None,
             mr_timer_pending: false,
+            mr_lifecycle_request: None,
             loaded_pack: None,
         }
     }
@@ -234,7 +236,7 @@ impl MrHost {
                 self.sprite_draw(args)?;
                 Ok(Vec::new())
             }
-            "_drawRect" | "DrawRect" => {
+            "_drawRect" | "DrawRect" | "_effSetCon" => {
                 let x = integer(args.first())?;
                 let y = integer(args.get(1))?;
                 let width = integer(args.get(2))?;
@@ -283,6 +285,20 @@ impl MrHost {
             "LoadTable" => Ok(vec![Value::Nil]),
             "SaveTable" => Ok(vec![Value::Number(0.0)]),
             "LoadPack" => Ok(vec![Value::Nil]),
+            "RunFile" => {
+                let package = value_bytes(args.first())?;
+                let entry = value_bytes(args.get(1))?;
+                if package.is_empty() || entry.is_empty() {
+                    return Err(crate::Error::MrFault(
+                        "RunFile package and entry must not be empty".into(),
+                    ));
+                }
+                self.mr_lifecycle_request = Some(ExtLifecycleRequest::Restart {
+                    package: package.to_vec(),
+                    entry: entry.to_vec(),
+                });
+                Ok(vec![Value::Number(0.0)])
+            }
             "UAReset" => Ok(Vec::new()),
             "TimerStart" => self.timer_start(args),
             "TimerStop" => self.timer_stop(),
@@ -465,6 +481,9 @@ impl MrHost {
     }
 
     pub fn lifecycle_request(&self) -> Result<Option<ExtLifecycleRequest>> {
+        if let Some(request) = &self.mr_lifecycle_request {
+            return Ok(Some(request.clone()));
+        }
         match self.ext_runtime.as_ref() {
             Some(runtime) => runtime.lifecycle_request(),
             None => Ok(None),
@@ -636,6 +655,9 @@ impl MrHost {
     }
 
     pub fn acknowledge_lifecycle_request(&mut self) -> Result<()> {
+        if self.mr_lifecycle_request.take().is_some() {
+            return Ok(());
+        }
         match self.ext_runtime.as_mut() {
             Some(runtime) => runtime.clear_lifecycle_request(),
             None => Ok(()),

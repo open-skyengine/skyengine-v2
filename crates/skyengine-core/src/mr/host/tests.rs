@@ -41,6 +41,46 @@ fn sprite_frame_equal_to_frame_count_uses_the_last_frame() {
     assert_eq!(host.framebuffer.pixels()[0], 0xabcd);
 }
 
+#[test]
+fn effect_background_fills_the_requested_rectangle() {
+    let mut host = test_host();
+    host.call(
+        "_effSetCon",
+        &[
+            Value::Number(3.0),
+            Value::Number(4.0),
+            Value::Number(2.0),
+            Value::Number(1.0),
+            Value::Number(128.0),
+            Value::Number(64.0),
+            Value::Number(32.0),
+        ],
+    )
+    .unwrap();
+
+    let expected = Framebuffer::rgb565(128, 64, 32);
+    assert_eq!(host.framebuffer.pixels()[4 * 240 + 3], expected);
+    assert_eq!(host.framebuffer.pixels()[4 * 240 + 4], expected);
+    assert_eq!(host.framebuffer.pixels()[4 * 240 + 5], 0);
+}
+
+#[test]
+fn run_file_requests_a_managed_application_restart() {
+    let mut host = test_host();
+    host.call("RunFile", &[bytes(b"game.mrp"), bytes(b"start.mr")])
+        .unwrap();
+
+    assert_eq!(
+        host.lifecycle_request().unwrap(),
+        Some(ExtLifecycleRequest::Restart {
+            package: b"game.mrp".to_vec(),
+            entry: b"start.mr".to_vec(),
+        })
+    );
+    host.acknowledge_lifecycle_request().unwrap();
+    assert_eq!(host.lifecycle_request().unwrap(), None);
+}
+
 struct TestDisplay;
 
 impl PlatformDisplay for TestDisplay {
