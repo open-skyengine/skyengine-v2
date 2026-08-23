@@ -122,6 +122,60 @@ fn thumb_arithmetic_and_conditional_branch_follow_pipeline_pc() {
 }
 
 #[test]
+fn thumb_semihosting_character_write_validates_its_input() {
+    let mut memory = thumb_code_memory(&[0xdfab, 0xdfab, 0xdf00]);
+    memory
+        .map(
+            GuestAddr(0x2000),
+            1,
+            Permissions::READ_WRITE,
+            "semihosting character",
+        )
+        .unwrap();
+    memory.write_u8(GuestAddr(0x2000), b'x').unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_pc(0x1001);
+    cpu.set_register(0, 3);
+    cpu.set_register(1, 0x2000);
+
+    cpu.step(&mut memory).unwrap();
+    assert_eq!(cpu.pc(), GuestAddr(0x1002));
+
+    cpu.set_register(1, 0);
+    assert!(matches!(cpu.step(&mut memory), Err(Error::ArmFault(_))));
+
+    cpu.set_pc(0x1005);
+    cpu.set_register(1, 0x2000);
+    assert!(
+        matches!(cpu.step(&mut memory), Err(Error::ArmFault(message)) if message.contains("unsupported Thumb-1 instruction"))
+    );
+}
+
+#[test]
+fn arm_semihosting_exit_is_reported_and_other_forms_still_fault() {
+    let mut memory = code_memory(&[0xef12_3456, 0xef12_3455, 0xef12_3456]);
+    let mut cpu = ArmCpu::new();
+    cpu.set_pc(0x1000);
+    cpu.set_register(0, 0x18);
+    cpu.set_register(1, 0x0002_0026);
+
+    cpu.step(&mut memory).unwrap();
+    assert_eq!(cpu.take_semihosting_exit_reason(), Some(0x0002_0026));
+    assert_eq!(cpu.take_semihosting_exit_reason(), None);
+
+    assert!(matches!(
+        cpu.step(&mut memory),
+        Err(Error::ArmFault(message)) if message.contains("unsupported A32 instruction")
+    ));
+
+    cpu.set_register(0, 0x17);
+    assert!(matches!(
+        cpu.step(&mut memory),
+        Err(Error::ArmFault(message)) if message.contains("unsupported A32 instruction")
+    ));
+}
+
+#[test]
 fn thumb_ldmia_preserves_a_loaded_base_register() {
     let mut memory = thumb_code_memory(&[
         0xca07, // ldmia r2!, {r0, r1, r2}

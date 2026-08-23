@@ -67,6 +67,8 @@ describe("geyaxz", () => {
         const screen = await engine.screen('game')
         // rgb(96, 84, 144)
         expect(screen.pixel(32, 229)).toEqual([96, 84, 144])
+        // 棋盘左软键区域；关卡选择页不会出现该颜色。
+        expect(screen.pixel(69, 239)).toEqual([16, 140, 128])
       }, {
         timeout: 10_000,
         interval: 1_000
@@ -90,18 +92,17 @@ describe("geyaxz", () => {
       await engine.delay(500)
       await engine.key('LEFT_SOFT', 1_000)
       await engine.delay(500)
-      for (let i=0; i<99; i++) {
-        await engine.key('ENTER', 1_000)
-        await engine.delay(500)
+      // 前置两次 ENTER 已消耗两步；精确提交剩余 98 步，再等待零步数结算。
+      for (let i=0; i<98; i++) {
+        await engine.key('ENTER', { holdMs: 80, waitForDraw: false })
       }
       await vi.waitFor(async () => {
         if (!engine) throw new Error('skyengine not defined')
-        const screen = await engine.screen('failed-menu')
-        // rgb(192, 216, 208)
+        const screen = await engine.screen('failed-menu-progress')
         expect(screen.pixel(69, 239)).toEqual([192, 216, 208])
       }, {
-        timeout: 30_000,
-        interval: 1_000
+        timeout: 10_000,
+        interval: 250
       })
       await engine.key('DOWN', 1_000)
       await engine.delay(500)

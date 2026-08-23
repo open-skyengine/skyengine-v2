@@ -15,8 +15,9 @@ use std::{
 use skyengine_core::{DisplayEvent, Error, Framebuffer, PlatformDisplay, Result};
 
 const FRAME_HISTORY_LIMIT: usize = 128;
-const DEFAULT_KEY_HOLD_MS: u64 = 80;
+const DEFAULT_KEY_HOLD_MS: u64 = 250;
 const DEFAULT_POINTER_HOLD_MS: u64 = 80;
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct CapturedFrame {
@@ -30,6 +31,7 @@ struct CaptureData {
     draw_count: u64,
     latest: Option<CapturedFrame>,
     history: VecDeque<(u64, CapturedFrame)>,
+    clipboard: String,
     exited: bool,
 }
 
@@ -60,6 +62,7 @@ pub(crate) struct E2eDisplay {
     queued_events: VecDeque<DisplayEvent>,
     key_releases: Vec<(Instant, i32)>,
     pointer_releases: Vec<(Instant, i32, i32)>,
+    yield_after_release: bool,
 }
 
 impl E2eDisplay {
@@ -94,6 +97,7 @@ impl E2eDisplay {
             queued_events: VecDeque::new(),
             key_releases: Vec::new(),
             pointer_releases: Vec::new(),
+            yield_after_release: false,
         })
     }
 
@@ -162,7 +166,18 @@ impl PlatformDisplay for E2eDisplay {
     fn poll_event(&mut self) -> Result<Option<DisplayEvent>> {
         self.queue_due_releases();
         if let Some(event) = self.queued_events.pop_front() {
+            self.yield_after_release = true;
             return Ok(Some(event));
+        }
+        if self.yield_after_release {
+            self.yield_after_release = false;
+            return Ok(None);
+        }
+        // KEY and CLICK model complete high-level input strokes. Keep a command
+        // queued until the previous stroke's release has reached the runtime;
+        // callers that need a long press can still select its hold duration.
+        if !self.key_releases.is_empty() || !self.pointer_releases.is_empty() {
+            return Ok(None);
         }
         match self.commands.try_recv() {
             Ok(ControlMessage::Event(event)) => Ok(Some(event)),
@@ -238,7 +253,9 @@ fn serve(listener: UnixListener, state: Arc<CaptureState>, sender: Sender<Contro
             continue;
         };
         let response = read_command(&mut stream)
-            .and_then(|command| handle_command(command.trim(), &state, &sender))
+            .and_then(|command| {
+                handle_command(command.trim_end_matches(['\r', '\n']), &state, &sender)
+            })
             .unwrap_or_else(|error| format!("ERR {}", one_line(&error)));
         let _ = writeln!(stream, "{response}");
     }
@@ -260,6 +277,32 @@ fn handle_command(
     state: &CaptureState,
     sender: &Sender<ControlMessage>,
 ) -> std::result::Result<String, String> {
+    if command == "SET_CLIPBOARD" || command.starts_with("SET_CLIPBOARD ") {
+        let text = command.strip_prefix("SET_CLIPBOARD").unwrap();
+        let text = text.strip_prefix(' ').unwrap_or(text);
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            return Err("clipboard_too_large".into());
+        }
+        let mut data = state
+            .data
+            .lock()
+            .map_err(|_| "capture_state_poisoned".to_string())?;
+        data.clipboard.clear();
+        data.clipboard.push_str(text);
+        return Ok("OK clipboard".into());
+    }
+    if command == "PASTE_SHORTCUT" {
+        let text = state
+            .data
+            .lock()
+            .map_err(|_| "capture_state_poisoned".to_string())?
+            .clipboard
+            .clone();
+        sender
+            .send(ControlMessage::Event(DisplayEvent::TextInput { text }))
+            .map_err(|_| "runtime_exited".to_string())?;
+        return Ok("OK paste".into());
+    }
     if command == "DRAW_COUNT" {
         let data = state
             .data

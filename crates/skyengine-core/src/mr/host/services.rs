@@ -18,12 +18,13 @@ pub(super) struct PackageServices<'a> {
 
 impl PackageServices<'_> {
     fn file_path(&self, name: &[u8]) -> Option<PathBuf> {
-        native_file_path(
+        let path = native_file_path(
             &self.work_dir,
             self.package.path(),
             &self.package.header().internal_name,
             name,
-        )
+        )?;
+        resolve_native_work_path(&self.work_dir, &path)
     }
 
     fn is_root_package(&self, package_name: &[u8]) -> bool {
@@ -37,27 +38,191 @@ impl PackageServices<'_> {
     }
 
     fn read_current_package_file(&self, name: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.package.read_named(name) {
+        read_current_package_entry(&self.package, name)
+    }
+}
+
+pub(super) fn read_current_package_entry(
+    package: &Package,
+    name: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    match package.read_named(name) {
+        Ok(bytes) => return Ok(Some(bytes)),
+        Err(crate::Error::EntryNotFound(_)) => {}
+        Err(error) => return Err(error),
+    }
+    let Some(entry_name) = package_entry_path(&package.header().internal_name, name) else {
+        return Ok(None);
+    };
+    if entry_name != name {
+        match package.read_named(&entry_name) {
             Ok(bytes) => return Ok(Some(bytes)),
             Err(crate::Error::EntryNotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        let Some(entry_name) = package_entry_path(&self.package.header().internal_name, name)
-        else {
-            return Ok(None);
-        };
-        if entry_name == name {
-            return Ok(None);
+    }
+    let Some(entry_name) = unique_logical_package_entry_name(package, &entry_name) else {
+        return Ok(None);
+    };
+    if !is_jpeg_entry_name(entry_name) {
+        return Ok(None);
+    }
+    decode_jpeg_resource(package, entry_name, package.read_named(entry_name)?).map(Some)
+}
+
+fn is_jpeg_entry_name(name: &[u8]) -> bool {
+    name.rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .and_then(|name| name.rsplit(|byte| *byte == b'.').next())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case(b"jpg") || extension.eq_ignore_ascii_case(b"jpeg")
+        })
+}
+
+fn decode_jpeg_resource(package: &Package, name: &[u8], bytes: Vec<u8>) -> Result<Vec<u8>> {
+    use jpeg_decoder::{Decoder, PixelFormat};
+
+    let mut decoder = Decoder::new(Cursor::new(bytes));
+    decoder.read_info().map_err(|error| {
+        crate::Error::Package(format!(
+            "invalid JPEG resource {}: {error}",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    let info = decoder.info().ok_or_else(|| {
+        crate::Error::Package(format!(
+            "JPEG resource {} has no image metadata",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    let pixel_count = usize::from(info.width)
+        .checked_mul(usize::from(info.height))
+        .ok_or_else(|| crate::Error::ResourceLimit("JPEG resource dimensions overflow".into()))?;
+    let output_len = pixel_count.checked_mul(2).ok_or_else(|| {
+        crate::Error::ResourceLimit("decoded JPEG resource size overflows".into())
+    })?;
+    let max = package.limits().max_expanded_file_len;
+    if output_len > max {
+        return Err(crate::Error::ResourceLimit(format!(
+            "decoded JPEG resource {} is {output_len} bytes (limit {max})",
+            String::from_utf8_lossy(name)
+        )));
+    }
+    let source_pixel_len = match info.pixel_format {
+        PixelFormat::RGB24 => 3,
+        PixelFormat::L8 => 1,
+        PixelFormat::L16 | PixelFormat::CMYK32 => {
+            return Err(crate::Error::Package(format!(
+                "unsupported JPEG pixel format {:?} for resource {}",
+                info.pixel_format,
+                String::from_utf8_lossy(name)
+            )));
         }
-        match self.package.read_named(&entry_name) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(crate::Error::EntryNotFound(_)) => Ok(None),
-            Err(error) => Err(error),
+    };
+    let decoded_len = pixel_count
+        .checked_mul(source_pixel_len)
+        .ok_or_else(|| crate::Error::ResourceLimit("JPEG decoding buffer size overflows".into()))?;
+    if decoded_len > max {
+        return Err(crate::Error::ResourceLimit(format!(
+            "decoded JPEG source {} is {decoded_len} bytes (limit {max})",
+            String::from_utf8_lossy(name)
+        )));
+    }
+    decoder.set_max_decoding_buffer_size(max);
+    let mut pixels = decoder.decode().map_err(|error| {
+        crate::Error::Package(format!(
+            "failed to decode JPEG resource {}: {error}",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    if pixels.len() != decoded_len {
+        return Err(crate::Error::Package(format!(
+            "decoded JPEG resource {} produced {} source bytes, expected {decoded_len}",
+            String::from_utf8_lossy(name),
+            pixels.len()
+        )));
+    }
+    match info.pixel_format {
+        PixelFormat::RGB24 => {
+            for index in 0..pixel_count {
+                let source = index * 3;
+                let destination = index * 2;
+                let color =
+                    rgb888_to_rgb565(pixels[source], pixels[source + 1], pixels[source + 2]);
+                pixels[destination..destination + 2].copy_from_slice(&color.to_le_bytes());
+            }
+            pixels.truncate(output_len);
+        }
+        PixelFormat::L8 => {
+            pixels.resize(output_len, 0);
+            for index in (0..pixel_count).rev() {
+                let luminance = pixels[index];
+                let color = rgb888_to_rgb565(luminance, luminance, luminance);
+                let destination = index * 2;
+                pixels[destination..destination + 2].copy_from_slice(&color.to_le_bytes());
+            }
+        }
+        PixelFormat::L16 | PixelFormat::CMYK32 => unreachable!(),
+    }
+    if pixels.len() != output_len {
+        return Err(crate::Error::Package(format!(
+            "decoded JPEG resource {} produced {} bytes, expected {output_len}",
+            String::from_utf8_lossy(name),
+            pixels.len()
+        )));
+    }
+    Ok(pixels)
+}
+
+fn rgb888_to_rgb565(red: u8, green: u8, blue: u8) -> u16 {
+    (u16::from(red >> 3) << 11) | (u16::from(green >> 2) << 5) | u16::from(blue >> 3)
+}
+
+fn unique_logical_package_entry_name<'a>(
+    package: &'a Package,
+    requested: &[u8],
+) -> Option<&'a [u8]> {
+    let basename = requested
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()?;
+    if basename.is_empty() || basename.contains(&b'.') {
+        return None;
+    }
+    let mut selected = None;
+    for entry in package.entries() {
+        let Some(suffix) = entry
+            .name
+            .strip_prefix(requested)
+            .and_then(|suffix| suffix.strip_prefix(b"."))
+        else {
+            continue;
+        };
+        if suffix.is_empty() || suffix.iter().any(|byte| matches!(byte, b'/' | b'\\')) {
+            continue;
+        }
+        match selected {
+            None => selected = Some(entry.name.as_slice()),
+            Some(name) if name == entry.name => {}
+            Some(_) => return None,
         }
     }
+    selected
 }
 
 impl NativeServices for PackageServices<'_> {
+    fn resize_screen(&mut self, width: u16, height: u16) -> Result<()> {
+        self.framebuffer.resize(width, height)?;
+        self.display.resize(width, height)
+    }
+
+    fn capture_framebuffer(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut bytes = Vec::with_capacity(self.framebuffer.pixels().len().saturating_mul(2));
+        for pixel in self.framebuffer.pixels() {
+            bytes.extend_from_slice(&pixel.to_le_bytes());
+        }
+        Ok(Some(bytes))
+    }
+
     fn read_package_file(&mut self, package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>> {
         let nested_package;
         let package = if self.is_root_package(package_name) {
@@ -157,11 +322,24 @@ impl NativeServices for PackageServices<'_> {
                 return Ok(-1);
             }
         }
-        let host_file = OpenOptions::new()
+        let mut host_file = OpenOptions::new()
             .read(read)
             .write(write)
-            .create(mode & 8 != 0)
-            .open(path);
+            .create(mode & 8 != 0 && write)
+            .open(&path);
+        if host_file
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            && mode & 8 != 0
+            && !write
+        {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => drop(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Ok(-1),
+            }
+            host_file = OpenOptions::new().read(read).write(write).open(&path);
+        }
         let file = match host_file {
             Ok(file) => NativeFile::Host(file),
             Err(_) if read && !write && mode & 8 == 0 => {
@@ -224,19 +402,19 @@ impl NativeServices for PackageServices<'_> {
         }
     }
 
-    fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<bool> {
+    fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<Option<u64>> {
         let Some(file) = self.files.get_mut(&handle) else {
-            return Ok(false);
+            return Ok(None);
         };
         let position = match origin {
             0 => SeekFrom::Start(offset as u32 as u64),
             1 => SeekFrom::Current(i64::from(offset)),
             2 => SeekFrom::End(i64::from(offset)),
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         Ok(match file {
-            NativeFile::Host(file) => file.seek(position).is_ok(),
-            NativeFile::Package(file) => file.seek(position).is_ok(),
+            NativeFile::Host(file) => file.seek(position).ok(),
+            NativeFile::Package(file) => file.seek(position).ok(),
         })
     }
 

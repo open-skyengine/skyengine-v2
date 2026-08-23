@@ -1,13 +1,18 @@
 use crate::{Error, Result};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisplayEvent {
     Quit,
     Key { code: i32, pressed: bool },
     Pointer { x: i32, y: i32, pressed: bool },
+    TextInput { text: String },
 }
 
 pub trait PlatformDisplay {
+    fn resize(&mut self, _width: u16, _height: u16) -> Result<()> {
+        Ok(())
+    }
+
     fn present(&mut self, framebuffer: &Framebuffer) -> Result<()>;
     fn poll_event(&mut self) -> Result<Option<DisplayEvent>>;
     fn wait_timeout(&mut self, milliseconds: u32);
@@ -43,6 +48,19 @@ impl Framebuffer {
 
     pub fn height(&self) -> u16 {
         self.height
+    }
+
+    pub fn resize(&mut self, width: u16, height: u16) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Err(Error::Config("screen dimensions must be non-zero".into()));
+        }
+        let len = usize::from(width)
+            .checked_mul(usize::from(height))
+            .ok_or_else(|| Error::Config("screen dimensions overflow".into()))?;
+        self.width = width;
+        self.height = height;
+        self.pixels = vec![0; len];
+        Ok(())
     }
 
     pub fn pixels(&self) -> &[u16] {
@@ -110,5 +128,23 @@ impl Framebuffer {
         let green = green.clamp(0, 255) as u16;
         let blue = blue.clamp(0, 255) as u16;
         ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resizing_clears_pixels_without_resetting_draw_count() {
+        let mut framebuffer = Framebuffer::new(2, 3).unwrap();
+        framebuffer.clear(0xffff);
+        framebuffer.mark_presented();
+
+        framebuffer.resize(3, 2).unwrap();
+
+        assert_eq!((framebuffer.width(), framebuffer.height()), (3, 2));
+        assert_eq!(framebuffer.pixels(), &[0; 6]);
+        assert_eq!(framebuffer.draw_count(), 1);
     }
 }

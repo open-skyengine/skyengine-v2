@@ -57,8 +57,16 @@ describe("gtlbd", () => {
       workDir: ws.dir,
     });
 
-    // 启动已在进入事件循环前完成首帧绘制；只截一次，避免控制请求改变 timer 竞态。
-    const initialPrompt = await engine.screen("initial-prompt");
+    // E2E IPC is available before the application's timer-driven first screen
+    // is complete, so wait for the original visual contract rather than an
+    // intermediate draw.
+    const initialPrompt = await engine.waitForScreen(
+      screen => {
+        const count = promptGlyphPixelCount(screen);
+        return count > 200 && count < 500;
+      },
+      { name: "initial-prompt", timeoutMs: 10_000, intervalMs: 100 },
+    );
     expect(promptGlyphPixelCount(initialPrompt)).toBeGreaterThan(200);
     expect(promptGlyphPixelCount(initialPrompt)).toBeLessThan(500);
 

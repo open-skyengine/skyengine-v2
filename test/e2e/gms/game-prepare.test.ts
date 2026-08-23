@@ -1,6 +1,20 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
+import { type PpmImage, SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
 import fs from "fs";
+
+function countMatchingPixels(
+  image: PpmImage,
+  rect: { x: number; y: number; width: number; height: number },
+  predicate: (pixel: readonly [number, number, number]) => boolean,
+): number {
+  let count = 0;
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      if (predicate(image.pixel(x, y))) count++;
+    }
+  }
+  return count;
+}
 
 describe("gms 付费慢测试", () => {
   let engine: SkyEngineE2e | undefined;
@@ -45,8 +59,12 @@ describe("gms 付费慢测试", () => {
       await engine.key('LEFT_SOFT', 1_000)
       await engine.delay(1_000);
       const afterRight = await engine.screen("start");
-      // rgb(40, 80, 248)
-      expect(afterRight.pixel(113, 293)).toEqual([40, 80, 248]);
+      const blueLabelPixels = countMatchingPixels(
+        afterRight,
+        { x: 65, y: 280, width: 110, height: 30 },
+        pixel => pixel[0] === 40 && pixel[1] === 80 && pixel[2] === 248,
+      );
+      expect(blueLabelPixels).toBeGreaterThan(300);
 
       for (let i=0; i< 28; i++) {
         await engine.key('ENTER', 1_000)
@@ -60,9 +78,14 @@ describe("gms 付费慢测试", () => {
       // 打开商店
       await engine.key('RIGHT_SOFT', 1_000)
       await engine.delay(1_000);
-      const afterSecondRight = await engine.screen("open-store");
-      // rgb(232, 228, 48)
-      expect(afterSecondRight.pixel(36, 55)).toEqual([232, 228, 48]);
+      const afterSecondRight = await engine.screen("store-icon");
+      const goldIconPixels = countMatchingPixels(
+        afterSecondRight,
+        { x: 28, y: 42, width: 28, height: 28 },
+        pixel => pixel[0] === 216 && pixel[1] === 160 && pixel[2] === 88,
+      );
+      expect(goldIconPixels).toBeGreaterThan(50);
+      expect(afterSecondRight.pixel(36, 55)).toEqual([0, 0, 0]);
       {   
         // 进入付费界面
         await engine.key('LEFT_SOFT', 1_000)

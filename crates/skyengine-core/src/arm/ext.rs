@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::PathBuf,
@@ -10,7 +10,10 @@ use std::{
 
 use flate2::read::GzDecoder;
 
-use crate::{DeviceDate, DnsMapping, Error, Framebuffer, Package, ResourceLimits, Result};
+use crate::{
+    DeviceDate, DnsMapping, Error, Framebuffer, Package, ResourceLimits, Result, VIRTUAL_IMEI,
+    VIRTUAL_IMSI,
+};
 
 use super::{ArmCpu, GuestAddr, GuestMemory, Permissions};
 mod dispatch;
@@ -24,6 +27,15 @@ mod ram_package;
 
 const PLATFORM_TABLE: GuestAddr = GuestAddr(0x0100_0000);
 const PLATFORM_DATA: GuestAddr = GuestAddr(0x0100_1000);
+const PLATFORM_RESOURCE_BACKING_LEN: usize = 0x1000;
+const BITMAP_ARRAY_DATA: GuestAddr = GuestAddr(0x0100_2000);
+const TILE_ARRAY_DATA: GuestAddr = GuestAddr(0x0100_4000);
+const MAP_ARRAY_DATA: GuestAddr = GuestAddr(0x0100_6000);
+const SOUND_ARRAY_DATA: GuestAddr = GuestAddr(0x0100_8000);
+const SPRITE_ARRAY_DATA: GuestAddr = GuestAddr(0x0100_a000);
+const SMS_CONFIG_DATA: GuestAddr = GuestAddr(0x0100_c000);
+const START_FILE_PARAMETER_DATA: GuestAddr = GuestAddr(0x0100_d000);
+pub(crate) const START_FILE_PARAMETER_LEN: usize = 128;
 const PACKAGE_NAME_DATA: GuestAddr = GuestAddr(0x0100_1400);
 const START_NAME_DATA: GuestAddr = GuestAddr(0x0100_1500);
 const PREVIOUS_PACKAGE_NAME_DATA: GuestAddr = GuestAddr(0x0100_1600);
@@ -33,6 +45,8 @@ const INTERNAL_TABLE_DATA: GuestAddr = GuestAddr(0x0100_1900);
 const APPLICATION_STATE_DATA: GuestAddr = GuestAddr(0x0100_1980);
 const LIFECYCLE_CALLBACK_DATA: GuestAddr = GuestAddr(0x0100_1984);
 const TIMER_ACTIVE_DATA: GuestAddr = GuestAddr(0x0100_1988);
+const APPLICATION_STATE_NORMAL: u32 = 1;
+const APPLICATION_STATE_RESTART_PENDING: u32 = 3;
 const PLATFORM_SIM_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a00);
 const PLATFORM_SIM_INFO_LEN: usize = 12;
 const PLATFORM_STORAGE_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a10);
@@ -40,13 +54,20 @@ const PLATFORM_STORAGE_INFO_LEN: usize = 16;
 const PLATFORM_STORAGE_DRIVE_DATA: GuestAddr = GuestAddr(0x0100_1a20);
 const PLATFORM_STORAGE_DRIVE: &[u8] = b"C:/mythroad/";
 const PLATFORM_STORAGE_DRIVE_LEN: usize = PLATFORM_STORAGE_DRIVE.len();
+const PLATFORM_JPEG_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a30);
+const PLATFORM_JPEG_INFO_LEN: usize = 8;
+const FIRMWARE_SLOT_DATA: GuestAddr = GuestAddr(0x0100_1b00);
+const FIRMWARE_SLOT_COUNT: u32 = 26;
+const PLATFORM_RUNTIME_PROFILE_DATA: GuestAddr = GuestAddr(0x0100_1b80);
+const PLATFORM_RUNTIME_PROFILE_LEN: usize = 12;
 const PLATFORM_USER_INFO_LEN: usize = 64;
 // Common MTK EXT fixtures identify the 1.0.4 runtime through this encoded version.
 const PLATFORM_USER_INFO_VERSION: u32 = 101_040_000;
 const MTK_NATIVE_EXTENSION_BASE: GuestAddr = GuestAddr(0x4001_8800);
 const MTK_NATIVE_EXTENSION_LEN: usize = MODULE_STRIDE as usize;
 const PLATFORM_STORAGE_BLOCK_SIZE: u32 = 4 * 1024;
-const PLATFORM_STORAGE_AVAILABLE_BLOCKS: u32 = 4 * 1024;
+const PLATFORM_STORAGE_AVAILABLE_BLOCKS: u32 = 32 * 1024;
+const PLATFORM_STORAGE_TOTAL_BLOCKS: u32 = PLATFORM_STORAGE_AVAILABLE_BLOCKS * 2;
 const INTERNAL_APPLICATION_STATE_OFFSETS: [u32; 2] = [8, 44];
 const MODULE_BASE: u32 = 0x1000_0000;
 const MODULE_STRIDE: u32 = 0x0010_0000;
@@ -69,9 +90,20 @@ const PLATFORM_SLOT_COUNT: u32 = 150;
 const INSTRUCTION_BUDGET: u64 = 200_000_000;
 const MD5_BUFFER_OFFSET: u32 = 24;
 const MAX_NATIVE_SOCKETS: usize = 64;
+const MAX_PLATFORM_UI_HANDLES: usize = 64;
+const MAX_PLATFORM_MENU_ITEMS: usize = 1024;
+const MAX_PLATFORM_EDITOR_CODE_UNITS: usize = 4096;
+const MAX_PENDING_PLATFORM_MENU_RETURNS: usize = 1024;
+const MAX_GUEST_ALLOCATION_VIEWS: usize = 256;
 const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_PENDING_EXTERNAL_ACTIONS: usize = 32;
+const LEGACY_EXTERNAL_ACTION_KINDS: [u32; 1] = [2];
 
 pub(crate) trait NativeServices {
+    fn resize_screen(&mut self, width: u16, height: u16) -> Result<()>;
+    fn capture_framebuffer(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
     fn read_package_file(&mut self, package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>>;
     fn file_info(&mut self, name: &[u8]) -> Result<i32>;
     fn remove_file(&mut self, name: &[u8]) -> Result<i32>;
@@ -82,7 +114,7 @@ pub(crate) trait NativeServices {
     fn close_file(&mut self, handle: i32) -> Result<i32>;
     fn write_file(&mut self, handle: i32, bytes: &[u8]) -> Result<Option<usize>>;
     fn read_file(&mut self, handle: i32, len: usize) -> Result<Option<Vec<u8>>>;
-    fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<bool>;
+    fn seek_file(&mut self, handle: i32, offset: i32, origin: u32) -> Result<Option<u64>>;
     fn file_len(&mut self, name: &[u8]) -> Result<Option<u64>>;
     fn find_start(&mut self, directory: &[u8]) -> Result<Option<(i32, Vec<u8>)>>;
     fn find_next(&mut self, handle: i32) -> Result<Option<Vec<u8>>>;
@@ -105,9 +137,9 @@ pub(crate) enum ExtLifecycleRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DeviceInfoProfile {
-    Unavailable,
-    DeterministicMtk,
+pub(crate) enum NativeExtensionProfile {
+    Baseline,
+    Mtk,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,16 +154,228 @@ struct ExtLifecycleState {
 struct GuestFunction {
     module: usize,
     address: u32,
+    expected_image: Option<ExecutableImage>,
+    captured_r9: Option<u32>,
+}
+
+#[derive(Debug)]
+struct GuestExecution {
+    function: GuestFunction,
+    cpu: ArmCpu,
+    entered_guest_call: Option<bool>,
+    instruction_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutableImage {
+    Static,
+    Dynamic(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableRange {
+    base: GuestAddr,
+    len: usize,
+}
+
+impl ExecutableRange {
+    fn end(self) -> Option<u32> {
+        u32::try_from(self.len)
+            .ok()
+            .and_then(|len| self.base.0.checked_add(len))
+    }
+
+    fn contains(self, address: u32, len: usize) -> bool {
+        let Some(range_end) = self.end() else {
+            return false;
+        };
+        let Some(request_len) = u32::try_from(len).ok() else {
+            return false;
+        };
+        let Some(request_end) = address.checked_add(request_len) else {
+            return false;
+        };
+        address >= self.base.0 && request_end <= range_end
+    }
+
+    fn contains_range(self, other: Self) -> bool {
+        let (Some(end), Some(other_end)) = (self.end(), other.end()) else {
+            return false;
+        };
+        other.base.0 >= self.base.0 && other_end <= end
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        let (Some(end), Some(other_end)) = (self.end(), other.end()) else {
+            return true;
+        };
+        self.base.0 < other_end && other.base.0 < end
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let (Some(end), Some(other_end)) = (self.end(), other.end()) else {
+            return None;
+        };
+        let base = self.base.0.max(other.base.0);
+        let end = end.min(other_end);
+        (base < end).then(|| Self {
+            base: GuestAddr(base),
+            len: (end - base) as usize,
+        })
+    }
+
+    fn subtract(self, removed: Self) -> Vec<Self> {
+        let Some(overlap) = self.intersection(removed) else {
+            return vec![self];
+        };
+        let end = self
+            .end()
+            .expect("tracked executable ranges have validated bounds");
+        let overlap_end = overlap
+            .end()
+            .expect("executable intersections have validated bounds");
+        let mut retained = Vec::with_capacity(2);
+        if self.base.0 < overlap.base.0 {
+            retained.push(Self {
+                base: self.base,
+                len: (overlap.base.0 - self.base.0) as usize,
+            });
+        }
+        if overlap_end < end {
+            retained.push(Self {
+                base: GuestAddr(overlap_end),
+                len: (end - overlap_end) as usize,
+            });
+        }
+        retained
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DynamicExecutableImage {
+    id: u64,
+    intervals: Vec<ExecutableRange>,
+}
+
+// Keep existing single-range state assertions readable while dynamic images can
+// retain multiple disjoint executable intervals after a partial overwrite.
+impl PartialEq<ExecutableRange> for DynamicExecutableImage {
+    fn eq(&self, other: &ExecutableRange) -> bool {
+        self.intervals.as_slice() == [*other]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DynamicExecutableImageSlot(Option<DynamicExecutableImage>);
+
+impl DynamicExecutableImageSlot {
+    fn as_ref(&self) -> Option<&DynamicExecutableImage> {
+        self.0.as_ref()
+    }
+
+    fn as_mut(&mut self) -> Option<&mut DynamicExecutableImage> {
+        self.0.as_mut()
+    }
+
+    fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl PartialEq<Option<ExecutableRange>> for DynamicExecutableImageSlot {
+    fn eq(&self, other: &Option<ExecutableRange>) -> bool {
+        match (self.as_ref(), other) {
+            (Some(image), Some(range)) => image == range,
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ModuleContext {
+    generation: u64,
     base: GuestAddr,
     len: usize,
     loader_context: GuestAddr,
     helper: Option<GuestFunction>,
     helper_parameter: GuestAddr,
     static_base_r9: u32,
+    dynamic_executable_ranges: Vec<DynamicExecutableImageSlot>,
+    next_dynamic_executable_image_id: u64,
+}
+
+impl ModuleContext {
+    fn image_range(&self) -> ExecutableRange {
+        ExecutableRange {
+            base: self.base,
+            len: self.len,
+        }
+    }
+
+    fn executable_image(&self, function: u32) -> Option<(ExecutableImage, u32)> {
+        if function & 1 == 0 && function & 3 != 0 {
+            return None;
+        }
+        let address = function & !1;
+        let instruction_len = if function & 1 == 0 { 4 } else { 2 };
+        if self.image_range().contains(address, instruction_len) {
+            return Some((ExecutableImage::Static, address - self.base.0));
+        }
+        self.dynamic_executable_ranges
+            .iter()
+            .filter_map(DynamicExecutableImageSlot::as_ref)
+            .find_map(|image| {
+                image.intervals.iter().find_map(|range| {
+                    range
+                        .contains(address, instruction_len)
+                        .then(|| (ExecutableImage::Dynamic(image.id), address - range.base.0))
+                })
+            })
+    }
+}
+
+fn merge_executable_intervals(mut intervals: Vec<ExecutableRange>) -> Vec<ExecutableRange> {
+    intervals.sort_unstable_by_key(|range| range.base.0);
+    let mut merged: Vec<ExecutableRange> = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        if let Some(previous) = merged.last_mut() {
+            let previous_end = previous
+                .end()
+                .expect("tracked executable ranges have validated bounds");
+            let interval_end = interval
+                .end()
+                .expect("tracked executable ranges have validated bounds");
+            if interval.base.0 <= previous_end {
+                previous.len = previous_end.max(interval_end) as usize - previous.base.0 as usize;
+                continue;
+            }
+        }
+        merged.push(interval);
+    }
+    merged
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlatformMemoryExtension {
+    len: usize,
+    previous_cursor: u32,
+    owner_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingExternalActionCompletion {
+    owner_generation: u64,
+    callback: GuestFunction,
+    callback_data: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ModuleLoadSnapshot {
+    active_helper: Option<GuestFunction>,
+    detached_guest_allocation_cursor: u32,
+    platform_memory_cursor: u32,
+    mtk_native_extension_owner: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,6 +391,58 @@ struct PlatformDialog {
     dialog_screen: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct PlatformTextViewer {
+    previous_screen: Vec<u8>,
+    viewer_screen: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PlatformEditor {
+    owner_generation: u64,
+    _title: Vec<u16>,
+    _editor_type: u32,
+    max_code_units: usize,
+    text: Vec<u16>,
+    buffer: GuestAddr,
+    buffer_len: usize,
+}
+
+#[derive(Debug)]
+struct PlatformMenu {
+    title: Vec<u16>,
+    items: Vec<Option<Vec<u16>>>,
+    focused_item: usize,
+    first_visible_item: usize,
+    previous_screen: Option<Vec<u8>>,
+    menu_screen: Option<Vec<u8>>,
+    modal_detached: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivePlatformUi {
+    Menu(u32),
+    Dialog(u32),
+    TextViewer(u32),
+    Editor(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlatformPointerAction {
+    None,
+    MenuSelect(usize),
+    MenuReturn,
+    DialogAccept,
+    DialogCancel,
+    TextViewerReturn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlatformPointerCapture {
+    ui: ActivePlatformUi,
+    action: PlatformPointerAction,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BitmapDescriptor {
     pixels: GuestAddr,
@@ -154,6 +450,14 @@ struct BitmapDescriptor {
     height: usize,
     x: i32,
     y: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BitmapDrawMode {
+    Or,
+    Copy,
+    Transparent(u16),
+    Gray(u16),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -191,6 +495,20 @@ struct GuestHeapSnapshot {
     terminator: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestAllocationView {
+    len: u32,
+    backing_base: u32,
+    owner_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NestedGuestHeap {
+    owner_generation: u64,
+    heap_base: u32,
+    heap_span: u32,
+}
+
 #[derive(Debug)]
 enum NativeSocketState {
     Created,
@@ -202,36 +520,69 @@ enum NativeSocketState {
 #[derive(Debug)]
 struct NativeSocket {
     state: NativeSocketState,
+    endpoint: Option<SocketAddrV4>,
+    pending_http_request: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ExtRuntime {
     memory: GuestMemory,
     modules: Vec<ModuleContext>,
+    next_module_generation: u64,
     active_helper: Option<GuestFunction>,
     heap_len: usize,
     guest_allocations: BTreeMap<u32, u32>,
+    guest_allocation_owners: BTreeMap<u32, u64>,
+    guest_allocation_views: BTreeMap<u32, GuestAllocationView>,
+    nested_guest_heaps: BTreeMap<u32, NestedGuestHeap>,
     guest_heap_snapshot: Option<GuestHeapSnapshot>,
     detached_guest_allocations: BTreeMap<u32, (usize, u32)>,
+    detached_guest_allocation_owners: BTreeMap<u32, u64>,
     detached_guest_allocation_cursor: u32,
     dns_mappings: Arc<[DnsMapping]>,
+    pending_external_action_completions: VecDeque<PendingExternalActionCompletion>,
     device_date: DeviceDate,
-    platform_memory_extensions: BTreeMap<u32, (usize, u32)>,
+    platform_memory_extensions: BTreeMap<u32, PlatformMemoryExtension>,
     platform_memory_cursor: u32,
+    mtk_native_extension_owner: Option<u64>,
     random_state: u32,
     glyphs: BTreeMap<(u32, u32), GuestGlyph>,
     dialogs: BTreeMap<u32, PlatformDialog>,
+    text_viewers: BTreeMap<u32, PlatformTextViewer>,
+    editors: BTreeMap<u32, PlatformEditor>,
+    menus: BTreeMap<u32, PlatformMenu>,
+    native_windows: BTreeMap<u32, u64>,
+    active_platform_ui: Vec<ActivePlatformUi>,
+    pending_platform_menu_selection: Option<u32>,
+    pending_platform_menu_returns: usize,
     next_ui_handle: u32,
     suppressed_ui_key_releases: BTreeSet<i32>,
+    platform_pointer_capture: Option<PlatformPointerCapture>,
     native_sockets: BTreeMap<i32, NativeSocket>,
     next_native_socket_handle: i32,
     exit_requested: bool,
-    device_info_profile: DeviceInfoProfile,
+    native_extension_profile: NativeExtensionProfile,
     clock_origin: Instant,
     timer_deadline: Option<Instant>,
 }
 
 impl ExtRuntime {
+    pub(crate) fn validate_module_image(image: &[u8]) -> Result<()> {
+        if !image.starts_with(b"MRPGCMAP") || image.len() <= 8 {
+            return Err(Error::Abi(
+                "EXT image is missing the complete MRPGCMAP marker".into(),
+            ));
+        }
+        if image.len() > MODULE_STRIDE as usize {
+            return Err(Error::ArmFault(format!(
+                "EXT image is {} bytes (module stride is {})",
+                image.len(),
+                MODULE_STRIDE
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(
         screen_width: u16,
         screen_height: u16,
@@ -261,6 +612,27 @@ impl ExtRuntime {
             Permissions::READ_WRITE,
             "platform data",
         )?;
+        for (address, name) in [
+            (BITMAP_ARRAY_DATA, "platform bitmap array"),
+            (TILE_ARRAY_DATA, "platform tile array"),
+            (MAP_ARRAY_DATA, "platform map array"),
+            (SOUND_ARRAY_DATA, "platform sound array"),
+            (SPRITE_ARRAY_DATA, "platform sprite array"),
+            (SMS_CONFIG_DATA, "platform SMS configuration"),
+        ] {
+            memory.map(
+                address,
+                PLATFORM_RESOURCE_BACKING_LEN,
+                Permissions::READ_WRITE,
+                name,
+            )?;
+        }
+        memory.map(
+            START_FILE_PARAMETER_DATA,
+            START_FILE_PARAMETER_LEN,
+            Permissions::READ_WRITE,
+            "platform start-file parameter",
+        )?;
         memory.map(
             HEAP_BASE,
             heap_len.max(MIN_GUEST_RAM_LEN),
@@ -283,7 +655,7 @@ impl ExtRuntime {
             let value = if is_function_slot(slot) {
                 TRAP_BASE + slot * 4
             } else if is_data_slot(slot) {
-                PLATFORM_DATA.0 + slot * 4
+                platform_data_slot_backing_address(slot).0
             } else {
                 0
             };
@@ -294,12 +666,15 @@ impl ExtRuntime {
         write_platform_string(&mut memory, PREVIOUS_PACKAGE_NAME_DATA, b"")?;
         write_platform_string(&mut memory, PREVIOUS_START_NAME_DATA, b"")?;
         write_platform_string(&mut memory, CURRENT_ENTRY_DATA, entry_name)?;
-        memory.write_u32(table_slot_address(100), PACKAGE_NAME_DATA.0)?;
-        memory.write_u32(table_slot_address(101), START_NAME_DATA.0)?;
-        memory.write_u32(table_slot_address(102), PREVIOUS_PACKAGE_NAME_DATA.0)?;
-        memory.write_u32(table_slot_address(103), PREVIOUS_START_NAME_DATA.0)?;
-        memory.write_u32(table_slot_address(144), CURRENT_ENTRY_DATA.0)?;
         memory.write_u32(table_slot_address(23), INTERNAL_TABLE_DATA.0)?;
+        memory.write_u32(INTERNAL_TABLE_DATA, FIRMWARE_SLOT_DATA.0)?;
+        for index in 0..FIRMWARE_SLOT_COUNT {
+            memory.write_u32(FIRMWARE_SLOT_DATA.checked_add(index * 4)?, 0)?;
+        }
+        memory.write(
+            PLATFORM_RUNTIME_PROFILE_DATA,
+            &[0; PLATFORM_RUNTIME_PROFILE_LEN],
+        )?;
         for offset in INTERNAL_APPLICATION_STATE_OFFSETS {
             memory.write_u32(
                 INTERNAL_TABLE_DATA.checked_add(offset)?,
@@ -311,7 +686,7 @@ impl ExtRuntime {
             LIFECYCLE_CALLBACK_DATA.0,
         )?;
         memory.write_u32(INTERNAL_TABLE_DATA.checked_add(20)?, TIMER_ACTIVE_DATA.0)?;
-        memory.write_u32(APPLICATION_STATE_DATA, 1)?;
+        memory.write_u32(APPLICATION_STATE_DATA, APPLICATION_STATE_NORMAL)?;
         memory.write_u32(data_slot_address(91), SCREEN_BASE.0)?;
         memory.write_u32(data_slot_address(92), u32::from(screen_width))?;
         memory.write_u32(data_slot_address(93), u32::from(screen_height))?;
@@ -338,8 +713,8 @@ impl ExtRuntime {
         memory.write_u32(HEAP_BASE.checked_add(4)?, heap_len as u32)?;
         memory.write(PLATFORM_SIM_INFO_DATA, &[0; PLATFORM_SIM_INFO_LEN])?;
         for (index, value) in [
-            PLATFORM_STORAGE_AVAILABLE_BLOCKS * 2,
-            PLATFORM_STORAGE_AVAILABLE_BLOCKS,
+            PLATFORM_STORAGE_TOTAL_BLOCKS,
+            PLATFORM_STORAGE_BLOCK_SIZE,
             PLATFORM_STORAGE_BLOCK_SIZE,
             PLATFORM_STORAGE_AVAILABLE_BLOCKS,
         ]
@@ -356,25 +731,40 @@ impl ExtRuntime {
         Ok(Self {
             memory,
             modules: Vec::new(),
+            next_module_generation: 1,
             active_helper: None,
             heap_len,
             guest_allocations: BTreeMap::new(),
+            guest_allocation_owners: BTreeMap::new(),
+            guest_allocation_views: BTreeMap::new(),
+            nested_guest_heaps: BTreeMap::new(),
             guest_heap_snapshot: None,
             detached_guest_allocations: BTreeMap::new(),
+            detached_guest_allocation_owners: BTreeMap::new(),
             detached_guest_allocation_cursor: DETACHED_GUEST_ALLOCATION_BASE.0,
             dns_mappings: Arc::from([]),
+            pending_external_action_completions: VecDeque::new(),
             device_date: DeviceDate::default(),
             platform_memory_extensions: BTreeMap::new(),
             platform_memory_cursor: PLATFORM_MEMORY_BASE.0,
+            mtk_native_extension_owner: None,
             random_state: 1,
             glyphs: BTreeMap::new(),
             dialogs: BTreeMap::new(),
+            text_viewers: BTreeMap::new(),
+            editors: BTreeMap::new(),
+            menus: BTreeMap::new(),
+            native_windows: BTreeMap::new(),
+            active_platform_ui: Vec::new(),
+            pending_platform_menu_selection: None,
+            pending_platform_menu_returns: 0,
             next_ui_handle: 1,
             suppressed_ui_key_releases: BTreeSet::new(),
+            platform_pointer_capture: None,
             native_sockets: BTreeMap::new(),
             next_native_socket_handle: 1,
             exit_requested: false,
-            device_info_profile: DeviceInfoProfile::Unavailable,
+            native_extension_profile: NativeExtensionProfile::Baseline,
             clock_origin: Instant::now(),
             timer_deadline: None,
         })
@@ -386,11 +776,7 @@ impl ExtRuntime {
         code: i32,
         services: &mut dyn NativeServices,
     ) -> Result<i32> {
-        if !image.starts_with(b"MRPGCMAP") || image.len() <= 8 {
-            return Err(Error::Abi(
-                "EXT image is missing the complete MRPGCMAP marker".into(),
-            ));
-        }
+        Self::validate_module_image(image)?;
         let module_index = self.modules.len();
         let module_offset = u32::try_from(module_index)
             .ok()
@@ -401,38 +787,52 @@ impl ExtRuntime {
                 .checked_add(module_offset)
                 .ok_or_else(|| Error::ArmFault("module base overflow".into()))?,
         );
-        if image.len() > MODULE_STRIDE as usize {
-            return Err(Error::ArmFault(format!(
-                "EXT image is {} bytes (module stride is {})",
-                image.len(),
-                MODULE_STRIDE
-            )));
-        }
+        let generation = self.next_module_generation;
+        self.next_module_generation = self
+            .next_module_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Abi("EXT module generation overflow".into()))?;
+        let snapshot = ModuleLoadSnapshot {
+            active_helper: self.active_helper,
+            detached_guest_allocation_cursor: self.detached_guest_allocation_cursor,
+            platform_memory_cursor: self.platform_memory_cursor,
+            mtk_native_extension_owner: self.mtk_native_extension_owner,
+        };
         self.memory.map_bytes(
             base,
             image.to_vec(),
             Permissions::READ_WRITE_EXECUTE,
             format!("EXT module {module_index}"),
         )?;
-        let loader_context = self.allocate(64, 8)?;
-        self.memory.write(loader_context, &[0; 64])?;
-        self.memory.write_u32(base, PLATFORM_TABLE.0)?;
-        self.memory
-            .write_u32(base.checked_add(4)?, loader_context.0)?;
         self.modules.push(ModuleContext {
+            generation,
             base,
             len: image.len(),
-            loader_context,
+            loader_context: GuestAddr(0),
             helper: None,
             helper_parameter: GuestAddr(0),
             static_base_r9: 0,
+            dynamic_executable_ranges: Vec::new(),
+            next_dynamic_executable_image_id: 0,
         });
 
-        let result = self
-            .call_guest(
+        let result = (|| {
+            let loader_context = self
+                .allocate_guest_block_for_module(64, module_index)?
+                .ok_or_else(|| {
+                    Error::ArmFault("guest heap exhausted while allocating loader context".into())
+                })?;
+            self.modules[module_index].loader_context = loader_context;
+            self.memory.write(loader_context, &[0; 64])?;
+            self.memory.write_u32(base, PLATFORM_TABLE.0)?;
+            self.memory
+                .write_u32(base.checked_add(4)?, loader_context.0)?;
+            self.call_guest(
                 GuestFunction {
                     module: module_index,
                     address: base.0 + 8,
+                    expected_image: Some(ExecutableImage::Static),
+                    captured_r9: None,
                 },
                 [code as u32, 0, 0, 0],
                 &[],
@@ -447,9 +847,15 @@ impl ExtRuntime {
                     self.memory.write_u32(helper_parameter, static_base)?;
                 }
                 Ok(value)
-            });
-        if result.is_err() {
-            self.modules.pop();
+            })
+        })();
+        if let Err(error) = result {
+            return match self.rollback_module_initialization(module_index, generation, snapshot) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::Abi(format!(
+                    "EXT module initialization failed: {error}; rollback failed: {rollback_error}"
+                ))),
+            };
         }
         result.map(|value| value as i32)
     }
@@ -481,21 +887,53 @@ impl ExtRuntime {
             self.memory.write(address, input)?;
             address
         };
+        self.call_active_helper_arguments(
+            helper,
+            code,
+            input_address.0,
+            input.len() as u32,
+            services,
+        )
+    }
+
+    pub fn call_active_helper_raw(
+        &mut self,
+        code: i32,
+        arguments: [u32; 2],
+        services: &mut dyn NativeServices,
+    ) -> Result<(i32, Vec<u8>)> {
+        let helper = self
+            .active_helper
+            .ok_or_else(|| Error::Abi("no EXT helper is registered".into()))?;
+        self.call_active_helper_arguments(helper, code, arguments[0], arguments[1], services)
+    }
+
+    fn call_active_helper_arguments(
+        &mut self,
+        helper: GuestFunction,
+        code: i32,
+        argument_2: u32,
+        argument_3: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<(i32, Vec<u8>)> {
         let output_fields = self.allocate(8, 4)?;
         self.memory.write_u32(output_fields, 0)?;
         self.memory.write_u32(output_fields.checked_add(4)?, 0)?;
         let module_parameter = self.modules[helper.module].helper_parameter;
         let return_value = self.call_guest(
             helper,
-            [
-                module_parameter.0,
-                code as u32,
-                input_address.0,
-                input.len() as u32,
-            ],
+            [module_parameter.0, code as u32, argument_2, argument_3],
             &[output_fields.0, output_fields.0 + 4],
             services,
         )? as i32;
+        self.active_helper_output(return_value, output_fields)
+    }
+
+    fn active_helper_output(
+        &self,
+        return_value: i32,
+        output_fields: GuestAddr,
+    ) -> Result<(i32, Vec<u8>)> {
         let output_address = self.memory.read_u32(output_fields)?;
         let output_len = self.memory.read_u32(output_fields.checked_add(4)?)? as usize;
         let output = if output_address == 0 || output_len == 0 {
@@ -531,6 +969,9 @@ impl ExtRuntime {
         if self.exit_requested {
             return Ok(Some(ExtLifecycleRequest::Exit));
         }
+        if self.memory.read_u32(APPLICATION_STATE_DATA)? != APPLICATION_STATE_RESTART_PENDING {
+            return Ok(None);
+        }
         let state = self.lifecycle_state()?;
         if state.callback != b"restart" {
             return Ok(None);
@@ -547,21 +988,41 @@ impl ExtRuntime {
         }))
     }
 
+    pub fn clear_lifecycle_request(&mut self) -> Result<()> {
+        self.memory.write_u32(LIFECYCLE_CALLBACK_DATA, 0)?;
+        self.memory
+            .write_u32(APPLICATION_STATE_DATA, APPLICATION_STATE_NORMAL)
+    }
+
     pub fn set_previous_application(&mut self, package: &[u8], entry: &[u8]) -> Result<()> {
         write_platform_string(&mut self.memory, PREVIOUS_PACKAGE_NAME_DATA, package)?;
         write_platform_string(&mut self.memory, PREVIOUS_START_NAME_DATA, entry)
     }
 
-    pub fn set_device_info_profile(&mut self, profile: DeviceInfoProfile) -> Result<()> {
-        if profile == self.device_info_profile {
+    pub(crate) fn start_file_parameter(&self) -> Result<[u8; START_FILE_PARAMETER_LEN]> {
+        self.memory
+            .read(START_FILE_PARAMETER_DATA, START_FILE_PARAMETER_LEN)?
+            .try_into()
+            .map_err(|_| Error::Abi("invalid start-file parameter length".into()))
+    }
+
+    pub(crate) fn set_start_file_parameter(
+        &mut self,
+        parameter: &[u8; START_FILE_PARAMETER_LEN],
+    ) -> Result<()> {
+        self.memory.write(START_FILE_PARAMETER_DATA, parameter)
+    }
+
+    pub fn set_native_extension_profile(&mut self, profile: NativeExtensionProfile) -> Result<()> {
+        if profile == self.native_extension_profile {
             return Ok(());
         }
-        if self.device_info_profile != DeviceInfoProfile::Unavailable {
+        if self.native_extension_profile != NativeExtensionProfile::Baseline {
             return Err(Error::Abi(
-                "device-information profile cannot change after configuration".into(),
+                "native-extension profile cannot change after configuration".into(),
             ));
         }
-        if profile == DeviceInfoProfile::DeterministicMtk {
+        if profile == NativeExtensionProfile::Mtk {
             self.memory.map(
                 MTK_NATIVE_EXTENSION_BASE,
                 MTK_NATIVE_EXTENSION_LEN,
@@ -577,7 +1038,7 @@ impl ExtRuntime {
                 .map(|address| address & !0xfff)
                 .ok_or_else(|| Error::ArmFault("platform memory cursor overflow".into()))?;
         }
-        self.device_info_profile = profile;
+        self.native_extension_profile = profile;
         Ok(())
     }
 
@@ -589,23 +1050,132 @@ impl ExtRuntime {
         self.device_date = device_date;
     }
 
-    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
+    pub fn route_key_event(
+        &mut self,
+        code: i32,
+        pressed: bool,
+        services: &mut dyn NativeServices,
+    ) -> Result<Option<(i32, i32, i32)>> {
         if !pressed && self.suppressed_ui_key_releases.remove(&code) {
-            return None;
+            return Ok(None);
         }
-        if self.dialogs.is_empty() {
-            return Some((if pressed { 0 } else { 1 }, code, 0));
-        }
+        let Some(active_ui) = self.active_platform_ui.last().copied() else {
+            return Ok(Some((if pressed { 0 } else { 1 }, code, 0)));
+        };
         if !pressed {
-            return None;
+            return Ok(None);
         }
         self.suppressed_ui_key_releases.insert(code);
-        match code {
-            // Left soft key and select accept; right soft key and power cancel.
-            17 | 20 => Some((6, 1, 0)),
-            16 | 18 => Some((6, 0, 0)),
-            _ => None,
+        match active_ui {
+            ActivePlatformUi::Menu(handle) => match code {
+                12 => {
+                    self.move_platform_menu_focus(handle, -1, services)?;
+                    Ok(None)
+                }
+                13 => {
+                    self.move_platform_menu_focus(handle, 1, services)?;
+                    Ok(None)
+                }
+                17 | 20 => {
+                    let selected = self.selected_platform_menu_item(handle);
+                    if selected.is_some() {
+                        self.pending_platform_menu_selection = Some(handle);
+                    }
+                    Ok(selected.map(|index| (4, index as i32, 0)))
+                }
+                16 | 18 => Ok(Some((5, 0, 0))),
+                _ => Ok(None),
+            },
+            ActivePlatformUi::Dialog(_) => match code {
+                // Left soft key and select accept; right soft key and power cancel.
+                17 | 20 => Ok(Some((6, 1, 0))),
+                16 | 18 => Ok(Some((6, 0, 0))),
+                _ => Ok(None),
+            },
+            ActivePlatformUi::TextViewer(_) => match code {
+                // Text viewers report the same dialog result ABI. The guest
+                // releases the viewer through slot 73 after receiving cancel.
+                16 | 18 => Ok(Some((6, 1, 0))),
+                _ => Ok(None),
+            },
+            ActivePlatformUi::Editor(_) => match code {
+                17 | 20 => Ok(Some((6, 0, 0))),
+                16 | 18 => Ok(Some((6, 1, 0))),
+                _ => Ok(None),
+            },
         }
+    }
+
+    pub fn route_text_input(&mut self, text: &str) -> Result<Option<(i32, i32, i32)>> {
+        let Some(ActivePlatformUi::Editor(handle)) = self.active_platform_ui.last().copied() else {
+            return Ok(None);
+        };
+        self.set_platform_editor_text(handle, text)?;
+        Ok(Some((6, 0, 0)))
+    }
+
+    pub fn route_pointer_event(
+        &mut self,
+        x: i32,
+        y: i32,
+        pressed: bool,
+        services: &mut dyn NativeServices,
+    ) -> Result<Option<(i32, i32, i32)>> {
+        if pressed {
+            let Some(ui) = self.active_platform_ui.last().copied() else {
+                return Ok(Some((2, x, y)));
+            };
+            let action = match ui {
+                ActivePlatformUi::Menu(handle) => {
+                    let action = self.platform_menu_pointer_action(handle, x, y)?;
+                    if let PlatformPointerAction::MenuSelect(index) = action {
+                        self.set_platform_menu_focus(handle, index, services)?;
+                    } else {
+                        self.render_platform_menu(handle, services)?;
+                    }
+                    action
+                }
+                ActivePlatformUi::Dialog(_) => self.platform_dialog_pointer_action(x, y)?,
+                ActivePlatformUi::TextViewer(_) => {
+                    self.platform_text_viewer_pointer_action(x, y)?
+                }
+                ActivePlatformUi::Editor(_) => PlatformPointerAction::None,
+            };
+            self.platform_pointer_capture = Some(PlatformPointerCapture { ui, action });
+            return Ok(None);
+        }
+
+        let Some(capture) = self.platform_pointer_capture.take() else {
+            if self.active_platform_ui.is_empty() {
+                return Ok(Some((3, x, y)));
+            }
+            return Ok(None);
+        };
+        if self.active_platform_ui.last().copied() != Some(capture.ui) {
+            return Ok(None);
+        }
+        let released_action = match capture.ui {
+            ActivePlatformUi::Menu(handle) => self.platform_menu_pointer_action(handle, x, y)?,
+            ActivePlatformUi::Dialog(_) => self.platform_dialog_pointer_action(x, y)?,
+            ActivePlatformUi::TextViewer(_) => self.platform_text_viewer_pointer_action(x, y)?,
+            ActivePlatformUi::Editor(_) => PlatformPointerAction::None,
+        };
+        if released_action != capture.action {
+            return Ok(None);
+        }
+        if matches!(capture.action, PlatformPointerAction::MenuSelect(_))
+            && let ActivePlatformUi::Menu(handle) = capture.ui
+        {
+            self.pending_platform_menu_selection = Some(handle);
+        }
+        Ok(match capture.action {
+            PlatformPointerAction::MenuSelect(index) => Some((4, index as i32, 0)),
+            PlatformPointerAction::MenuReturn => Some((5, 0, 0)),
+            PlatformPointerAction::DialogAccept => Some((6, 1, 0)),
+            PlatformPointerAction::DialogCancel => Some((6, 0, 0)),
+            PlatformPointerAction::TextViewerReturn => Some((6, 1, 0)),
+            PlatformPointerAction::None => None,
+        })
     }
 
     fn lifecycle_state(&self) -> Result<ExtLifecycleState> {
@@ -630,6 +1200,399 @@ impl ExtRuntime {
         })
     }
 
+    pub fn dispatch_pending_platform_event(
+        &mut self,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        if self.pending_platform_menu_returns == 0 {
+            return Ok(false);
+        }
+        let mut event = [0_u8; 12];
+        event[..4].copy_from_slice(&5_i32.to_le_bytes());
+        self.call_active_helper(1, &event, services)?;
+        self.pending_platform_menu_returns -= 1;
+        Ok(true)
+    }
+
+    pub fn dispatch_pending_external_action(
+        &mut self,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        let Some(completion) = self.pending_external_action_completions.pop_front() else {
+            return Ok(false);
+        };
+        if !self
+            .modules
+            .get(completion.callback.module)
+            .is_some_and(|module| module.generation == completion.owner_generation)
+        {
+            return Ok(true);
+        }
+        self.call_guest(
+            completion.callback,
+            [0, completion.callback_data, 0, 0],
+            &[],
+            services,
+        )?;
+        Ok(true)
+    }
+
+    fn allocation_owner_for_range(&self, requested: ExecutableRange) -> Option<u64> {
+        let guest_owner = self.guest_allocations.iter().find_map(|(base, len)| {
+            let allocation = ExecutableRange {
+                base: GuestAddr(*base),
+                len: *len as usize,
+            };
+            allocation
+                .contains_range(requested)
+                .then(|| self.guest_allocation_owners.get(base).copied())
+                .flatten()
+        });
+        guest_owner
+            .or_else(|| {
+                self.detached_guest_allocations
+                    .iter()
+                    .find_map(|(base, (len, _))| {
+                        ExecutableRange {
+                            base: GuestAddr(*base),
+                            len: *len,
+                        }
+                        .contains_range(requested)
+                        .then(|| self.detached_guest_allocation_owners.get(base).copied())
+                        .flatten()
+                    })
+            })
+            .or_else(|| {
+                self.platform_memory_extensions
+                    .iter()
+                    .find_map(|(base, extension)| {
+                        ExecutableRange {
+                            base: GuestAddr(*base),
+                            len: extension.len,
+                        }
+                        .contains_range(requested)
+                        .then_some(extension.owner_generation)
+                    })
+            })
+    }
+
+    fn guest_function_is_executable(&self, function: GuestFunction) -> bool {
+        let actual_image = self
+            .modules
+            .get(function.module)
+            .and_then(|module| module.executable_image(function.address))
+            .map(|(image, _)| image);
+        actual_image.is_some()
+            && function
+                .expected_image
+                .is_none_or(|expected| actual_image == Some(expected))
+    }
+
+    fn revoke_executable_ranges_in(&mut self, released: ExecutableRange) -> Result<()> {
+        let intersections = self
+            .modules
+            .iter()
+            .flat_map(|module| {
+                module
+                    .dynamic_executable_ranges
+                    .iter()
+                    .filter_map(DynamicExecutableImageSlot::as_ref)
+            })
+            .flat_map(|image| image.intervals.iter())
+            .filter_map(|range| range.intersection(released))
+            .collect::<Vec<_>>();
+        if intersections.is_empty() {
+            return Ok(());
+        }
+
+        // Remove execute permission before changing image metadata. A permission
+        // failure can then only leave the runtime fail-closed.
+        for intersection in &intersections {
+            self.memory.remove_permissions(
+                intersection.base,
+                intersection.len,
+                Permissions::EXECUTE,
+            )?;
+        }
+
+        for module in &mut self.modules {
+            for image in &mut module.dynamic_executable_ranges {
+                let Some(dynamic_image) = image.as_mut() else {
+                    continue;
+                };
+                dynamic_image.intervals = dynamic_image
+                    .intervals
+                    .iter()
+                    .flat_map(|range| range.subtract(released))
+                    .collect();
+                if dynamic_image.intervals.is_empty() {
+                    image.0 = None;
+                }
+            }
+        }
+
+        let invalid_helpers = self
+            .modules
+            .iter()
+            .enumerate()
+            .filter_map(|(module_index, module)| {
+                module
+                    .helper
+                    .is_some_and(|helper| !self.guest_function_is_executable(helper))
+                    .then_some(module_index)
+            })
+            .collect::<Vec<_>>();
+        for module_index in invalid_helpers {
+            self.modules[module_index].helper = None;
+        }
+        if self
+            .active_helper
+            .is_some_and(|helper| !self.guest_function_is_executable(helper))
+        {
+            self.active_helper = None;
+        }
+        let mut pending = std::mem::take(&mut self.pending_external_action_completions);
+        pending.retain(|completion| self.guest_function_is_executable(completion.callback));
+        self.pending_external_action_completions = pending;
+        Ok(())
+    }
+
+    fn rollback_module_initialization(
+        &mut self,
+        module_index: usize,
+        generation: u64,
+        snapshot: ModuleLoadSnapshot,
+    ) -> Result<()> {
+        let (module_base, module_len) = self
+            .modules
+            .get(module_index)
+            .filter(|module| module.generation == generation)
+            .map(|module| (module.base, module.len))
+            .ok_or_else(|| {
+                Error::Abi(format!(
+                    "cannot roll back missing EXT module generation {generation}"
+                ))
+            })?;
+        if module_index + 1 != self.modules.len() {
+            return Err(Error::Abi(format!(
+                "cannot roll back EXT module {module_index} while later modules are active"
+            )));
+        }
+
+        self.modules[module_index].helper = None;
+        self.pending_external_action_completions
+            .retain(|completion| completion.owner_generation != generation);
+        self.native_windows
+            .retain(|_, owner_generation| *owner_generation != generation);
+        let discarded_editors = self
+            .editors
+            .iter()
+            .filter_map(|(handle, editor)| {
+                (editor.owner_generation == generation).then_some(*handle)
+            })
+            .collect::<BTreeSet<_>>();
+        self.editors
+            .retain(|_, editor| editor.owner_generation != generation);
+        self.active_platform_ui.retain(|ui| {
+            !matches!(ui, ActivePlatformUi::Editor(handle) if discarded_editors.contains(handle))
+        });
+        if self.platform_pointer_capture.is_some_and(|capture| {
+            matches!(capture.ui, ActivePlatformUi::Editor(handle) if discarded_editors.contains(&handle))
+        }) {
+            self.platform_pointer_capture = None;
+        }
+
+        let dynamic_ranges = self.modules[module_index]
+            .dynamic_executable_ranges
+            .iter()
+            .filter_map(DynamicExecutableImageSlot::as_ref)
+            .flat_map(|image| image.intervals.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let mut rollback_error = None;
+        let mut revocation_failed = false;
+        for range in dynamic_ranges {
+            if let Err(error) = self.revoke_executable_ranges_in(range) {
+                revocation_failed = true;
+                if rollback_error.is_none() {
+                    rollback_error = Some(error);
+                }
+            }
+        }
+
+        let mut owned_allocations = self
+            .guest_allocation_owners
+            .iter()
+            .filter_map(|(base, owner)| {
+                (*owner == generation).then(|| {
+                    self.guest_allocations
+                        .get(base)
+                        .map(|len| (GuestAddr(*base), *len as usize))
+                })?
+            })
+            .chain(
+                self.detached_guest_allocation_owners
+                    .iter()
+                    .filter_map(|(base, owner)| {
+                        (*owner == generation).then(|| {
+                            self.detached_guest_allocations
+                                .get(base)
+                                .map(|(len, _)| (GuestAddr(*base), *len))
+                        })?
+                    }),
+            )
+            .collect::<Vec<_>>();
+        owned_allocations.sort_unstable_by_key(|(address, _)| std::cmp::Reverse(address.0));
+
+        for (address, len) in &owned_allocations {
+            if let Err(error) = self.free_guest_block(*address, *len)
+                && rollback_error.is_none()
+            {
+                rollback_error = Some(error);
+            }
+        }
+
+        let mut owned_platform_arenas = self
+            .platform_memory_extensions
+            .iter()
+            .filter_map(|(base, extension)| {
+                (extension.owner_generation == generation).then_some((*base, *extension))
+            })
+            .collect::<Vec<_>>();
+        owned_platform_arenas.sort_unstable_by_key(|(base, _)| std::cmp::Reverse(*base));
+        for (base, extension) in owned_platform_arenas {
+            match self.memory.unmap(GuestAddr(base), extension.len) {
+                Ok(()) => {
+                    self.platform_memory_extensions.remove(&base);
+                    self.guest_allocation_views
+                        .retain(|_, view| view.backing_base != base);
+                }
+                Err(error) if rollback_error.is_none() => rollback_error = Some(error),
+                Err(_) => {}
+            }
+        }
+
+        if !self
+            .detached_guest_allocation_owners
+            .values()
+            .any(|owner| *owner == generation)
+        {
+            self.detached_guest_allocation_cursor = snapshot.detached_guest_allocation_cursor;
+        }
+        if !self
+            .platform_memory_extensions
+            .values()
+            .any(|extension| extension.owner_generation == generation)
+        {
+            self.platform_memory_cursor = snapshot.platform_memory_cursor;
+        }
+        if !revocation_failed && self.mtk_native_extension_owner == Some(generation) {
+            self.mtk_native_extension_owner = snapshot.mtk_native_extension_owner;
+        }
+        self.active_helper = snapshot.active_helper;
+
+        match self.memory.unmap(module_base, module_len) {
+            Ok(()) => {
+                self.modules.pop();
+            }
+            Err(error) if rollback_error.is_none() => rollback_error = Some(error),
+            Err(_) => {}
+        }
+
+        rollback_error.map_or(Ok(()), Err)
+    }
+
+    fn try_dispatch_legacy_external_action(
+        &mut self,
+        module: usize,
+        return_to_thumb: bool,
+        cpu: &mut ArmCpu,
+    ) -> Result<bool> {
+        let Some(context) = self.modules.get(module) else {
+            return Ok(false);
+        };
+        let Some((entry_image @ ExecutableImage::Dynamic(_), _)) =
+            context.executable_image(cpu.pc().0 | u32::from(cpu.is_thumb()))
+        else {
+            return Ok(false);
+        };
+        const REQUEST_WORDS: usize = 11;
+        const REQUEST_LEN: usize = REQUEST_WORDS * 4;
+        let request = GuestAddr(cpu.register(0));
+        if request.0 == 0
+            || request.0 & 3 != 0
+            || self
+                .memory
+                .check_range(request, REQUEST_LEN, Permissions::READ)
+                .is_err()
+        {
+            return Ok(false);
+        }
+        let mut words = [0_u32; REQUEST_WORDS];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = self
+                .memory
+                .read_u32(request.checked_add((index * 4) as u32)?)?;
+        }
+        // This is an ABI allowlist, not a function-signature guess: only calls into
+        // module-owned dynamic code with the complete bounded record are handled.
+        if words[0] != 0
+            || words[1] != 0
+            || words[2] != 20
+            || !LEGACY_EXTERNAL_ACTION_KINDS.contains(&words[3])
+            || words[4] == 0
+            || words[5] == 0
+            || words[6..=8] != [0, 0, 0]
+            || words[10] == 0
+        {
+            return Ok(false);
+        }
+        let Ok(identifier) = self.read_c_string(GuestAddr(words[4]), 65) else {
+            return Ok(false);
+        };
+        if identifier.is_empty() {
+            return Ok(false);
+        }
+        if self.read_c_string(GuestAddr(words[5]), 257).is_err() {
+            return Ok(false);
+        }
+
+        let callback = words[10];
+        let return_address = cpu.register(14);
+        let encoded_return_address = return_address | u32::from(return_to_thumb);
+        let Some((callback_image, _)) = context.executable_image(callback) else {
+            return Ok(false);
+        };
+        let Some((_return_image, _)) = context.executable_image(encoded_return_address) else {
+            return Ok(false);
+        };
+        if callback_image != entry_image {
+            return Ok(false);
+        }
+
+        if self.pending_external_action_completions.len() >= MAX_PENDING_EXTERNAL_ACTIONS {
+            cpu.set_register(0, 0);
+            cpu.set_pc(encoded_return_address);
+            return Ok(true);
+        }
+
+        let owner_generation = context.generation;
+        self.pending_external_action_completions
+            .push_back(PendingExternalActionCompletion {
+                owner_generation,
+                callback: GuestFunction {
+                    module,
+                    address: callback,
+                    expected_image: Some(callback_image),
+                    captured_r9: Some(cpu.register(9)),
+                },
+                callback_data: words[9],
+            });
+        cpu.set_register(0, 1);
+        cpu.set_pc(encoded_return_address);
+        Ok(true)
+    }
+
     fn call_guest(
         &mut self,
         function: GuestFunction,
@@ -637,25 +1600,41 @@ impl ExtRuntime {
         stack_arguments: &[u32],
         services: &mut dyn NativeServices,
     ) -> Result<u32> {
+        let execution = self.prepare_guest_execution(function, registers, stack_arguments)?;
+        self.run_guest_execution(execution, services)
+    }
+
+    fn prepare_guest_execution(
+        &mut self,
+        function: GuestFunction,
+        registers: [u32; 4],
+        stack_arguments: &[u32],
+    ) -> Result<GuestExecution> {
         let module = self.modules.get(function.module).ok_or_else(|| {
             Error::Abi(format!(
                 "guest function references module {}",
                 function.module
             ))
         })?;
-        let module_end = module.base.0 + module.len as u32;
-        let executable_address = function.address & !1;
-        if executable_address < module.base.0 || executable_address >= module_end {
+        let actual_image = module
+            .executable_image(function.address)
+            .map(|(image, _)| image);
+        if actual_image.is_none()
+            || function
+                .expected_image
+                .is_some_and(|expected| actual_image != Some(expected))
+        {
             return Err(Error::Abi(format!(
                 "guest function {:#010x} is outside module {}",
                 function.address, function.module
             )));
         }
+        let static_base_r9 = module.static_base_r9;
         let mut cpu = ArmCpu::new();
         for (index, value) in registers.into_iter().enumerate() {
             cpu.set_register(index, value);
         }
-        cpu.set_register(9, module.static_base_r9);
+        cpu.set_register(9, function.captured_r9.unwrap_or(static_base_r9));
         let stack_top = STACK_BASE.0 + STACK_LEN as u32;
         let stack_bytes = u32::try_from(stack_arguments.len())
             .ok()
@@ -675,9 +1654,38 @@ impl ExtRuntime {
         cpu.set_register(14, RETURN_SENTINEL);
         cpu.set_pc(function.address);
 
+        Ok(GuestExecution {
+            function,
+            cpu,
+            entered_guest_call: None,
+            instruction_count: 0,
+        })
+    }
+
+    fn run_guest_execution(
+        &mut self,
+        execution: GuestExecution,
+        services: &mut dyn NativeServices,
+    ) -> Result<u32> {
+        let GuestExecution {
+            function,
+            mut cpu,
+            mut entered_guest_call,
+            mut instruction_count,
+        } = execution;
         let trace_arm = std::env::var_os("SKYENGINE_TRACE_ARM").is_some();
-        for instruction_count in 0..INSTRUCTION_BUDGET {
+        while instruction_count < INSTRUCTION_BUDGET {
             let pc = cpu.pc().0;
+            if let Some(return_to_thumb) = entered_guest_call.take()
+                && self.try_dispatch_legacy_external_action(
+                    function.module,
+                    return_to_thumb,
+                    &mut cpu,
+                )?
+            {
+                instruction_count += 1;
+                continue;
+            }
             if pc == RETURN_SENTINEL {
                 return Ok(cpu.register(0));
             }
@@ -701,6 +1709,7 @@ impl ExtRuntime {
                 }
                 let return_address = cpu.register(14);
                 cpu.set_pc(return_address);
+                instruction_count += 1;
                 continue;
             }
             if trace_arm {
@@ -718,6 +1727,9 @@ impl ExtRuntime {
                     cpu.register(14),
                 );
             }
+            let previous_lr = cpu.register(14);
+            let previous_thumb = cpu.is_thumb();
+            let sequential_pc = pc.wrapping_add(if previous_thumb { 2 } else { 4 });
             if let Err(error) = cpu.step(&mut self.memory) {
                 return Err(match error {
                     Error::ArmFault(message) => {
@@ -755,6 +1767,14 @@ impl ExtRuntime {
                     other => other,
                 });
             }
+            if cpu.take_semihosting_exit_reason().is_some() {
+                self.exit_requested = true;
+                return Ok(0);
+            }
+            if cpu.register(14) != previous_lr && cpu.pc().0 != sequential_pc {
+                entered_guest_call = Some(previous_thumb);
+            }
+            instruction_count += 1;
         }
         let pc = cpu.pc().0;
         let instruction = self
@@ -873,8 +1893,8 @@ impl ExtRuntime {
 
 fn platform_user_info() -> [u8; PLATFORM_USER_INFO_LEN] {
     let mut info = [0_u8; PLATFORM_USER_INFO_LEN];
-    info[..16].copy_from_slice(b"000000000000000\0");
-    info[16..32].copy_from_slice(b"460001234567890\0");
+    info[..VIRTUAL_IMEI.len()].copy_from_slice(VIRTUAL_IMEI);
+    info[16..16 + VIRTUAL_IMSI.len()].copy_from_slice(VIRTUAL_IMSI);
     info[32..40].copy_from_slice(b"SkyEng\0\0");
     info[40..48].copy_from_slice(b"SE-V2\0\0\0");
     info[48..52].copy_from_slice(&PLATFORM_USER_INFO_VERSION.to_le_bytes());
@@ -888,6 +1908,24 @@ fn trap_slot(address: u32) -> Option<u32> {
 
 fn data_slot_address(slot: u32) -> GuestAddr {
     GuestAddr(PLATFORM_DATA.0 + slot * 4)
+}
+
+fn platform_data_slot_backing_address(slot: u32) -> GuestAddr {
+    match slot {
+        95 => BITMAP_ARRAY_DATA,
+        96 => TILE_ARRAY_DATA,
+        97 => MAP_ARRAY_DATA,
+        98 => SOUND_ARRAY_DATA,
+        99 => SPRITE_ARRAY_DATA,
+        100 => PACKAGE_NAME_DATA,
+        101 => START_NAME_DATA,
+        102 => PREVIOUS_PACKAGE_NAME_DATA,
+        103 => PREVIOUS_START_NAME_DATA,
+        112 => SMS_CONFIG_DATA,
+        138 => START_FILE_PARAMETER_DATA,
+        144 => CURRENT_ENTRY_DATA,
+        _ => data_slot_address(slot),
+    }
 }
 
 fn table_slot_address(slot: u32) -> GuestAddr {

@@ -170,7 +170,11 @@ export class SkyEngineE2e {
     const previous = await this.drawCount();
     const response = await this.command(`CLICK ${x} ${y}`);
     const accepted = /^OK click draw_count (\d+)$/.exec(response);
-    await this.waitDrawAfter(accepted ? Number(accepted[1]) : previous, timeoutMs);
+    try {
+      await this.waitDrawAfter(accepted ? Number(accepted[1]) : previous, timeoutMs);
+    } catch (error) {
+      throw new Error(`CLICK ${x} ${y} did not produce a frame: ${errorMessage(error)}`);
+    }
   }
 
   async delay(ms: number): Promise<void> {
@@ -197,13 +201,19 @@ export class SkyEngineE2e {
     const previous = options.waitForDraw ? await this.drawCount() : undefined;
     const response = await this.command(options.holdMs != null ? `KEY ${name} ${options.holdMs}` : `KEY ${name}`);
     const accepted = /^OK key draw_count (\d+)$/.exec(response);
-    const drawBaseline = accepted ? Number(accepted[1]) : previous;
+    const drawBaseline = options.waitForDraw
+      ? (accepted ? Number(accepted[1]) : previous)
+      : undefined;
     // editCreate and other valid state-only actions do not submit a bitmap.  Let
     // callers express that contract instead of accepting an unrelated timer draw.
     // A key may also complete by intentionally terminating the runtime; the server
     // reports that terminal state explicitly because no later draw can exist.
     if (drawBaseline != null && !response.endsWith(" exited")) {
-      await this.waitDrawAfter(drawBaseline, options.timeoutMs);
+      try {
+        await this.waitDrawAfter(drawBaseline, options.timeoutMs);
+      } catch (error) {
+        throw new Error(`KEY ${name} did not produce a frame: ${errorMessage(error)}`);
+      }
     }
   }
 
@@ -235,6 +245,22 @@ export class SkyEngineE2e {
     const ppmPath = path.join(this.tmpDir, `${name}.ppm`);
     await this.command(`SCREEN_DRAW ${drawCount} ${ppmPath}`);
     return readPpm(ppmPath);
+  }
+
+  /** Poll screenshots until the application reaches a semantic visual state. */
+  async waitForScreen(
+    predicate: (screen: PpmImage) => boolean | Promise<boolean>,
+    options: { name?: string; timeoutMs?: number; intervalMs?: number } = {}
+  ): Promise<PpmImage> {
+    const { name = "wait-screen", timeoutMs = 60_000, intervalMs = 250 } = options;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const screen = await this.screen(name);
+      if (await predicate(screen)) return screen;
+      if (Date.now() + intervalMs > deadline) break;
+      await sleep(intervalMs);
+    }
+    throw new Error(`Screen predicate did not match within ${timeoutMs}ms`);
   }
 
   /**
@@ -403,6 +429,10 @@ function controlEndpoint(tmpDir: string): string {
     return `\\\\.\\pipe\\skyengine-e2e-${process.pid}-${path.basename(tmpDir)}`;
   }
   return path.join(tmpDir, "skyengine-e2e.sock");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**

@@ -100,6 +100,119 @@ fn bitmap_trap_accepts_a_linear_source_offset_at_the_stride_boundary() {
 }
 
 #[test]
+fn bitmap_trap_mode_zero_ors_source_and_destination_pixels() {
+    let mut runtime =
+        ExtRuntime::new(2, 1, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.memory.write_u16(SCREEN_BASE, 0x00f0).unwrap();
+    runtime
+        .memory
+        .write_u16(SCREEN_BASE.checked_add(2).unwrap(), 0x0f00)
+        .unwrap();
+    let source = runtime.allocate(4, 2).unwrap();
+    runtime.memory.write_u16(source, 0x0f0f).unwrap();
+    runtime
+        .memory
+        .write_u16(source.checked_add(2).unwrap(), 0xf000)
+        .unwrap();
+    let stack = runtime.allocate(24, 4).unwrap();
+    for (index, value) in [1_u32, 0, 0, 0, 0, 2].into_iter().enumerate() {
+        runtime
+            .memory
+            .write_u32(stack.checked_add((index * 4) as u32).unwrap(), value)
+            .unwrap();
+    }
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, source.0);
+    cpu.set_register(3, 2);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(120, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(
+        read_bitmap_pixels(&runtime, SCREEN_BASE, 2, 1),
+        [0x0fff, 0xff00]
+    );
+}
+
+#[test]
+fn bitmap_trap_draws_into_the_active_screen_buffer() {
+    let mut runtime =
+        ExtRuntime::new(2, 1, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let active_screen = runtime.allocate(4, 2).unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(91), active_screen.0)
+        .unwrap();
+    let source = runtime.allocate(4, 2).unwrap();
+    runtime.memory.write_u16(source, 0x1234).unwrap();
+    runtime
+        .memory
+        .write_u16(source.checked_add(2).unwrap(), 0x5678)
+        .unwrap();
+    let stack = runtime.allocate(24, 4).unwrap();
+    for (index, value) in [1_u32, 2, 0, 0, 0, 2].into_iter().enumerate() {
+        runtime
+            .memory
+            .write_u32(stack.checked_add((index * 4) as u32).unwrap(), value)
+            .unwrap();
+    }
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, source.0);
+    cpu.set_register(3, 2);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(120, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(
+        read_bitmap_pixels(&runtime, active_screen, 2, 1),
+        [0x1234, 0x5678]
+    );
+    assert_eq!(read_bitmap_pixels(&runtime, SCREEN_BASE, 2, 1), [0, 0]);
+}
+
+#[test]
+fn rectangle_trap_draws_into_the_physical_screen_buffer() {
+    let mut runtime =
+        ExtRuntime::new(2, 1, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let active_screen = runtime.allocate(4, 2).unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(91), active_screen.0)
+        .unwrap();
+    runtime.memory.write_u16(active_screen, 0xaaaa).unwrap();
+    runtime
+        .memory
+        .write_u16(active_screen.checked_add(2).unwrap(), 0xaaaa)
+        .unwrap();
+    let stack = runtime.allocate(12, 4).unwrap();
+    for (index, value) in [255_u32, 0, 0].into_iter().enumerate() {
+        runtime
+            .memory
+            .write_u32(stack.checked_add((index * 4) as u32).unwrap(), value)
+            .unwrap();
+    }
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(2, 2);
+    cpu.set_register(3, 1);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(122, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    let red = Framebuffer::rgb565(255, 0, 0);
+    assert_eq!(read_bitmap_pixels(&runtime, SCREEN_BASE, 2, 1), [red, red]);
+    assert_eq!(
+        read_bitmap_pixels(&runtime, active_screen, 2, 1),
+        [0xaaaa, 0xaaaa]
+    );
+}
+
+#[test]
 fn strncmp_compares_a_bounded_prefix_without_requiring_a_nul() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -112,13 +225,13 @@ fn strncmp_compares_a_bounded_prefix_without_requiring_a_nul() {
     cpu.set_register(0, left.0);
     cpu.set_register(1, right.0);
     cpu.set_register(2, 2);
-    runtime.dispatch_libc(11, &mut cpu).unwrap();
+    runtime.dispatch_libc(11, 0, &mut cpu).unwrap();
     assert_eq!(cpu.register(0), 0);
 
     cpu.set_register(0, left.0);
     cpu.set_register(1, right.0);
     cpu.set_register(2, 3);
-    runtime.dispatch_libc(11, &mut cpu).unwrap();
+    runtime.dispatch_libc(11, 0, &mut cpu).unwrap();
     assert_eq!(cpu.register(0) as i32, -1);
 }
 

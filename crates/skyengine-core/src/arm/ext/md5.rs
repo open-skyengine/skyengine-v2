@@ -72,7 +72,7 @@ impl ExtRuntime {
         debug_assert_eq!(remaining, 0);
 
         let mut digest = [0_u8; 16];
-        for (chunk, value) in digest.chunks_exact_mut(4).zip(state) {
+        for (chunk, value) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
         self.memory.write(output, &digest)
@@ -181,8 +181,8 @@ fn md5_transform(state: &mut [u32; 4], block: &[u8; 64]) {
     ];
 
     let mut words = [0_u32; 16];
-    for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_le_bytes(bytes.try_into().expect("four-byte MD5 word"));
+    for (word, bytes) in words.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
     let [mut a, mut b, mut c, mut d] = *state;
     for index in 0..64 {

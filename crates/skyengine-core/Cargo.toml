@@ -7,6 +7,6 @@ license.workspace = true
 [dependencies]
 encoding_rs.workspace = true
 flate2.workspace = true
+jpeg-decoder.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-

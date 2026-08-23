@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -10,15 +11,26 @@ use std::{
 use encoding_rs::GBK;
 
 use crate::{
-    DnsMapping, Framebuffer, Package, PlatformDisplay, Result,
-    arm::{DeviceInfoProfile, ExtLifecycleRequest, ExtRuntime, GuestAddr, NativeServices},
+    DnsMapping, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result, VIRTUAL_IMEI,
+    VIRTUAL_IMSI,
+    arm::{
+        ExtLifecycleRequest, ExtRuntime, GuestAddr, NativeExtensionProfile, NativeServices,
+        START_FILE_PARAMETER_LEN,
+    },
 };
 
-use super::value::{Table, Value};
+use super::{
+    chunk::{MrChunk, Prototype},
+    value::{Table, Value},
+};
 
 mod services;
 
 use services::PackageServices;
+
+// Baseline headless SDK compatibility profile. Local native fixtures prove the
+// >= 2000 path; this is an advertised capability floor, not a device identity.
+const BASELINE_VM_VERSION: u32 = 2_000;
 
 #[derive(Clone, Debug)]
 struct Bitmap {
@@ -50,6 +62,33 @@ enum NativeFile {
     Package(Cursor<Vec<u8>>),
 }
 
+enum ExtHelperInput<'a> {
+    Buffer(&'a [u8]),
+    Arguments([u32; 2]),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ApplicationStackTransition {
+    Stay,
+    Push((Vec<u8>, Vec<u8>, PathBuf)),
+    Pop,
+}
+
+pub(crate) enum PreparedEntry {
+    Mr(Arc<Prototype>),
+    Native(Vec<u8>),
+}
+
+pub(crate) struct PreparedApplication {
+    package: Arc<Package>,
+    entry: Vec<u8>,
+    prepared_entry: PreparedEntry,
+    stack_transition: ApplicationStackTransition,
+    previous_application: Option<(Vec<u8>, Vec<u8>)>,
+    start_file_parameter: [u8; START_FILE_PARAMETER_LEN],
+    ext_runtime: Option<ExtRuntime>,
+}
+
 pub(crate) struct MrHost {
     pub package: Arc<Package>,
     pub framebuffer: Framebuffer,
@@ -66,7 +105,9 @@ pub(crate) struct MrHost {
     next_native_file_handle: i32,
     sdk_key: Option<i32>,
     current_entry: Vec<u8>,
-    application_stack: Vec<(Vec<u8>, Vec<u8>)>,
+    application_stack: Vec<(Vec<u8>, Vec<u8>, PathBuf)>,
+    previous_application: Option<(Vec<u8>, Vec<u8>)>,
+    start_file_parameter: [u8; START_FILE_PARAMETER_LEN],
     ext_runtime: Option<ExtRuntime>,
 }
 
@@ -102,6 +143,8 @@ impl MrHost {
             sdk_key: None,
             current_entry: b"start.mr".to_vec(),
             application_stack: Vec::new(),
+            previous_application: None,
+            start_file_parameter: [0; START_FILE_PARAMETER_LEN],
             ext_runtime: None,
         }
     }
@@ -120,8 +163,8 @@ impl MrHost {
                         bytes(b"scrh"),
                         Value::Number(f64::from(self.framebuffer.height())),
                     );
-                    values.set(bytes(b"IMEI"), bytes(b"000000000000000"));
-                    values.set(bytes(b"IMSI"), bytes(b"460000000000000"));
+                    values.set(bytes(b"IMEI"), bytes(VIRTUAL_IMEI));
+                    values.set(bytes(b"IMSI"), bytes(VIRTUAL_IMSI));
                 }
                 Ok(vec![Value::Table(info)])
             }
@@ -137,6 +180,10 @@ impl MrHost {
                 table.borrow_mut().set(
                     bytes(b"ScreenH"),
                     Value::Number(f64::from(self.framebuffer.height())),
+                );
+                table.borrow_mut().set(
+                    bytes(b"vmver"),
+                    Value::Number(f64::from(BASELINE_VM_VERSION)),
                 );
                 Ok(vec![Value::Table(table)])
             }
@@ -223,16 +270,61 @@ impl MrHost {
         self.ext_runtime.as_ref().and_then(ExtRuntime::timer_due_in)
     }
 
-    pub fn dispatch_native_timer(&mut self) -> Result<bool> {
+    pub fn take_due_native_timer(&mut self) -> Result<bool> {
         let due = match self.ext_runtime.as_mut() {
             Some(runtime) => runtime.take_due_timer()?,
             None => false,
         };
-        if !due {
+        Ok(due)
+    }
+
+    pub fn dispatch_native_timer(&mut self) -> Result<()> {
+        self.call_ext_helper(2, ExtHelperInput::Buffer(&[]))?;
+        Ok(())
+    }
+
+    pub fn dispatch_external_action_completion(&mut self) -> Result<bool> {
+        let Some(mut runtime) = self.ext_runtime.take() else {
             return Ok(false);
-        }
-        self.call_ext_helper(2, &[])?;
-        Ok(true)
+        };
+        let result = {
+            let mut services = PackageServices {
+                package: self.package.clone(),
+                work_dir: self.work_dir.clone(),
+                directory_searches: &mut self.directory_searches,
+                next_directory_handle: &mut self.next_directory_handle,
+                files: &mut self.native_files,
+                next_file_handle: &mut self.next_native_file_handle,
+                font: &self.font,
+                framebuffer: &mut self.framebuffer,
+                display: self.display.as_mut(),
+            };
+            runtime.dispatch_pending_external_action(&mut services)
+        };
+        self.ext_runtime = Some(runtime);
+        result
+    }
+
+    pub fn dispatch_pending_platform_event(&mut self) -> Result<bool> {
+        let Some(mut runtime) = self.ext_runtime.take() else {
+            return Ok(false);
+        };
+        let result = {
+            let mut services = PackageServices {
+                package: self.package.clone(),
+                work_dir: self.work_dir.clone(),
+                directory_searches: &mut self.directory_searches,
+                next_directory_handle: &mut self.next_directory_handle,
+                files: &mut self.native_files,
+                next_file_handle: &mut self.next_native_file_handle,
+                font: &self.font,
+                framebuffer: &mut self.framebuffer,
+                display: self.display.as_mut(),
+            };
+            runtime.dispatch_pending_platform_event(&mut services)
+        };
+        self.ext_runtime = Some(runtime);
+        result
     }
 
     pub fn lifecycle_request(&self) -> Result<Option<ExtLifecycleRequest>> {
@@ -242,48 +334,210 @@ impl MrHost {
         }
     }
 
-    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
-        match self.ext_runtime.as_mut() {
-            Some(runtime) => runtime.route_key_event(code, pressed),
-            None => Some((if pressed { 0 } else { 1 }, code, 0)),
-        }
+    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Result<Option<(i32, i32, i32)>> {
+        let Some(mut runtime) = self.ext_runtime.take() else {
+            return Ok(Some((if pressed { 0 } else { 1 }, code, 0)));
+        };
+        let result = {
+            let mut services = PackageServices {
+                package: self.package.clone(),
+                work_dir: self.work_dir.clone(),
+                directory_searches: &mut self.directory_searches,
+                next_directory_handle: &mut self.next_directory_handle,
+                files: &mut self.native_files,
+                next_file_handle: &mut self.next_native_file_handle,
+                font: &self.font,
+                framebuffer: &mut self.framebuffer,
+                display: self.display.as_mut(),
+            };
+            runtime.route_key_event(code, pressed, &mut services)
+        };
+        self.ext_runtime = Some(runtime);
+        result
     }
 
-    pub fn prepare_restart(&self, package_name: &[u8], entry: &[u8]) -> Result<Arc<Package>> {
-        let path = native_file_path(
-            &self.work_dir,
-            self.package.path(),
-            &self.package.header().internal_name,
-            package_name,
-        )
-        .ok_or_else(|| {
+    pub fn route_pointer_event(
+        &mut self,
+        x: i32,
+        y: i32,
+        pressed: bool,
+    ) -> Result<Option<(i32, i32, i32)>> {
+        let Some(mut runtime) = self.ext_runtime.take() else {
+            return Ok(Some((if pressed { 2 } else { 3 }, x, y)));
+        };
+        let result = {
+            let mut services = PackageServices {
+                package: self.package.clone(),
+                work_dir: self.work_dir.clone(),
+                directory_searches: &mut self.directory_searches,
+                next_directory_handle: &mut self.next_directory_handle,
+                files: &mut self.native_files,
+                next_file_handle: &mut self.next_native_file_handle,
+                font: &self.font,
+                framebuffer: &mut self.framebuffer,
+                display: self.display.as_mut(),
+            };
+            runtime.route_pointer_event(x, y, pressed, &mut services)
+        };
+        self.ext_runtime = Some(runtime);
+        result
+    }
+
+    pub fn route_text_input(&mut self, text: &str) -> Result<Option<(i32, i32, i32)>> {
+        let Some(mut runtime) = self.ext_runtime.take() else {
+            return Ok(None);
+        };
+        let result = runtime.route_text_input(text);
+        self.ext_runtime = Some(runtime);
+        result
+    }
+
+    pub fn dispatch_native_event(
+        &mut self,
+        event: i32,
+        parameter0: i32,
+        parameter1: i32,
+    ) -> Result<()> {
+        let mut input = [0_u8; 12];
+        input[0..4].copy_from_slice(&event.to_le_bytes());
+        input[4..8].copy_from_slice(&parameter0.to_le_bytes());
+        input[8..12].copy_from_slice(&parameter1.to_le_bytes());
+        self.call_ext_helper(1, ExtHelperInput::Buffer(&input))?;
+        Ok(())
+    }
+
+    pub fn prepare_restart(
+        &self,
+        package_name: &[u8],
+        entry: &[u8],
+        limits: &ResourceLimits,
+    ) -> Result<PreparedApplication> {
+        // A bare package identity cannot distinguish duplicate installations. In that
+        // ABI form, prefer the recorded parent at the top of the stack. A request that
+        // carries a path is always resolved as that path, and the resolved target path
+        // below decides whether this is a push, pop, or self-restart.
+        let parent_identity_path =
+            self.application_stack
+                .last()
+                .and_then(|(package, parent_entry, parent_path)| {
+                    (is_identity_only_application_reference(package_name)
+                        && package == package_name
+                        && parent_entry == entry)
+                        .then(|| parent_path.clone())
+                });
+        let unresolved_path = if let Some(parent_path) = parent_identity_path {
+            parent_path
+        } else {
+            native_file_path(
+                &self.work_dir,
+                self.package.path(),
+                &self.package.header().internal_name,
+                package_name,
+            )
+            .ok_or_else(|| {
+                crate::Error::Platform(format!(
+                    "restart package path {:?} is outside the work directory",
+                    String::from_utf8_lossy(package_name)
+                ))
+            })?
+        };
+        let path = resolve_native_work_path(&self.work_dir, &unresolved_path).ok_or_else(|| {
             crate::Error::Platform(format!(
                 "restart package path {:?} is outside the work directory",
                 String::from_utf8_lossy(package_name)
             ))
         })?;
         let package = Arc::new(Package::open(path, self.package.limits().clone())?);
-        package.resolve(entry)?;
-        Ok(package)
-    }
-
-    pub fn reset_for_restart(&mut self, package: Arc<Package>, entry: &[u8]) {
-        update_application_stack(
-            &mut self.application_stack,
+        let entry_bytes = package.read_named(entry)?;
+        let start_file_parameter = match self.ext_runtime.as_ref() {
+            Some(runtime) => runtime.start_file_parameter()?,
+            None => self.start_file_parameter,
+        };
+        let stack_transition = application_stack_transition(
+            &self.application_stack,
             &self.package.header().internal_name,
             &self.current_entry,
-            &package.header().internal_name,
+            self.package.path(),
+            package.path(),
             entry,
         );
-        self.package = package;
+        let previous_application = match &stack_transition {
+            ApplicationStackTransition::Stay => self.previous_application.clone(),
+            ApplicationStackTransition::Push(_) | ApplicationStackTransition::Pop => Some((
+                self.package.header().internal_name.clone(),
+                self.current_entry.clone(),
+            )),
+        };
+        let (prepared_entry, ext_runtime) = if entry_bytes.starts_with(b"MRPGCMAP") {
+            ExtRuntime::validate_module_image(&entry_bytes)?;
+            let runtime = self.create_ext_runtime(
+                &package,
+                entry,
+                previous_application.as_ref(),
+                &start_file_parameter,
+            )?;
+            (PreparedEntry::Native(entry_bytes), Some(runtime))
+        } else {
+            if !entry_bytes.starts_with(b"\x1bMRP") {
+                return Err(crate::Error::UnsupportedMr(format!(
+                    "text MR frontend is not implemented for {}",
+                    String::from_utf8_lossy(entry)
+                )));
+            }
+            let chunk = MrChunk::load(&entry_bytes, limits)?;
+            (PreparedEntry::Mr(chunk.root), None)
+        };
+        Ok(PreparedApplication {
+            package,
+            entry: entry.to_vec(),
+            prepared_entry,
+            stack_transition,
+            previous_application,
+            start_file_parameter,
+            ext_runtime,
+        })
+    }
+
+    pub fn acknowledge_lifecycle_request(&mut self) -> Result<()> {
+        match self.ext_runtime.as_mut() {
+            Some(runtime) => runtime.clear_lifecycle_request(),
+            None => Ok(()),
+        }
+    }
+
+    pub fn commit_application(&mut self, prepared: PreparedApplication) -> PreparedEntry {
+        match prepared.stack_transition {
+            ApplicationStackTransition::Stay => {}
+            ApplicationStackTransition::Push(application) => {
+                self.application_stack.push(application)
+            }
+            ApplicationStackTransition::Pop => {
+                self.application_stack.pop();
+            }
+        }
+
+        self.start_file_parameter = prepared.start_file_parameter;
+        self.previous_application = prepared.previous_application;
+        self.package = prepared.package;
         self.bitmaps.clear();
         self.directory_searches.clear();
         self.next_directory_handle = 1;
         self.native_files.clear();
         self.next_native_file_handle = 1;
         self.sdk_key = None;
-        self.current_entry = entry.to_vec();
+        self.current_entry = prepared.entry;
+        self.ext_runtime = prepared.ext_runtime;
+        prepared.prepared_entry
+    }
+
+    pub(crate) fn discard_failed_application_runtime(&mut self) {
         self.ext_runtime = None;
+        self.bitmaps.clear();
+        self.directory_searches.clear();
+        self.next_directory_handle = 1;
+        self.native_files.clear();
+        self.next_native_file_handle = 1;
+        self.sdk_key = None;
     }
 
     pub fn set_current_entry(&mut self, entry: &[u8]) {
@@ -310,7 +564,9 @@ impl MrHost {
             )));
         }
         let pixels: Vec<u16> = raw[..byte_count]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pixel| u16::from_le_bytes([pixel[0], pixel[1]]))
             .collect();
         let transparent_color = pixels.first().copied().unwrap_or(0);
@@ -410,7 +666,9 @@ impl MrHost {
                 let unicode = args.get(1).is_some_and(Value::truthy);
                 if unicode {
                     encoded
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .take_while(|bytes| **bytes != [0, 0])
                         .map(|bytes| {
                             if u16::from_be_bytes([bytes[0], bytes[1]]) < 128 {
@@ -463,6 +721,18 @@ impl MrHost {
     fn string_command(&mut self, args: &[Value]) -> Result<Vec<Value>> {
         let command = integer(args.first())?;
         match command {
+            // Optional carrier/SMS metadata suffix. The deterministic headless
+            // profile has no provider, so it returns the ABI's neutral string.
+            501 => {
+                let input = value_bytes(args.get(1))?;
+                if input.len() > 1024 {
+                    return Err(crate::Error::Platform(format!(
+                        "_strCom 501 input is {} bytes; limit is 1024",
+                        input.len()
+                    )));
+                }
+                Ok(vec![bytes(b"")])
+            }
             // Read a checked byte range from the currently loaded MRP file.
             600 => {
                 let requested = value_bytes(args.get(1))?;
@@ -498,32 +768,26 @@ impl MrHost {
             // Turn an MRPGCMAP image into the callable first-stage EXT loader.
             800 => {
                 let code = integer(args.get(2))?;
-                let package_name = self.package.header().internal_name.clone();
-                let mut runtime = match self.ext_runtime.take() {
-                    Some(runtime) => runtime,
-                    None => {
-                        let mut runtime = ExtRuntime::new(
-                            self.framebuffer.width(),
-                            self.framebuffer.height(),
-                            &package_name,
-                            &self.current_entry,
-                            self.memory_limit,
-                        )?;
-                        runtime.set_device_info_profile(device_info_profile(
-                            self.package.header().platform,
-                            self.package.header().version,
-                        ))?;
-                        runtime.set_dns_mappings(self.dns_mappings.clone());
-                        runtime.set_device_date(self.device_date);
-                        let (previous_package, previous_entry) = self
-                            .application_stack
-                            .last()
-                            .map(|(package, entry)| (package.as_slice(), entry.as_slice()))
-                            .unwrap_or((&[], &[]));
-                        runtime.set_previous_application(previous_package, previous_entry)?;
-                        runtime
+                enum ImageSource {
+                    Bytes(Arc<[u8]>),
+                    GuestRange(GuestAddr, usize),
+                }
+                let source = match args.get(1) {
+                    Some(Value::Bytes(image)) => ImageSource::Bytes(image.clone()),
+                    Some(Value::Table(range)) => {
+                        let range = range.borrow();
+                        let address = guest_u32(&range.get(&Value::Number(1.0)), "EXT address")?;
+                        let len =
+                            guest_u32(&range.get(&Value::Number(2.0)), "EXT length")? as usize;
+                        ImageSource::GuestRange(GuestAddr(address), len)
+                    }
+                    other => {
+                        return Err(crate::Error::MrFault(format!(
+                            "_strCom 800 expects EXT bytes or {{address, length}}, got {other:?}"
+                        )));
                     }
                 };
+                let mut runtime = self.take_or_create_ext_runtime()?;
                 let package = self.package.clone();
                 let mut services = PackageServices {
                     package,
@@ -536,25 +800,13 @@ impl MrHost {
                     framebuffer: &mut self.framebuffer,
                     display: self.display.as_mut(),
                 };
-                let result = match args.get(1) {
-                    Some(Value::Bytes(image)) => {
-                        runtime.load_and_call_entry(image, code, &mut services)
+                let result = match source {
+                    ImageSource::Bytes(image) => {
+                        runtime.load_and_call_entry(&image, code, &mut services)
                     }
-                    Some(Value::Table(range)) => {
-                        let range = range.borrow();
-                        let address = guest_u32(&range.get(&Value::Number(1.0)), "EXT address")?;
-                        let len =
-                            guest_u32(&range.get(&Value::Number(2.0)), "EXT length")? as usize;
-                        runtime.load_guest_image_and_call_entry(
-                            GuestAddr(address),
-                            len,
-                            code,
-                            &mut services,
-                        )
+                    ImageSource::GuestRange(address, len) => {
+                        runtime.load_guest_image_and_call_entry(address, len, code, &mut services)
                     }
-                    other => Err(crate::Error::MrFault(format!(
-                        "_strCom 800 expects EXT bytes or {{address, length}}, got {other:?}"
-                    ))),
                 };
                 self.ext_runtime = Some(runtime);
                 Ok(vec![Value::Number(f64::from(result?))])
@@ -563,7 +815,7 @@ impl MrHost {
             801 => {
                 let input = ext_input(args.get(1))?;
                 let code = integer(args.get(2))?;
-                let (result, output) = self.call_ext_helper(code, &input)?;
+                let (result, output) = self.call_ext_helper(code, input)?;
                 Ok(vec![bytes(&output), Value::Number(f64::from(result))])
             }
             3 => Ok(vec![Value::Number(0.0)]),
@@ -573,17 +825,83 @@ impl MrHost {
         }
     }
 
+    pub fn run_native_entry(&mut self, image: &[u8]) -> Result<()> {
+        let mut runtime = self.take_or_create_ext_runtime()?;
+        let package = self.package.clone();
+        let result = {
+            let mut services = PackageServices {
+                package,
+                work_dir: self.work_dir.clone(),
+                directory_searches: &mut self.directory_searches,
+                next_directory_handle: &mut self.next_directory_handle,
+                files: &mut self.native_files,
+                next_file_handle: &mut self.next_native_file_handle,
+                font: &self.font,
+                framebuffer: &mut self.framebuffer,
+                display: self.display.as_mut(),
+            };
+            runtime.load_and_call_entry(image, 0, &mut services)
+        };
+        self.ext_runtime = Some(runtime);
+        result?;
+
+        self.call_ext_helper(6, ExtHelperInput::Arguments([1, BASELINE_VM_VERSION]))?;
+        self.call_ext_helper(0, ExtHelperInput::Buffer(&[]))?;
+        Ok(())
+    }
+
+    fn take_or_create_ext_runtime(&mut self) -> Result<ExtRuntime> {
+        if let Some(runtime) = self.ext_runtime.take() {
+            return Ok(runtime);
+        }
+        self.create_ext_runtime(
+            &self.package,
+            &self.current_entry,
+            self.previous_application.as_ref(),
+            &self.start_file_parameter,
+        )
+    }
+
+    fn create_ext_runtime(
+        &self,
+        package: &Package,
+        entry: &[u8],
+        previous_application: Option<&(Vec<u8>, Vec<u8>)>,
+        start_file_parameter: &[u8; START_FILE_PARAMETER_LEN],
+    ) -> Result<ExtRuntime> {
+        let mut runtime = ExtRuntime::new(
+            self.framebuffer.width(),
+            self.framebuffer.height(),
+            &package.header().internal_name,
+            entry,
+            self.memory_limit,
+        )?;
+        runtime.set_native_extension_profile(native_extension_profile(
+            package.header().platform,
+            package.header().version,
+        ))?;
+        runtime.set_dns_mappings(self.dns_mappings.clone());
+        runtime.set_device_date(self.device_date);
+        let (previous_package, previous_entry) = previous_application
+            .map(|(package, entry)| (package.as_slice(), entry.as_slice()))
+            .unwrap_or((&[], &[]));
+        runtime.set_previous_application(previous_package, previous_entry)?;
+        runtime.set_start_file_parameter(start_file_parameter)?;
+        Ok(runtime)
+    }
+
     fn mr_c_load(&mut self, args: &[Value]) -> Result<Vec<Value>> {
         let code = integer(args.first())?;
         let input = args
             .get(1)
             .and_then(Value::bytes)
             .unwrap_or_else(|| Arc::from(&b""[..]));
-        let (result, output) = self.call_ext_helper(code, &input)?;
+        let (result, output) =
+            self.call_ext_helper(code, ExtHelperInput::Buffer(input.as_ref()))?;
         Ok(vec![Value::Number(f64::from(result)), bytes(&output)])
     }
 
-    fn call_ext_helper(&mut self, code: i32, input: &[u8]) -> Result<(i32, Vec<u8>)> {
+    fn call_ext_helper(&mut self, code: i32, input: ExtHelperInput<'_>) -> Result<(i32, Vec<u8>)> {
         let package = self.package.clone();
         let mut runtime = self
             .ext_runtime
@@ -601,7 +919,14 @@ impl MrHost {
                 framebuffer: &mut self.framebuffer,
                 display: self.display.as_mut(),
             };
-            runtime.call_active_helper(code, input, &mut services)
+            match input {
+                ExtHelperInput::Buffer(input) => {
+                    runtime.call_active_helper(code, input, &mut services)
+                }
+                ExtHelperInput::Arguments(arguments) => {
+                    runtime.call_active_helper_raw(code, arguments, &mut services)
+                }
+            }
         };
         self.ext_runtime = Some(runtime);
         result
@@ -713,12 +1038,12 @@ fn is_mrp_file_name(path: &[u8]) -> bool {
     name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".mrp")
 }
 
-fn device_info_profile(platform: u8, version: u32) -> DeviceInfoProfile {
-    // Versions from 1000 onward use the common MTK/MStar device-info ABI.
+fn native_extension_profile(platform: u8, version: u32) -> NativeExtensionProfile {
+    // Versions from 1000 onward on this platform use the fixed MTK native-code window.
     if platform == 1 && version >= 1_000 {
-        DeviceInfoProfile::DeterministicMtk
+        NativeExtensionProfile::Mtk
     } else {
-        DeviceInfoProfile::Unavailable
+        NativeExtensionProfile::Baseline
     }
 }
 
@@ -728,7 +1053,14 @@ fn safe_work_path(work_dir: &Path, bytes: &[u8]) -> Option<PathBuf> {
         return None;
     }
     let mut resolved = work_dir.to_path_buf();
-    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+    if path.len() < 2 || path.as_bytes()[1] != b':' {
+        let first_component = path
+            .split(['/', '\\'])
+            .find(|component| !matches!(*component, "" | "."));
+        if !first_component.is_some_and(|component| component.eq_ignore_ascii_case("mythroad")) {
+            resolved.push("mythroad");
+        }
+    } else {
         match path.as_bytes()[0].to_ascii_uppercase() {
             b'C' => {}
             drive @ (b'X' | b'Y' | b'Z') => {
@@ -771,20 +1103,117 @@ fn native_file_path(
     safe_work_path(work_dir, bytes)
 }
 
-fn update_application_stack(
-    stack: &mut Vec<(Vec<u8>, Vec<u8>)>,
+fn is_identity_only_application_reference(package: &[u8]) -> bool {
+    !package.is_empty() && !package.iter().any(|byte| matches!(byte, b'/' | b'\\'))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NativePathComponent {
+    Missing,
+    Match(OsString),
+    Ambiguous,
+}
+
+fn select_ascii_case_component(
+    requested: &OsStr,
+    candidates: impl IntoIterator<Item = OsString>,
+) -> NativePathComponent {
+    let Some(requested_text) = requested.to_str() else {
+        return NativePathComponent::Missing;
+    };
+    let mut folded_match = None;
+    let mut ambiguous = false;
+    for candidate in candidates {
+        if candidate == requested {
+            return NativePathComponent::Match(candidate);
+        }
+        if candidate
+            .to_str()
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(requested_text))
+        {
+            if folded_match.is_some() {
+                ambiguous = true;
+            } else {
+                folded_match = Some(candidate);
+            }
+        }
+    }
+    if ambiguous {
+        NativePathComponent::Ambiguous
+    } else {
+        folded_match
+            .map(NativePathComponent::Match)
+            .unwrap_or(NativePathComponent::Missing)
+    }
+}
+
+fn resolve_native_work_path(work_dir: &Path, target: &Path) -> Option<PathBuf> {
+    let Ok(relative) = target.strip_prefix(work_dir) else {
+        return Some(target.to_path_buf());
+    };
+    let mut resolved = work_dir.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(requested) = component else {
+            return None;
+        };
+        let exact = resolved.join(requested);
+        match fs::symlink_metadata(&exact) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return None,
+            Ok(_) => {
+                resolved = exact;
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        let candidates = match fs::read_dir(&resolved) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                resolved = exact;
+                continue;
+            }
+            Err(_) => return None,
+        };
+        match select_ascii_case_component(requested, candidates) {
+            NativePathComponent::Missing => resolved = exact,
+            NativePathComponent::Match(actual) => {
+                let matched = resolved.join(actual);
+                let metadata = fs::symlink_metadata(&matched).ok()?;
+                if metadata.file_type().is_symlink() {
+                    return None;
+                }
+                resolved = matched;
+            }
+            NativePathComponent::Ambiguous => return None,
+        }
+    }
+    Some(resolved)
+}
+
+fn application_stack_transition(
+    stack: &[(Vec<u8>, Vec<u8>, PathBuf)],
     current_package: &[u8],
     current_entry: &[u8],
-    target_package: &[u8],
+    current_path: &Path,
+    target_path: &Path,
     target_entry: &[u8],
-) {
+) -> ApplicationStackTransition {
+    if current_path == target_path && current_entry == target_entry {
+        return ApplicationStackTransition::Stay;
+    }
     if stack
         .last()
-        .is_some_and(|(package, entry)| package == target_package && entry == target_entry)
+        .is_some_and(|(_, entry, path)| path == target_path && entry == target_entry)
     {
-        stack.pop();
+        ApplicationStackTransition::Pop
     } else {
-        stack.push((current_package.to_vec(), current_entry.to_vec()));
+        ApplicationStackTransition::Push((
+            current_package.to_vec(),
+            current_entry.to_vec(),
+            current_path.to_path_buf(),
+        ))
     }
 }
 
@@ -835,13 +1264,18 @@ fn guest_u32(value: &Value, label: &str) -> Result<u32> {
     Ok(number as u32)
 }
 
-fn ext_input(value: Option<&Value>) -> Result<Vec<u8>> {
+fn ext_input<'a>(value: Option<&'a Value>) -> Result<ExtHelperInput<'a>> {
     match value {
-        Some(Value::Bytes(bytes)) => Ok(bytes.to_vec()),
+        Some(Value::Bytes(bytes)) => Ok(ExtHelperInput::Buffer(bytes.as_ref())),
         Some(Value::Table(table)) => {
             let table = table.borrow();
             let len = table.sequence_len();
-            let mut output = Vec::with_capacity(len.saturating_mul(4));
+            if len > 2 {
+                return Err(crate::Error::MrFault(format!(
+                    "EXT helper argument table has {len} items; the ABI accepts at most 2"
+                )));
+            }
+            let mut arguments = [0; 2];
             for index in 1..=len {
                 let value = table.get(&Value::Number(index as f64));
                 let number = value.number().ok_or_else(|| {
@@ -854,9 +1288,9 @@ fn ext_input(value: Option<&Value>) -> Result<Vec<u8>> {
                         "EXT input table item {index} does not fit 32 bits: {number}"
                     )));
                 }
-                output.extend_from_slice(&(number as i64 as u32).to_le_bytes());
+                arguments[index - 1] = number as i64 as u32;
             }
-            Ok(output)
+            Ok(ExtHelperInput::Arguments(arguments))
         }
         other => Err(crate::Error::MrFault(format!(
             "_strCom 801 expects bytes or a numeric sequence, got {other:?}"

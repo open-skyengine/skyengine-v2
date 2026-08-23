@@ -46,6 +46,7 @@ impl MrVm {
             "TimerStart",
             "TimerStop",
             "_num",
+            "_str",
             "_t",
             "mod",
             "_mod",
@@ -127,13 +128,7 @@ impl MrVm {
         }
         let result = match name {
             "type" => Ok(vec![bytes(args.first().unwrap_or(&Value::Nil).type_name())]),
-            "tostring" => Ok(vec![
-                args.first()
-                    .unwrap_or(&Value::Nil)
-                    .bytes()
-                    .map(Value::Bytes)
-                    .unwrap_or_else(|| bytes(format!("{:?}", args[0]).as_bytes())),
-            ]),
+            "tostring" | "_str" => Ok(vec![native_tostring(args)]),
             "tonumber" | "_num" => Ok(vec![native_tonumber(args)]),
             "_t" => Ok(vec![bytes(match args.first().unwrap_or(&Value::Nil) {
                 Value::Nil => b"nil",

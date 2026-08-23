@@ -25,7 +25,7 @@ function hasBottomFileHighlight(screen: PpmImage): boolean {
   // Runtime-created root entries can move the final item between the last two
   // visible rows.  The following launch and return-frame checks still prove
   // that this highlighted item is the browser package.
-  for (let y = 232; y <= 284; y += 1) {
+  for (let y = 200; y <= 284; y += 1) {
     if (pixelEquals(screen, 100, y, [248, 200, 24])) return true;
   }
   return false;
@@ -111,6 +111,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
       })
     }
     {
+      await engine.delay(500);
       await engine.key('UP', 1_000)
 
       await vi.waitFor(async () => {
@@ -125,6 +126,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
       })
     }
     {
+      await engine.delay(500);
       await engine.key('LEFT_SOFT', 1_000)
 
       await vi.waitFor(async () => {
@@ -139,6 +141,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
       })
     }
     {
+      await engine.delay(500);
       await engine.key('UP', 1_000)
 
       await vi.waitFor(async () => {
@@ -153,6 +156,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
       })
     }
     {
+      await engine.delay(500);
       await engine.key('LEFT_SOFT', 1_000)
 
       await vi.waitFor(async () => {
@@ -168,6 +172,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
     }
     {
       // 启动
+      await engine.delay(500);
       await engine.key('LEFT_SOFT', 1_000)
 
       // rgb(200, 228, 248)
@@ -186,6 +191,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
     }
     {
       // 打开菜单
+      await engine.delay(500);
       await engine.key('LEFT_SOFT', 1_000)
       // rgb(224, 240, 248)
       await vi.waitFor(async () => {
@@ -199,6 +205,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
     }
     {
       // 向上选择最后一个菜单项“退出”
+      await engine.delay(500);
       await engine.key('UP', 1_000)
       // rgb(128, 192, 240)
       await vi.waitFor(async () => {
@@ -241,6 +248,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
 
       // 文件管理器的“退出”先返回 Cookie 主界面；恢复后的父 VM 必须继续
       // 接收正常事件，不能只停留在一张宿主强制提交的列表快照上。
+      await engine.delay(500);
       await engine.key('RIGHT_SOFT', 2_000);
       await vi.waitFor(async () => {
         if (!engine) throw new Error("skyengine 未初始化");
@@ -292,6 +300,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
       })
     }
     {
+      await engine.delay(500);
       await engine.key('UP', 1_000)
 
       await vi.waitFor(async () => {
@@ -306,6 +315,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
       })
     }
     {
+      await engine.delay(500);
       await engine.key('LEFT_SOFT', 1_000)
 
       await vi.waitFor(async () => {
@@ -320,6 +330,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
       })
     }
     {
+      await engine.delay(500);
       await engine.key('UP', 1_000)
 
       await vi.waitFor(async () => {
@@ -335,6 +346,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
     }
     {
       // 启动
+      await engine.delay(500);
       await engine.key('ENTER', 1_000)
 
       // rgb(200, 228, 248)
@@ -353,6 +365,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
     }
     {
       // 打开菜单
+      await engine.delay(500);
       await engine.key('LEFT_SOFT', 1_000)
       // rgb(224, 240, 248)
       await vi.waitFor(async () => {
@@ -366,6 +379,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
     }
     {
       // 向上选择最后一个菜单项“退出”
+      await engine.delay(500);
       await engine.key('UP', 1_000)
       // rgb(128, 192, 240)
       await vi.waitFor(async () => {
@@ -408,6 +422,7 @@ describe("cookie 应用正常启动并且退出到文件管理器", () => {
 
       // 文件管理器的“退出”先返回 Cookie 主界面；恢复后的父 VM 必须继续
       // 接收正常事件，不能只停留在一张宿主强制提交的列表快照上。
+      await engine.delay(500);
       await engine.key('RIGHT_SOFT', 2_000);
       await vi.waitFor(async () => {
         if (!engine) throw new Error("skyengine 未初始化");

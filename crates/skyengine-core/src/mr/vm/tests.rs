@@ -1,6 +1,191 @@
 use super::stdlib::*;
 use super::*;
 
+struct LifecycleTestDisplay;
+
+impl PlatformDisplay for LifecycleTestDisplay {
+    fn present(&mut self, _framebuffer: &Framebuffer) -> Result<()> {
+        Ok(())
+    }
+
+    fn poll_event(&mut self) -> Result<Option<crate::DisplayEvent>> {
+        Ok(None)
+    }
+
+    fn wait_timeout(&mut self, _milliseconds: u32) {}
+}
+
+fn lifecycle_test_root(label: &str) -> std::path::PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "skyengine-lifecycle-{label}-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+fn immediate_self_restart_image() -> Vec<u8> {
+    const MODULE_BASE: u32 = 0x1000_0000;
+    const TRAP_BASE: u32 = 0xff00_0000;
+    const LIFECYCLE_CALLBACK_DATA: u32 = 0x0100_1984;
+    const APPLICATION_STATE_DATA: u32 = 0x0100_1980;
+
+    let helper = MODULE_BASE + 40;
+    let restart = MODULE_BASE + 84;
+    let instructions = [
+        0xe92d_4000, // entry: push {lr}
+        0xe59f_000c, // ldr r0, [pc, #12] (helper)
+        0xe3a0_1014, // mov r1, #20
+        0xe59f_c008, // ldr ip, [pc, #8] (slot 25)
+        0xe12f_ff3c, // blx ip
+        0xe8bd_8000, // pop {pc}
+        helper,
+        TRAP_BASE + 25 * 4,
+        0xe59f_0018, // helper: ldr r0, [pc, #24] (callback pointer)
+        0xe59f_1018, // ldr r1, [pc, #24] ("restart")
+        0xe580_1000, // str r1, [r0]
+        0xe59f_0014, // ldr r0, [pc, #20] (application state)
+        0xe3a0_1003, // mov r1, #3
+        0xe580_1000, // str r1, [r0]
+        0xe3a0_0000, // mov r0, #0
+        0xe12f_ff1e, // bx lr
+        LIFECYCLE_CALLBACK_DATA,
+        restart,
+        APPLICATION_STATE_DATA,
+        u32::from_le_bytes(*b"rest"),
+        u32::from_le_bytes(*b"art\0"),
+    ];
+    let mut image = b"MRPGCMAP".to_vec();
+    image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
+    image
+}
+
+fn failing_native_init_image() -> Vec<u8> {
+    const TRAP_BASE: u32 = 0xff00_0000;
+    let instructions = [
+        0xe59f_c000, // ldr ip, [pc] (unsupported platform trap)
+        0xe12f_ff3c, // blx ip
+        TRAP_BASE + 21 * 4,
+    ];
+    let mut image = b"MRPGCMAP".to_vec();
+    image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
+    image
+}
+
+fn write_lifecycle_test_package(path: &std::path::Path, image: &[u8]) {
+    const LIST_START: usize = 0xf0;
+    const ENTRY: &[u8] = b"start.mr";
+    let directory_len = 4 + ENTRY.len() + 1 + 12;
+    let payload_start = LIST_START + directory_len;
+    let mut package = vec![0_u8; payload_start + image.len()];
+    let package_len = package.len() as u32;
+    package[0..4].copy_from_slice(b"MRPG");
+    package[4..8].copy_from_slice(&((payload_start - 8) as u32).to_le_bytes());
+    package[8..12].copy_from_slice(&package_len.to_le_bytes());
+    package[12..16].copy_from_slice(&(LIST_START as u32).to_le_bytes());
+    package[0x10..0x18].copy_from_slice(b"self.mrp");
+    package[LIST_START..LIST_START + 4].copy_from_slice(&((ENTRY.len() + 1) as u32).to_le_bytes());
+    let name = LIST_START + 4;
+    package[name..name + ENTRY.len()].copy_from_slice(ENTRY);
+    let fields = name + ENTRY.len() + 1;
+    package[fields..fields + 4].copy_from_slice(&(payload_start as u32).to_le_bytes());
+    package[fields + 4..fields + 8].copy_from_slice(&(image.len() as u32).to_le_bytes());
+    package[payload_start..].copy_from_slice(image);
+    std::fs::write(path, package).unwrap();
+}
+
+fn immediate_restart_vm() -> (MrVm, std::path::PathBuf, std::path::PathBuf) {
+    let root = lifecycle_test_root("immediate-restart");
+    let mythroad = root.join("mythroad");
+    std::fs::create_dir_all(&mythroad).unwrap();
+    let package_path = mythroad.join("self.mrp");
+    write_lifecycle_test_package(&package_path, &immediate_self_restart_image());
+    let limits = ResourceLimits::default();
+    let package = Arc::new(Package::open(&package_path, limits.clone()).unwrap());
+    let vm = MrVm::new(
+        package,
+        Framebuffer::new(240, 320).unwrap(),
+        Box::new(LifecycleTestDisplay),
+        MrHostConfig {
+            work_dir: root.clone(),
+            font: Arc::from(&b""[..]),
+            memory_limit: 2 * 1024 * 1024,
+            dns_mappings: Vec::<crate::DnsMapping>::new().into(),
+            device_date: crate::DeviceDate::default(),
+        },
+        limits,
+    );
+    (vm, root, package_path)
+}
+
+#[test]
+fn immediate_self_restart_commits_at_most_once_per_dispatch() {
+    let (mut vm, root, _) = immediate_restart_vm();
+    vm.run_entry(b"start.mr").unwrap();
+    assert!(matches!(
+        vm.host.lifecycle_request().unwrap(),
+        Some(ExtLifecycleRequest::Restart { .. })
+    ));
+
+    assert_eq!(
+        vm.process_lifecycle_request().unwrap(),
+        LifecycleOutcome::Continue
+    );
+    assert!(matches!(
+        vm.host.lifecycle_request().unwrap(),
+        Some(ExtLifecycleRequest::Restart { .. })
+    ));
+    assert_eq!(
+        vm.process_lifecycle_request().unwrap(),
+        LifecycleOutcome::Continue
+    );
+    assert!(matches!(
+        vm.host.lifecycle_request().unwrap(),
+        Some(ExtLifecycleRequest::Restart { .. })
+    ));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_restart_preparation_acknowledges_the_request_and_keeps_the_old_app_runnable() {
+    let (mut vm, root, package_path) = immediate_restart_vm();
+    vm.run_entry(b"start.mr").unwrap();
+    std::fs::remove_file(package_path).unwrap();
+
+    assert!(matches!(
+        vm.process_lifecycle_request(),
+        Err(LifecycleError::BeforeCommit(_))
+    ));
+    assert_eq!(vm.host.lifecycle_request().unwrap(), None);
+    vm.host.dispatch_native_event(1, 2, 3).unwrap();
+    assert!(matches!(
+        vm.host.lifecycle_request().unwrap(),
+        Some(ExtLifecycleRequest::Restart { .. })
+    ));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_init_fault_after_restart_commit_is_terminal_for_the_lifecycle_dispatch() {
+    let (mut vm, root, package_path) = immediate_restart_vm();
+    vm.run_entry(b"start.mr").unwrap();
+    write_lifecycle_test_package(&package_path, &failing_native_init_image());
+
+    assert!(matches!(
+        vm.process_lifecycle_request(),
+        Err(LifecycleError::AfterCommit(_))
+    ));
+    assert_eq!(vm.host.lifecycle_request().unwrap(), None);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn table_insert_shifts_sequence_values() {
     let table = Table::new();
@@ -23,6 +208,13 @@ fn native_number_supports_radix() {
         native_tonumber(&[bytes(b"not-a-number")]),
         Value::Nil
     ));
+}
+
+#[test]
+fn mythroad_string_conversion_matches_tostring() {
+    assert!(native_tostring(&[]).raw_equal(&bytes(b"nil")));
+    assert!(native_tostring(&[Value::Number(54_892_597.0)]).raw_equal(&bytes(b"54892597")));
+    assert!(native_tostring(&[Value::Boolean(true)]).raw_equal(&bytes(b"true")));
 }
 
 #[test]

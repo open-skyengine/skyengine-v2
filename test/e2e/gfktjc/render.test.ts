@@ -1,5 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
+import { type PpmImage, SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
+
+function countColor(
+  image: PpmImage,
+  color: readonly [number, number, number],
+  rect: { x: number; y: number; width: number; height: number },
+): number {
+  let count = 0;
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      const pixel = image.pixel(x, y);
+      if (pixel[0] === color[0] && pixel[1] === color[1] && pixel[2] === color[2]) count++;
+    }
+  }
+  return count;
+}
 import fs from "fs";
 
 describe("gfktjc", () => {
@@ -90,21 +105,14 @@ describe("gfktjc", () => {
     {
       // 不开启音乐
       await engine.key("RIGHT_SOFT", 1_000);
-      await engine.delay(500);
-      await engine.key("ENTER", 1_000);
-      await vi.waitFor(
-        async () => {
-          const screen = await engine!.screen("game-menu");
-          // rgb(0, 0, 0)
-          expect(screen.pixel(218, 186)).toEqual([0, 0, 0]);
-          // rgb(248, 140, 0)
-          expect(screen.pixel(153, 298)).toEqual([248, 140, 0]);
-        },
-        {
-          timeout: 10_000,
-          interval: 1_000,
-        },
+      const menu = await engine.waitForScreen(
+        screen =>
+          screen.pixel(218, 186).toString() === "0,0,0" &&
+          screen.pixel(153, 298).toString() === "248,140,0",
+        { name: "game-menu", timeoutMs: 20_000, intervalMs: 250 },
       );
+      expect(menu.pixel(218, 186)).toEqual([0, 0, 0]);
+      expect(menu.pixel(153, 298)).toEqual([248, 140, 0]);
     }
     {
       // 选择开始游戏
@@ -156,8 +164,9 @@ describe("gfktjc", () => {
           expect(screen.pixel(145, 13)).toEqual([104, 76, 0]);
           // rgb(64, 68, 64)
           expect(screen.pixel(39, 21)).toEqual([64, 68, 64]);
-          // rgb(152, 152, 152)
-          expect(screen.pixel(164, 99)).toEqual([152, 152, 152]);
+          expect(
+            countColor(screen, [152, 152, 152], { x: 49, y: 89, width: 160, height: 30 }),
+          ).toBeGreaterThan(4_400);
         },
         {
           timeout: 10_000,
@@ -192,8 +201,9 @@ describe("gfktjc", () => {
           expect(screen.pixel(145, 13)).toEqual([104, 76, 0]);
           // rgb(64, 68, 64)
           expect(screen.pixel(39, 21)).toEqual([64, 68, 64]);
-          // rgb(152, 152, 152)
-          expect(screen.pixel(164, 99)).toEqual([152, 152, 152]);
+          expect(
+            countColor(screen, [152, 152, 152], { x: 49, y: 89, width: 160, height: 30 }),
+          ).toBeGreaterThan(4_400);
           // 不应该出现左右箭头
           // rgb(248, 156, 0)
           expect(screen.pixel(227, 153)).not.toEqual([248, 156, 0]);

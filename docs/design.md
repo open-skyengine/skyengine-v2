@@ -158,15 +158,12 @@ skyengine run [options] <app.mrp>
   --mr-profile <id>
   --isa-profile <id>
   --deny-network
-  --external-actions <mock|fail>
   --debug-listen <endpoint>
 
 skydbg connect <endpoint>
 ```
 
 `inspect` 只解析和报告包信息，不执行 guest。`run` 创建独立应用工作区和运行时。
-`--external-actions` 默认为 `mock`，其语义见平台安全策略。
-
 ### 5.2 运行时配置
 
 配置在进入运行时后不可被无约束地全局修改。核心概念接口如下：
@@ -181,7 +178,6 @@ pub struct RuntimeConfig {
     pub mr_profile: Option<MrProfileId>,
     pub isa_profile: IsaProfileId,
     pub network: NetworkPolicy,
-    pub external_actions: ExternalActionPolicy,
     pub limits: ResourceLimits,
     pub debug_endpoint: Option<DebugEndpoint>,
 }
@@ -501,6 +497,11 @@ SDL / worker / debug thread
 模块和回调目标；模块停止或应用重启时先取消操作，迟到结果因 generation 不匹配而
 丢弃。工作线程不能直接进入 MR VM 或 ARM CPU。
 
+应用 restart 是调度边界上的冷替换，不是 guest 调用栈的暂停和续执行。目标包、入口
+和需要迁移的平台会话数据必须在提交前全部验证并捕获；提交后销毁旧 MR/ARM/EXT
+执行态，创建新应用 generation，再于 guest 入口前导入会话数据。返回身份栈中的父
+应用也执行同样的冷启动流程，不能恢复旧 PC、调用帧、guest 指针或待完成 native 调用。
+
 计时器以单调时钟调度，设备日期与单调时间分开。headless 后端使用可推进的虚拟时钟，
 保证单元和端到端测试不依赖真实等待。
 
@@ -557,17 +558,24 @@ ABI dispatcher 依赖这些抽象，而不依赖 SDL2 或宿主原生句柄。�
 网络默认开放，可使用 `--deny-network` 或嵌入方策略关闭。所有 socket 和 DNS 操作
 受句柄数、缓冲区、超时和待完成操作数量限制，回调只能投递给仍存活的所有者。
 
-短信和呼叫默认由 `MockExternalActions` provider 实现。它是一个明确配置的平台模拟
-能力，而不是“未实现后伪造成功”：
+短信和呼叫由内部固定 ABI adapter 处理。headless 模拟能力不是“未实现后伪造成功”，
+也不接受调用侧的一次性放行参数：
 
 - 不调用任何真实宿主短信或电话 API；
-- 按 `SdkProfile` 返回确定的成功值或成功事件；
-- 记录动作类型、脱敏参数、模块和调用时间；
-- 在测试中允许配置下一次操作成功、失败或超时；
-- 使用 `--external-actions fail` 时改为返回目标 ABI 的失败结果。
+- 只对内部 ABI 白名单返回 adapter 固定的成功值或成功事件；
+- 不在测试或 CLI 中暴露“下一次操作”授权或按调用放行开关。
 
 其他没有真实实现、没有 mock provider、也没有 profile 失败语义的能力必须报告
 `UnsupportedPlatformCapability`，不能默认返回零或成功。
+
+`legacy-callback-v1` 是迁移期 ABI adapter，不是完整支付实现。adapter 只检查调用进入
+原模块通过平台槽 131 登记且仍有效的动态执行区，并要求请求完整匹配 44 字节结构、
+内部动作类型白名单和有界字符串。callee 与 callback 必须属于同一个动态映像，返回
+地址必须仍属于原模块；匹配后先返回该 ABI 的“已接受”值，再把成功回调排入有固定
+上限的运行时事件队列。回调使用请求时捕获的静态基址，不能在 guest 调用栈内同步
+重入。adapter 不接受宿主调用方另行传入的模块号、函数地址、ID 或单次授权参数；
+guest ABI 记录内的 callback 和 ID 只做边界与归属校验，不作为宿主授权或路由键。
+adapter 也不能通过包名、绝对 PC、画面像素或应用对象偏移推断成功。
 
 ## 11. 调试与可观测性
 
@@ -653,8 +661,10 @@ profile 可以在全局安全上限内选择更小的设备档位，不能提高
 
 ### 12.3 确定性与可恢复性
 
-headless 后端允许注入虚拟时钟、设备日期、随机种子、网络响应和外部动作结果。相同
-输入与配置应得到相同事件顺序和 framebuffer 输出。
+headless 后端允许注入虚拟时钟、设备日期、随机种子和网络响应。外部动作结果只由内部
+固定 ABI adapter 决定；CLI、`RuntimeConfig`、嵌入方和 E2E 不得按运行、
+按调用或按“下一次动作”注入结果或授予权限。相同输入与配置应得到相同事件顺序和
+framebuffer 输出。
 
 应用 fault 后不继续执行未知状态的 guest。运行时先冻结事件生产，再取消异步操作，
 逆序卸载子模块、主 EXT、MR VM 和平台资源，最后进入 `Stopped`。停止过程中的次要

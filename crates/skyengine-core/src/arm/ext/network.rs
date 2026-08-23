@@ -1,5 +1,139 @@
 use super::*;
 
+const MAX_HTTP_HEADER_INSPECTION: usize = 64 * 1024;
+
+#[derive(Debug, Eq, PartialEq)]
+struct HttpAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+enum HttpRequestInspection {
+    Incomplete,
+    Direct,
+    Routed(HttpAuthority),
+}
+
+fn parse_http_authority(value: &str) -> Option<HttpAuthority> {
+    if !value.is_ascii() || value.starts_with('[') {
+        return None;
+    }
+    let (host, port) = match value.matches(':').count() {
+        0 => (value, None),
+        1 => {
+            let (host, port) = value.rsplit_once(':')?;
+            (host, Some(port.parse().ok()?))
+        }
+        _ => return None,
+    };
+    let host = host.trim_end_matches('.');
+    if host.is_empty()
+        || host.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'/' | b'\\' | b'@' | b'#' | b'?')
+        })
+    {
+        return None;
+    }
+    Some(HttpAuthority {
+        host: host.to_ascii_lowercase(),
+        port,
+    })
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn inspect_http_request(bytes: &[u8]) -> HttpRequestInspection {
+    let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        let Some(line_end) = bytes.windows(2).position(|window| window == b"\r\n") else {
+            return HttpRequestInspection::Direct;
+        };
+        let Ok(request_line) = std::str::from_utf8(&bytes[..line_end]) else {
+            return HttpRequestInspection::Direct;
+        };
+        return if valid_http_request_line(request_line) {
+            HttpRequestInspection::Incomplete
+        } else {
+            HttpRequestInspection::Direct
+        };
+    };
+    let Ok(header) = std::str::from_utf8(&bytes[..header_end]) else {
+        return HttpRequestInspection::Direct;
+    };
+    let mut lines = header.split("\r\n");
+    if !lines.next().is_some_and(valid_http_request_line) {
+        return HttpRequestInspection::Direct;
+    }
+    let mut authority = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return HttpRequestInspection::Direct;
+        };
+        if !is_http_token(name) {
+            return HttpRequestInspection::Direct;
+        }
+        if name.eq_ignore_ascii_case("host") {
+            if authority.is_some() {
+                return HttpRequestInspection::Direct;
+            }
+            let Some(parsed) = parse_http_authority(value.trim_matches([' ', '\t'])) else {
+                return HttpRequestInspection::Direct;
+            };
+            authority = Some(parsed);
+        }
+    }
+    authority.map_or(HttpRequestInspection::Direct, HttpRequestInspection::Routed)
+}
+
+fn valid_http_request_line(line: &str) -> bool {
+    if !line.is_ascii() {
+        return false;
+    }
+    let mut parts = line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    is_http_token(method)
+        && !target.is_empty()
+        && !target.bytes().any(|byte| byte.is_ascii_control())
+        && matches!(version, "HTTP/1.0" | "HTTP/1.1")
+}
+
+fn write_buffered_request(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    let write_result = stream
+        .set_write_timeout(Some(NETWORK_CONNECT_TIMEOUT))
+        .and_then(|()| stream.write_all(bytes));
+    let timeout_result = stream.set_write_timeout(None);
+    let nonblocking_result = stream.set_nonblocking(true);
+    write_result.and(timeout_result).and(nonblocking_result)
+}
+
 impl ExtRuntime {
     pub(super) fn resolve_mapped_host(&self, name: &[u8]) -> Option<u32> {
         let name = std::str::from_utf8(name).ok()?.trim_end_matches('.');
@@ -50,6 +184,8 @@ impl ExtRuntime {
             {
                 entry.insert(NativeSocket {
                     state: NativeSocketState::Created,
+                    endpoint: None,
+                    pending_http_request: Some(Vec::new()),
                 });
                 return Ok(Some(handle));
             }
@@ -85,7 +221,8 @@ impl ExtRuntime {
             socket.state = NativeSocketState::Failed;
             return -1;
         }
-        let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port));
+        let endpoint = SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port);
+        let address = SocketAddr::V4(endpoint);
         let (sender, receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(format!("skyengine-connect-{handle}"))
@@ -97,6 +234,7 @@ impl ExtRuntime {
             socket.state = NativeSocketState::Failed;
             return -1;
         }
+        socket.endpoint = Some(endpoint);
         socket.state = NativeSocketState::Connecting(receiver);
         2
     }
@@ -150,9 +288,78 @@ impl ExtRuntime {
             return None;
         }
         let socket = self.native_sockets.get_mut(&handle)?;
-        let NativeSocketState::Connected(stream) = &mut socket.state else {
+        if socket.pending_http_request.is_none() {
+            let NativeSocketState::Connected(stream) = &mut socket.state else {
+                return None;
+            };
+            return stream.write(bytes).ok();
+        }
+
+        let pending = socket.pending_http_request.as_mut()?;
+        let combined_len = pending.len().checked_add(bytes.len())?;
+        if combined_len > self.heap_len {
+            socket.state = NativeSocketState::Failed;
             return None;
+        }
+        pending.extend_from_slice(bytes);
+        let inspection = if pending.len() > MAX_HTTP_HEADER_INSPECTION {
+            HttpRequestInspection::Direct
+        } else {
+            inspect_http_request(pending)
         };
-        stream.write(bytes).ok()
+        if matches!(inspection, HttpRequestInspection::Incomplete) {
+            return Some(bytes.len());
+        }
+
+        let buffered = socket.pending_http_request.take()?;
+        let endpoint = socket.endpoint?;
+        let target = match inspection {
+            HttpRequestInspection::Routed(authority) => self
+                .dns_mappings
+                .iter()
+                .find(|mapping| mapping.source.eq_ignore_ascii_case(&authority.host))
+                .map(|mapping| {
+                    SocketAddrV4::new(
+                        mapping.address,
+                        mapping.port.or(authority.port).unwrap_or(endpoint.port()),
+                    )
+                }),
+            HttpRequestInspection::Incomplete => unreachable!(),
+            HttpRequestInspection::Direct => None,
+        };
+
+        if target.is_none() || target == Some(endpoint) {
+            let socket = self.native_sockets.get_mut(&handle)?;
+            let NativeSocketState::Connected(stream) = &mut socket.state else {
+                return None;
+            };
+            if write_buffered_request(stream, &buffered).is_err() {
+                socket.state = NativeSocketState::Failed;
+                return None;
+            }
+            return Some(bytes.len());
+        }
+
+        let target = SocketAddr::V4(target?);
+        let replacement =
+            TcpStream::connect_timeout(&target, NETWORK_CONNECT_TIMEOUT).and_then(|mut stream| {
+                write_buffered_request(&mut stream, &buffered)?;
+                Ok(stream)
+            });
+        let socket = self.native_sockets.get_mut(&handle)?;
+        match replacement {
+            Ok(stream) => {
+                socket.endpoint = match target {
+                    SocketAddr::V4(endpoint) => Some(endpoint),
+                    SocketAddr::V6(_) => unreachable!(),
+                };
+                socket.state = NativeSocketState::Connected(stream);
+            }
+            Err(_) => {
+                socket.state = NativeSocketState::Failed;
+                return None;
+            }
+        }
+        Some(bytes.len())
     }
 }

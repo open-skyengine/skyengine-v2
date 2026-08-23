@@ -1,14 +1,24 @@
 use super::{heap::aligned_heap_len, *};
 
 impl ExtRuntime {
-    pub(super) fn dispatch_libc(&mut self, slot: u32, cpu: &mut ArmCpu) -> Result<()> {
+    pub(super) fn dispatch_libc(
+        &mut self,
+        slot: u32,
+        module: usize,
+        cpu: &mut ArmCpu,
+    ) -> Result<()> {
         match slot {
             0 => {
-                let address = self.allocate_guest_block(cpu.register(0) as usize)?;
+                let address =
+                    self.allocate_guest_block_for_module(cpu.register(0) as usize, module)?;
                 cpu.set_register(0, address.map_or(0, |address| address.0));
             }
             1 => {
-                self.free_guest_block(GuestAddr(cpu.register(0)), cpu.register(1) as usize)?;
+                self.free_guest_block_for_module(
+                    GuestAddr(cpu.register(0)),
+                    cpu.register(1) as usize,
+                    module,
+                )?;
                 cpu.set_register(0, 0);
             }
             2 => {
@@ -16,24 +26,18 @@ impl ExtRuntime {
                 let old_len = cpu.register(1) as usize;
                 let new_len = cpu.register(2) as usize;
                 if source.0 == 0 {
-                    let output = self.allocate_guest_block(new_len)?;
+                    let output = self.allocate_guest_block_for_module(new_len, module)?;
                     cpu.set_register(0, output.map_or(0, |address| address.0));
                 } else if new_len == 0 {
-                    self.free_guest_block(source, old_len)?;
+                    self.free_guest_block_for_module(source, old_len, module)?;
                     cpu.set_register(0, 0);
                 } else if new_len <= old_len {
+                    self.validate_guest_allocation_owner(source, old_len, module, "realloc")?;
                     cpu.set_register(0, source.0);
                 } else {
-                    let allocated_len = self
-                        .guest_allocations
-                        .get(&source.0)
-                        .copied()
-                        .or_else(|| {
-                            self.detached_guest_allocations
-                                .get(&source.0)
-                                .map(|(len, _)| *len as u32)
-                        })
-                        .ok_or_else(|| {
+                    self.validate_guest_allocation_owner(source, old_len, module, "realloc")?;
+                    let allocated_len =
+                        self.tracked_guest_allocation_len(source).ok_or_else(|| {
                             Error::Abi(format!(
                                 "realloc references unknown guest allocation {:#010x}",
                                 source.0
@@ -45,13 +49,14 @@ impl ExtRuntime {
                             source.0
                         )));
                     }
-                    let Some(output) = self.allocate_guest_block(new_len)? else {
+                    let Some(output) = self.allocate_guest_block_for_module(new_len, module)?
+                    else {
                         cpu.set_register(0, 0);
                         return Ok(());
                     };
                     let bytes = self.memory.read(source, old_len)?;
                     self.memory.write(output, &bytes)?;
-                    self.free_guest_block(source, old_len)?;
+                    self.free_guest_block_for_module(source, old_len, module)?;
                     cpu.set_register(0, output.0);
                 }
             }
@@ -233,6 +238,7 @@ impl ExtRuntime {
             while format.get(index).is_some_and(u8::is_ascii_digit) {
                 index += 1;
             }
+            let has_width = index != width_start;
             let width = parse_decimal_usize(&format[width_start..index]);
             let precision = if format.get(index) == Some(&b'.') {
                 index += 1;
@@ -244,16 +250,34 @@ impl ExtRuntime {
             } else {
                 None
             };
+            let length_start = index;
             while format
                 .get(index)
                 .is_some_and(|byte| matches!(byte, b'h' | b'l'))
             {
                 index += 1;
             }
+            let has_length = index != length_start;
             let specifier = *format
                 .get(index)
                 .ok_or_else(|| Error::Abi("sprintf format ends after '%'".into()))?;
             index += 1;
+            if specifier == b'm' {
+                // Verified SDK extension: bare `%m` emits the resource prefix and consumes no argument.
+                if left_aligned
+                    || show_sign
+                    || space_sign
+                    || alternate
+                    || zero_padded
+                    || has_width
+                    || precision.is_some()
+                    || has_length
+                {
+                    return Err(Error::Abi("unsupported sprintf modifiers for '%m'".into()));
+                }
+                output.push(b'm');
+                continue;
+            }
             let argument = next_argument(&self.memory)?;
             let (mut field, numeric_prefix_len) = match specifier {
                 b's' => {

@@ -2,6 +2,558 @@ use super::ram_package::read_le_u32;
 use super::*;
 
 impl ExtRuntime {
+    pub(super) fn create_platform_editor(
+        &mut self,
+        module: usize,
+        title: Vec<u16>,
+        text: Vec<u16>,
+        editor_type: u32,
+        max_code_units: usize,
+    ) -> Result<u32> {
+        if max_code_units > MAX_PLATFORM_EDITOR_CODE_UNITS {
+            return Err(Error::ResourceLimit(format!(
+                "platform editor requested {max_code_units} code units (limit {MAX_PLATFORM_EDITOR_CODE_UNITS})"
+            )));
+        }
+        if text.len() > max_code_units {
+            return Err(Error::Abi(format!(
+                "platform editor initial text has {} code units (limit {max_code_units})",
+                text.len()
+            )));
+        }
+        let owner_generation = self
+            .modules
+            .get(module)
+            .ok_or_else(|| Error::Abi(format!("editor creation for missing module {module}")))?
+            .generation;
+        let buffer_len = max_code_units
+            .checked_add(1)
+            .and_then(|units| units.checked_mul(2))
+            .ok_or_else(|| Error::Abi("platform editor buffer length overflow".into()))?;
+        let handle = self.allocate_ui_handle()?;
+        let buffer = self
+            .allocate_guest_block_for_module(buffer_len, module)?
+            .ok_or_else(|| {
+                Error::ResourceLimit("guest heap exhausted for platform editor".into())
+            })?;
+        self.memory.write(buffer, &vec![0; buffer_len])?;
+        self.write_platform_editor_units(buffer, &text)?;
+        self.editors.insert(
+            handle,
+            PlatformEditor {
+                owner_generation,
+                _title: title,
+                _editor_type: editor_type,
+                max_code_units,
+                text,
+                buffer,
+                buffer_len,
+            },
+        );
+        self.active_platform_ui
+            .push(ActivePlatformUi::Editor(handle));
+        Ok(handle)
+    }
+
+    pub(super) fn release_platform_editor(&mut self, module: usize, handle: u32) -> Result<bool> {
+        let owner_generation = self
+            .modules
+            .get(module)
+            .ok_or_else(|| Error::Abi(format!("editor release for missing module {module}")))?
+            .generation;
+        let Some(editor) = self.editors.get(&handle) else {
+            return Ok(false);
+        };
+        if editor.owner_generation != owner_generation {
+            return Ok(false);
+        }
+        let (buffer, buffer_len) = (editor.buffer, editor.buffer_len);
+        self.free_guest_block_for_module(buffer, buffer_len, module)?;
+        self.editors.remove(&handle);
+        let ui = ActivePlatformUi::Editor(handle);
+        self.active_platform_ui.retain(|active| *active != ui);
+        if self
+            .platform_pointer_capture
+            .is_some_and(|capture| capture.ui == ui)
+        {
+            self.platform_pointer_capture = None;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn platform_editor_text(
+        &self,
+        module: usize,
+        handle: u32,
+    ) -> Result<Option<GuestAddr>> {
+        let owner_generation = self
+            .modules
+            .get(module)
+            .ok_or_else(|| Error::Abi(format!("editor access for missing module {module}")))?
+            .generation;
+        Ok(self
+            .editors
+            .get(&handle)
+            .filter(|editor| editor.owner_generation == owner_generation)
+            .map(|editor| editor.buffer))
+    }
+
+    pub(super) fn set_platform_editor_text(&mut self, handle: u32, text: &str) -> Result<()> {
+        let editor = self.editors.get(&handle).ok_or_else(|| {
+            Error::Abi(format!("active platform editor handle {handle} is missing"))
+        })?;
+        let (buffer, max_code_units) = (editor.buffer, editor.max_code_units);
+        let mut units = Vec::with_capacity(text.len().min(max_code_units));
+        for character in text.chars() {
+            let required = character.len_utf16();
+            if units.len().saturating_add(required) > max_code_units {
+                break;
+            }
+            let mut encoded = [0_u16; 2];
+            units.extend_from_slice(character.encode_utf16(&mut encoded));
+        }
+        self.write_platform_editor_units(buffer, &units)?;
+        self.editors
+            .get_mut(&handle)
+            .expect("validated platform editor remains live")
+            .text = units;
+        Ok(())
+    }
+
+    fn write_platform_editor_units(&mut self, buffer: GuestAddr, units: &[u16]) -> Result<()> {
+        let mut encoded = Vec::with_capacity((units.len() + 1) * 2);
+        for unit in units {
+            encoded.extend_from_slice(&unit.to_be_bytes());
+        }
+        encoded.extend_from_slice(&[0, 0]);
+        self.memory.write(buffer, &encoded)
+    }
+
+    pub(super) fn create_native_window(&mut self, module: usize) -> Result<u32> {
+        let owner_generation = self
+            .modules
+            .get(module)
+            .ok_or_else(|| Error::Abi(format!("window creation for missing module {module}")))?
+            .generation;
+        let handle = self.allocate_ui_handle()?;
+        self.native_windows.insert(handle, owner_generation);
+        Ok(handle)
+    }
+
+    pub(super) fn release_native_window(&mut self, module: usize, handle: u32) -> Result<bool> {
+        let owner_generation = self
+            .modules
+            .get(module)
+            .ok_or_else(|| Error::Abi(format!("window release for missing module {module}")))?
+            .generation;
+        if self.native_windows.get(&handle) != Some(&owner_generation) {
+            return Ok(false);
+        }
+        self.native_windows.remove(&handle);
+        Ok(true)
+    }
+
+    pub(super) fn create_platform_menu(
+        &mut self,
+        title: Vec<u16>,
+        item_count: usize,
+    ) -> Result<u32> {
+        if item_count > MAX_PLATFORM_MENU_ITEMS {
+            return Err(Error::ResourceLimit(format!(
+                "platform menu requested {item_count} items (limit {MAX_PLATFORM_MENU_ITEMS})"
+            )));
+        }
+        let handle = self.allocate_ui_handle()?;
+        self.menus.insert(
+            handle,
+            PlatformMenu {
+                title,
+                items: vec![None; item_count],
+                focused_item: 0,
+                first_visible_item: 0,
+                previous_screen: None,
+                menu_screen: None,
+                modal_detached: false,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub(super) fn set_platform_menu_item(
+        &mut self,
+        handle: u32,
+        index: usize,
+        text: Vec<u16>,
+    ) -> bool {
+        let Some(item) = self
+            .menus
+            .get_mut(&handle)
+            .and_then(|menu| menu.items.get_mut(index))
+        else {
+            return false;
+        };
+        *item = Some(text);
+        true
+    }
+
+    pub(super) fn selected_platform_menu_item(&self, handle: u32) -> Option<usize> {
+        let menu = self.menus.get(&handle)?;
+        menu.items
+            .get(menu.focused_item)
+            .and_then(Option::as_ref)
+            .map(|_| menu.focused_item)
+    }
+
+    pub(super) fn set_platform_menu_focus(
+        &mut self,
+        handle: u32,
+        index: usize,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        let Some(menu) = self.menus.get_mut(&handle) else {
+            return Ok(false);
+        };
+        if menu.items.get(index).and_then(Option::as_ref).is_none() {
+            return Ok(false);
+        }
+        menu.focused_item = index;
+        self.render_platform_menu(handle, services)?;
+        Ok(true)
+    }
+
+    pub(super) fn move_platform_menu_focus(
+        &mut self,
+        handle: u32,
+        direction: i32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        let Some(menu) = self.menus.get(&handle) else {
+            return Ok(false);
+        };
+        let item_count = menu.items.len();
+        if item_count == 0 {
+            self.render_platform_menu(handle, services)?;
+            return Ok(true);
+        }
+        let focused_item = menu.focused_item.min(item_count - 1);
+        let next = (1..=item_count).find_map(|distance| {
+            let index = if direction < 0 {
+                (focused_item + item_count - distance % item_count) % item_count
+            } else {
+                (focused_item + distance) % item_count
+            };
+            menu.items[index].as_ref().map(|_| index)
+        });
+        if let Some(next) = next {
+            self.menus
+                .get_mut(&handle)
+                .expect("menu handle was checked")
+                .focused_item = next;
+        }
+        self.render_platform_menu(handle, services)?;
+        Ok(true)
+    }
+
+    pub(super) fn show_platform_menu(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        if !self.menus.contains_key(&handle) {
+            return Ok(false);
+        }
+        self.pending_platform_menu_selection = None;
+        let ui = ActivePlatformUi::Menu(handle);
+        if let Some(position) = self
+            .active_platform_ui
+            .iter()
+            .position(|active| *active == ui)
+        {
+            self.active_platform_ui.truncate(position + 1);
+            self.platform_pointer_capture = None;
+            self.render_platform_menu(handle, services)?;
+            return Ok(true);
+        }
+
+        let previous_screen = self.capture_platform_screen(services)?;
+        self.memory.write(SCREEN_BASE, &previous_screen)?;
+        self.menus
+            .get_mut(&handle)
+            .expect("menu handle was checked")
+            .previous_screen = Some(previous_screen.clone());
+        if let Err(error) = self.render_platform_menu(handle, services) {
+            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.menus
+                .get_mut(&handle)
+                .expect("menu handle was checked")
+                .previous_screen = None;
+            return Err(error);
+        }
+        self.active_platform_ui.push(ui);
+        Ok(true)
+    }
+
+    pub(super) fn release_platform_menu(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        if self.pending_platform_menu_selection == Some(handle) {
+            self.pending_platform_menu_selection = None;
+        }
+        let Some(menu) = self.menus.remove(&handle) else {
+            return Ok(false);
+        };
+        let ui = ActivePlatformUi::Menu(handle);
+        let position = self
+            .active_platform_ui
+            .iter()
+            .position(|active| *active == ui);
+        let was_top =
+            position.is_some_and(|position| position + 1 == self.active_platform_ui.len());
+        let modal_parent_screen = (position.is_none() && menu.modal_detached)
+            .then(|| {
+                self.active_platform_ui
+                    .iter()
+                    .all(|ui| matches!(ui, ActivePlatformUi::Menu(_)))
+            })
+            .filter(|all_menus| *all_menus)
+            .and_then(|_| {
+                self.active_platform_ui.iter().find_map(|ui| {
+                    let ActivePlatformUi::Menu(handle) = ui else {
+                        return None;
+                    };
+                    self.menus
+                        .get(handle)
+                        .and_then(|menu| menu.previous_screen.clone())
+                })
+            });
+        if let Some(position) = position {
+            self.active_platform_ui.remove(position);
+        }
+        if self
+            .platform_pointer_capture
+            .is_some_and(|capture| capture.ui == ui)
+        {
+            self.platform_pointer_capture = None;
+        }
+        if let Some(previous_screen) = modal_parent_screen {
+            self.pending_platform_menu_returns = self
+                .pending_platform_menu_returns
+                .checked_add(self.active_platform_ui.len())
+                .filter(|count| *count <= MAX_PENDING_PLATFORM_MENU_RETURNS)
+                .ok_or_else(|| {
+                    Error::ResourceLimit("too many pending platform menu returns".into())
+                })?;
+            self.active_platform_ui.clear();
+            self.platform_pointer_capture = None;
+            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.present_screen(services)?;
+        } else if was_top && let Some(previous_screen) = menu.previous_screen {
+            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.present_screen(services)?;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn refresh_platform_menu(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        if self.active_platform_ui.last() != Some(&ActivePlatformUi::Menu(handle)) {
+            return Ok(false);
+        }
+        if self.pending_platform_menu_selection == Some(handle) {
+            self.pending_platform_menu_selection = None;
+        }
+        self.render_platform_menu(handle, services)?;
+        Ok(true)
+    }
+
+    pub(super) fn platform_menu_pointer_action(
+        &self,
+        handle: u32,
+        x: i32,
+        y: i32,
+    ) -> Result<PlatformPointerAction> {
+        let Some(menu) = self.menus.get(&handle) else {
+            return Ok(PlatformPointerAction::None);
+        };
+        let (width, height) = self.screen_dimensions()?;
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return Ok(PlatformPointerAction::None);
+        }
+        let item_top = 34;
+        let item_height = 24;
+        let softkey_top = height.saturating_sub(26).max(item_top);
+        if y >= softkey_top {
+            if x >= width / 2 {
+                return Ok(PlatformPointerAction::MenuReturn);
+            }
+            return Ok(self
+                .selected_platform_menu_item(handle)
+                .map(PlatformPointerAction::MenuSelect)
+                .unwrap_or(PlatformPointerAction::None));
+        }
+        if y < item_top {
+            return Ok(PlatformPointerAction::None);
+        }
+        let visible_index = usize::try_from((y - item_top) / item_height)
+            .map_err(|_| Error::Abi("platform menu pointer index overflow".into()))?;
+        let index = menu.first_visible_item.saturating_add(visible_index);
+        Ok(menu
+            .items
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|_| PlatformPointerAction::MenuSelect(index))
+            .unwrap_or(PlatformPointerAction::None))
+    }
+
+    pub(super) fn platform_dialog_pointer_action(
+        &self,
+        x: i32,
+        y: i32,
+    ) -> Result<PlatformPointerAction> {
+        let (width, height) = self.screen_dimensions()?;
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return Ok(PlatformPointerAction::None);
+        }
+        let softkey_top = height.saturating_sub(26);
+        if y >= softkey_top {
+            return Ok(if x < width / 2 {
+                PlatformPointerAction::DialogAccept
+            } else {
+                PlatformPointerAction::DialogCancel
+            });
+        }
+        let button_width = 120.min(width.saturating_sub(24));
+        let button_x = (width - button_width) / 2;
+        let button_y = height.saturating_sub(68);
+        if x >= button_x && x < button_x + button_width && y >= button_y && y < button_y + 30 {
+            return Ok(PlatformPointerAction::DialogAccept);
+        }
+        Ok(PlatformPointerAction::None)
+    }
+
+    pub(super) fn platform_text_viewer_pointer_action(
+        &self,
+        x: i32,
+        y: i32,
+    ) -> Result<PlatformPointerAction> {
+        let (width, height) = self.screen_dimensions()?;
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return Ok(PlatformPointerAction::None);
+        }
+        let softkey_top = height.saturating_sub(26);
+        Ok(if y >= softkey_top && x >= width / 2 {
+            PlatformPointerAction::TextViewerReturn
+        } else {
+            PlatformPointerAction::None
+        })
+    }
+
+    pub(super) fn render_platform_menu(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        let (title, items, focused_item, mut first_visible_item) = {
+            let menu = self
+                .menus
+                .get(&handle)
+                .ok_or_else(|| Error::Abi(format!("missing platform menu handle {handle}")))?;
+            (
+                menu.title.clone(),
+                menu.items.clone(),
+                menu.focused_item,
+                menu.first_visible_item,
+            )
+        };
+        let (width, height) = self.screen_dimensions()?;
+        let item_top = 34;
+        let item_height = 24;
+        let softkey_top = height.saturating_sub(26).max(item_top);
+        let visible_items = usize::try_from((softkey_top - item_top) / item_height)
+            .unwrap_or(0)
+            .max(1);
+        if focused_item < first_visible_item {
+            first_visible_item = focused_item;
+        } else if focused_item >= first_visible_item.saturating_add(visible_items) {
+            first_visible_item = focused_item + 1 - visible_items;
+        }
+
+        let black = Framebuffer::rgb565(0, 0, 0);
+        let green = Framebuffer::rgb565(0, 252, 0);
+        let blue = Framebuffer::rgb565(0, 0, 248);
+        self.draw_rectangle_to_screen(0, 0, width, height, black)?;
+        self.draw_text_to_screen(&title, 8, 6, green, 0, services)?;
+        self.draw_rectangle_to_screen(0, 26, width, 1, green)?;
+        for (visible_index, item) in items
+            .iter()
+            .skip(first_visible_item)
+            .take(visible_items)
+            .enumerate()
+        {
+            let item_index = first_visible_item + visible_index;
+            let y = item_top + i32::try_from(visible_index).unwrap_or(i32::MAX) * item_height;
+            if item_index == focused_item {
+                self.draw_rectangle_to_screen(0, y, width, item_height, blue)?;
+            }
+            if let Some(text) = item {
+                self.draw_text_to_screen(text, 0, y + 4, green, 0, services)?;
+            }
+        }
+        self.draw_rectangle_to_screen(0, softkey_top, width, 1, green)?;
+        self.draw_text_to_screen(&[0x786e, 0x5b9a], 4, softkey_top + 5, green, 0, services)?;
+        self.draw_text_to_screen(
+            &[0x8fd4, 0x56de],
+            width.saturating_sub(36),
+            softkey_top + 5,
+            green,
+            0,
+            services,
+        )?;
+
+        let menu_screen = self
+            .memory
+            .read(SCREEN_BASE, self.platform_screen_byte_len()?)?;
+        let menu = self
+            .menus
+            .get_mut(&handle)
+            .expect("menu handle remained live while rendering");
+        menu.first_visible_item = first_visible_item;
+        menu.menu_screen = Some(menu_screen);
+        self.present_screen(services)
+    }
+
+    fn platform_screen_byte_len(&self) -> Result<usize> {
+        let (width, height) = self.screen_dimensions()?;
+        usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or_else(|| Error::Abi("platform UI screen size overflow".into()))
+    }
+
+    fn capture_platform_screen(&self, services: &mut dyn NativeServices) -> Result<Vec<u8>> {
+        let expected_len = self.platform_screen_byte_len()?;
+        let Some(screen) = services.capture_framebuffer()? else {
+            return self.memory.read(SCREEN_BASE, expected_len);
+        };
+        if screen.len() != expected_len {
+            return Err(Error::Abi(format!(
+                "captured framebuffer is {} bytes, expected {expected_len}",
+                screen.len()
+            )));
+        }
+        Ok(screen)
+    }
+
     pub(super) fn create_platform_dialog(
         &mut self,
         title: &[u16],
@@ -14,6 +566,7 @@ impl ExtRuntime {
                 "unsupported platform dialog style {style}"
             )));
         }
+        let handle = self.allocate_ui_handle()?;
         let (width, height) = self.screen_dimensions()?;
         let screen_len = usize::try_from(width)
             .ok()
@@ -24,40 +577,57 @@ impl ExtRuntime {
             })
             .and_then(|pixels| pixels.checked_mul(2))
             .ok_or_else(|| Error::Abi("platform dialog screen size overflow".into()))?;
-        let previous_screen = self.memory.read(SCREEN_BASE, screen_len)?;
+        let selected_menu_background =
+            self.pending_platform_menu_selection
+                .take()
+                .and_then(|handle| {
+                    let ui = ActivePlatformUi::Menu(handle);
+                    if self.active_platform_ui.last().copied() != Some(ui) {
+                        return None;
+                    }
+                    self.active_platform_ui.pop();
+                    if self
+                        .platform_pointer_capture
+                        .is_some_and(|capture| capture.ui == ui)
+                    {
+                        self.platform_pointer_capture = None;
+                    }
+                    let previous_screen = self
+                        .menus
+                        .get(&handle)
+                        .and_then(|menu| menu.previous_screen.clone());
+                    if previous_screen.is_some()
+                        && let Some(menu) = self.menus.get_mut(&handle)
+                    {
+                        menu.modal_detached = true;
+                    }
+                    previous_screen
+                });
+        let previous_screen = match selected_menu_background {
+            Some(screen) => screen,
+            None => self.capture_platform_screen(services)?,
+        };
+        self.memory.write(SCREEN_BASE, &previous_screen)?;
 
-        let background = Framebuffer::rgb565(248, 252, 248);
-        let accent = Framebuffer::rgb565(32, 160, 224);
-        let accent_dark = Framebuffer::rgb565(0, 96, 176);
         let black = Framebuffer::rgb565(0, 0, 0);
-        let white = Framebuffer::rgb565(255, 255, 255);
-        self.draw_rectangle_to_screen(0, 0, width, height, background)?;
-        self.draw_rectangle_to_screen(0, 0, width, 30, accent)?;
-        self.draw_text_to_screen(title, 8, 7, white, 0, services)?;
-        self.draw_wrapped_text_to_screen(message, 12, 48, width - 24, black, services)?;
-
-        let button_width = 120.min(width.saturating_sub(24));
-        let button_x = (width - button_width) / 2;
-        let button_y = height.saturating_sub(68);
-        self.draw_rectangle_to_screen(
-            button_x - 1,
-            button_y - 1,
-            button_width + 2,
-            32,
-            accent_dark,
-        )?;
-        self.draw_rectangle_to_screen(button_x, button_y, button_width, 30, accent)?;
+        let green = Framebuffer::rgb565(0, 252, 0);
+        let softkey_top = height.saturating_sub(26);
+        self.draw_rectangle_to_screen(0, 0, width, height, black)?;
+        self.draw_text_to_screen(title, 8, 6, green, 0, services)?;
+        self.draw_rectangle_to_screen(0, 26, width, 1, green)?;
+        self.draw_wrapped_text_to_screen(message, 12, 48, width - 24, green, services)?;
+        self.draw_rectangle_to_screen(0, softkey_top, width, 1, green)?;
+        self.draw_text_to_screen(&[0x786e, 0x5b9a], 4, softkey_top + 5, green, 0, services)?;
         self.draw_text_to_screen(
-            &[0x786e, 0x5b9a],
-            button_x + button_width / 2 - 16,
-            button_y + 7,
-            white,
+            &[0x8fd4, 0x56de],
+            width.saturating_sub(36),
+            softkey_top + 5,
+            green,
             0,
             services,
         )?;
 
         let dialog_screen = self.memory.read(SCREEN_BASE, screen_len)?;
-        let handle = self.allocate_ui_handle()?;
         self.dialogs.insert(
             handle,
             PlatformDialog {
@@ -65,8 +635,166 @@ impl ExtRuntime {
                 dialog_screen,
             },
         );
+        self.active_platform_ui
+            .push(ActivePlatformUi::Dialog(handle));
         self.present_screen(services)?;
         Ok(handle)
+    }
+
+    pub(super) fn release_platform_dialog(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        let Some(dialog) = self.dialogs.remove(&handle) else {
+            return Ok(false);
+        };
+        let ui = ActivePlatformUi::Dialog(handle);
+        let position = self
+            .active_platform_ui
+            .iter()
+            .position(|active| *active == ui);
+        let was_top =
+            position.is_some_and(|position| position + 1 == self.active_platform_ui.len());
+        if let Some(position) = position {
+            self.active_platform_ui.remove(position);
+        }
+        if self
+            .platform_pointer_capture
+            .is_some_and(|capture| capture.ui == ui)
+        {
+            self.platform_pointer_capture = None;
+        }
+        if was_top {
+            self.memory.write(SCREEN_BASE, &dialog.previous_screen)?;
+            self.present_screen(services)?;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn create_platform_text_viewer(
+        &mut self,
+        title: &[u16],
+        text: &[u16],
+        style: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<u32> {
+        if style != 2 {
+            return Err(Error::Abi(format!(
+                "unsupported platform text-viewer style {style}"
+            )));
+        }
+        let handle = self.allocate_ui_handle()?;
+        let previous_screen = self
+            .pending_platform_menu_selection
+            .take()
+            .and_then(|handle| {
+                let ui = ActivePlatformUi::Menu(handle);
+                if self.active_platform_ui.last().copied() != Some(ui) {
+                    return None;
+                }
+                self.active_platform_ui.pop();
+                if self
+                    .platform_pointer_capture
+                    .is_some_and(|capture| capture.ui == ui)
+                {
+                    self.platform_pointer_capture = None;
+                }
+                let previous_screen = self
+                    .menus
+                    .get(&handle)
+                    .and_then(|menu| menu.previous_screen.clone());
+                if previous_screen.is_some()
+                    && let Some(menu) = self.menus.get_mut(&handle)
+                {
+                    menu.modal_detached = true;
+                }
+                previous_screen
+            })
+            .map(Ok)
+            .unwrap_or_else(|| self.capture_platform_screen(services))?;
+        self.memory.write(SCREEN_BASE, &previous_screen)?;
+
+        let (width, height) = self.screen_dimensions()?;
+        let black = Framebuffer::rgb565(0, 0, 0);
+        let green = Framebuffer::rgb565(0, 252, 0);
+        self.draw_rectangle_to_screen(0, 0, width, height, black)?;
+        self.draw_text_to_screen(title, 7, 6, green, 0, services)?;
+        self.draw_rectangle_to_screen(0, 26, width, 1, green)?;
+        self.draw_wrapped_text_to_screen(text, 8, 32, width - 16, green, services)?;
+
+        let softkey_top = height.saturating_sub(26);
+        self.draw_rectangle_to_screen(0, softkey_top, width, 1, green)?;
+        self.draw_text_to_screen(
+            &[0x8fd4, 0x56de],
+            width.saturating_sub(36),
+            softkey_top + 5,
+            green,
+            0,
+            services,
+        )?;
+
+        let viewer_screen = self
+            .memory
+            .read(SCREEN_BASE, self.platform_screen_byte_len()?)?;
+        self.text_viewers.insert(
+            handle,
+            PlatformTextViewer {
+                previous_screen,
+                viewer_screen,
+            },
+        );
+        self.active_platform_ui
+            .push(ActivePlatformUi::TextViewer(handle));
+        self.present_screen(services)?;
+        Ok(handle)
+    }
+
+    pub(super) fn release_platform_text_viewer(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        let Some(viewer) = self.text_viewers.remove(&handle) else {
+            return Ok(false);
+        };
+        let ui = ActivePlatformUi::TextViewer(handle);
+        let position = self
+            .active_platform_ui
+            .iter()
+            .position(|active| *active == ui);
+        let was_top =
+            position.is_some_and(|position| position + 1 == self.active_platform_ui.len());
+        if let Some(position) = position {
+            self.active_platform_ui.remove(position);
+        }
+        if self
+            .platform_pointer_capture
+            .is_some_and(|capture| capture.ui == ui)
+        {
+            self.platform_pointer_capture = None;
+        }
+        if was_top {
+            self.memory.write(SCREEN_BASE, &viewer.previous_screen)?;
+            self.present_screen(services)?;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn refresh_platform_text_viewer(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        if self.active_platform_ui.last() != Some(&ActivePlatformUi::TextViewer(handle)) {
+            return Ok(false);
+        }
+        let Some(viewer) = self.text_viewers.get(&handle) else {
+            return Ok(false);
+        };
+        self.memory.write(SCREEN_BASE, &viewer.viewer_screen)?;
+        self.present_screen(services)?;
+        Ok(true)
     }
 
     pub(super) fn draw_wrapped_text_to_screen(
@@ -103,11 +831,29 @@ impl ExtRuntime {
     }
 
     pub(super) fn allocate_ui_handle(&mut self) -> Result<u32> {
+        let live_handles = self
+            .dialogs
+            .len()
+            .saturating_add(self.text_viewers.len())
+            .saturating_add(self.editors.len())
+            .saturating_add(self.menus.len())
+            .saturating_add(self.native_windows.len());
+        if live_handles >= MAX_PLATFORM_UI_HANDLES {
+            return Err(Error::ResourceLimit(format!(
+                "platform UI has {live_handles} live handles (limit {MAX_PLATFORM_UI_HANDLES})"
+            )));
+        }
         let start = self.next_ui_handle;
         loop {
             let handle = self.next_ui_handle;
             self.next_ui_handle = self.next_ui_handle.checked_add(1).unwrap_or(1);
-            if handle != 0 && !self.dialogs.contains_key(&handle) {
+            if handle != 0
+                && !self.dialogs.contains_key(&handle)
+                && !self.text_viewers.contains_key(&handle)
+                && !self.editors.contains_key(&handle)
+                && !self.menus.contains_key(&handle)
+                && !self.native_windows.contains_key(&handle)
+            {
                 return Ok(handle);
             }
             if self.next_ui_handle == start {
@@ -189,6 +935,7 @@ impl ExtRuntime {
         package_address: GuestAddr,
         package_len: usize,
         output_len: usize,
+        module: usize,
     ) -> Result<Option<GuestAddr>> {
         if package_len < 24 {
             return Ok(None);
@@ -203,10 +950,7 @@ impl ExtRuntime {
 
         let output_len = u32::try_from(output_len)
             .map_err(|_| Error::Abi("compact RAM MRP output length exceeds u32".into()))?;
-        let aligned_len = output_len
-            .checked_add(7)
-            .map(|len| len & !7)
-            .ok_or_else(|| Error::Abi("compact RAM MRP output alignment overflow".into()))?;
+        let aligned_len = heap::aligned_heap_len(output_len as usize)?;
         let heap_end = HEAP_BASE.0 + self.heap_len as u32;
         let mut candidates = Vec::new();
         for descriptor_len_address in (HEAP_BASE.0 + 4..heap_end).step_by(4) {
@@ -223,12 +967,20 @@ impl ExtRuntime {
             let candidate = GuestAddr(candidate);
             if self
                 .memory
-                .check_range(candidate, output_len as usize, Permissions::READ_WRITE)
+                .check_range(candidate, aligned_len as usize, Permissions::READ_WRITE)
                 .is_err()
             {
                 continue;
             }
-            if self.memory.read_u32(candidate.checked_add(4)?)? == aligned_len {
+            if self.memory.read_u32(candidate.checked_add(4)?)? != aligned_len {
+                continue;
+            }
+            let claimable = self.prepared_output_candidate_is_claimable_by_module(
+                candidate,
+                aligned_len,
+                module,
+            )?;
+            if claimable {
                 candidates.push(candidate);
             }
         }
@@ -236,10 +988,7 @@ impl ExtRuntime {
         candidates.dedup();
         match candidates.as_slice() {
             [] => Ok(None),
-            [candidate] => {
-                self.reserve_guest_heap_range(*candidate, aligned_len)?;
-                Ok(Some(*candidate))
-            }
+            [candidate] => Ok(Some(*candidate)),
             _ => Err(Error::Abi(format!(
                 "compact RAM MRP output has ambiguous prepared buffers: {candidates:?}"
             ))),
@@ -253,7 +1002,7 @@ impl ExtRuntime {
         y: i32,
         width: usize,
         height: usize,
-        transparent_color: Option<u16>,
+        mode: BitmapDrawMode,
     ) -> Result<()> {
         let (screen_width, screen_height) = self.screen_dimensions()?;
         let destination_x0 = i64::from(x).max(0);
@@ -283,25 +1032,43 @@ impl ExtRuntime {
                 .and_then(|offset| offset.checked_mul(2))
                 .ok_or_else(|| Error::Abi("visible bitmap source offset overflow".into()))?;
             let source_row = &pixels[source_offset..source_offset + row_byte_len];
-            let destination_address = self.screen_address(
+            let destination_address = self.active_screen_address(
                 destination_x0 as i32,
                 destination_y0 as i32 + visible_row as i32,
                 screen_width,
             )?;
-            if let Some(transparent_color) = transparent_color {
+            if mode == BitmapDrawMode::Copy {
+                self.memory.write(destination_address, source_row)?;
+            } else {
                 let mut destination_row = self.memory.read(destination_address, row_byte_len)?;
                 for (source, destination) in source_row
-                    .chunks_exact(2)
-                    .zip(destination_row.chunks_exact_mut(2))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(destination_row.as_chunks_mut::<2>().0.iter_mut())
                 {
-                    let color = u16::from_le_bytes([source[0], source[1]]);
-                    if color != transparent_color {
-                        destination.copy_from_slice(source);
+                    let source = u16::from_le_bytes(*source);
+                    match mode {
+                        BitmapDrawMode::Or => {
+                            let destination_color =
+                                u16::from_le_bytes([destination[0], destination[1]]);
+                            destination
+                                .copy_from_slice(&(source | destination_color).to_le_bytes());
+                        }
+                        BitmapDrawMode::Transparent(transparent_color)
+                            if source != transparent_color =>
+                        {
+                            destination.copy_from_slice(&source.to_le_bytes());
+                        }
+                        BitmapDrawMode::Transparent(_) => {}
+                        BitmapDrawMode::Gray(transparent_color) if source != transparent_color => {
+                            destination.copy_from_slice(&grayscale_rgb565(source).to_le_bytes());
+                        }
+                        BitmapDrawMode::Gray(_) => {}
+                        BitmapDrawMode::Copy => unreachable!("copy rows are handled above"),
                     }
                 }
                 self.memory.write(destination_address, &destination_row)?;
-            } else {
-                self.memory.write(destination_address, source_row)?;
             }
         }
         Ok(())
@@ -551,15 +1318,81 @@ impl ExtRuntime {
         ))
     }
 
-    pub(super) fn screen_address(&self, x: i32, y: i32, width: i32) -> Result<GuestAddr> {
-        let offset = y
-            .checked_mul(width)
-            .and_then(|offset| offset.checked_add(x))
-            .and_then(|offset| offset.checked_mul(2))
-            .and_then(|offset| u32::try_from(offset).ok())
-            .ok_or_else(|| Error::Abi("screen pixel offset overflow".into()))?;
-        SCREEN_BASE.checked_add(offset)
+    pub(super) fn set_screen_orientation(
+        &mut self,
+        landscape: bool,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        let (width, height) = self.screen_dimensions()?;
+        let width = u16::try_from(width)
+            .map_err(|_| Error::Abi(format!("screen width {width} exceeds u16")))?;
+        let height = u16::try_from(height)
+            .map_err(|_| Error::Abi(format!("screen height {height} exceeds u16")))?;
+        let short = width.min(height);
+        let long = width.max(height);
+        let (width, height) = if landscape {
+            (long, short)
+        } else {
+            (short, long)
+        };
+        if self.screen_dimensions()? == (i32::from(width), i32::from(height)) {
+            return Ok(());
+        }
+
+        let byte_len = usize::from(width)
+            .checked_mul(usize::from(height))
+            .and_then(|pixels| pixels.checked_mul(2))
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| Error::Abi("screen bitmap size overflow".into()))?;
+        self.memory
+            .check_range(SCREEN_BASE, byte_len as usize, Permissions::READ_WRITE)?;
+        let bitmap_table = GuestAddr(self.memory.read_u32(table_slot_address(95))?);
+        let screen_bitmap = bitmap_table.checked_add(SCREEN_BITMAP_ID * BITMAP_ENTRY_SIZE)?;
+
+        services.resize_screen(width, height)?;
+        self.memory
+            .write_u32(data_slot_address(92), u32::from(width))?;
+        self.memory
+            .write_u32(data_slot_address(93), u32::from(height))?;
+        self.memory.write_u16(screen_bitmap, width)?;
+        self.memory
+            .write_u16(screen_bitmap.checked_add(2)?, height)?;
+        self.memory
+            .write_u32(screen_bitmap.checked_add(4)?, byte_len)?;
+        self.present_screen(services)
     }
+
+    pub(super) fn screen_address(&self, x: i32, y: i32, width: i32) -> Result<GuestAddr> {
+        screen_pixel_address(SCREEN_BASE, x, y, width)
+    }
+
+    fn active_screen_address(&self, x: i32, y: i32, width: i32) -> Result<GuestAddr> {
+        let screen = GuestAddr(self.memory.read_u32(data_slot_address(91))?);
+        screen_pixel_address(screen, x, y, width)
+    }
+}
+
+fn screen_pixel_address(screen: GuestAddr, x: i32, y: i32, width: i32) -> Result<GuestAddr> {
+    let offset = y
+        .checked_mul(width)
+        .and_then(|offset| offset.checked_add(x))
+        .and_then(|offset| offset.checked_mul(2))
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or_else(|| Error::Abi("screen pixel offset overflow".into()))?;
+    screen.checked_add(offset)
+}
+
+fn grayscale_rgb565(color: u16) -> u16 {
+    let red = u32::from((color >> 11) & 0x1f);
+    let green = u32::from((color >> 5) & 0x3f);
+    let blue = u32::from(color & 0x1f);
+    let red = (red << 3) | (red >> 2);
+    let green = (green << 2) | (green >> 4);
+    let blue = (blue << 3) | (blue >> 2);
+    // The caller only defines gray-with-transparent-key semantics. Use a
+    // deterministic integer BT.601 conversion for the platform implementation.
+    let luminance = ((77 * red + 150 * green + 29 * blue + 128) >> 8) as i32;
+    Framebuffer::rgb565(luminance, luminance, luminance)
 }
 
 impl BitmapTransform {

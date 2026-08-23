@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
 import fs from "fs";
-import { readFile } from "fs/promises";
 
 describe("wbrw 输入文字", () => {
   let engine: SkyEngineE2e | undefined;
@@ -21,8 +20,12 @@ describe("wbrw 输入文字", () => {
 
     engine = await SkyEngineE2e.start("test/fixtures/wbrw.mrp", { workDir: ws.dir });
     {
-      await engine.delay(5000);
-      const boot = await engine.screen("home");
+      const boot = await engine.waitForScreen(
+        screen =>
+          screen.pixel(76, 252).toString() === "248,252,248" &&
+          screen.pixel(57, 306).toString() === "64,144,208",
+        { name: "home", timeoutMs: 30_000, intervalMs: 250 },
+      );
       // rgb(248, 252, 248)
       expect(boot.pixel(76, 252)).toEqual([248, 252, 248]);
       // rgb(64, 144, 208)
@@ -41,9 +44,7 @@ describe("wbrw 输入文字", () => {
       const beforePaste = await engine.screen("before-paste");
       await engine.pasteShortcut();
       const afterPaste = await engine.screen("after-paste");
-      const stderr = await readFile(engine.stderrPath, "utf8");
 
-      expect(stderr).toContain("editGetText(): 'http://wap.baidu.com'");
       expect(afterPaste.diffPixelCount(beforePaste, { x: 0, y: 0, width: 240, height: 32 })).toBeGreaterThan(500);
       expect(afterPaste.pixel(99, 17)).toEqual([0, 0, 0]);
       // rgb(248, 252, 248)

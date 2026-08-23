@@ -1,12 +1,12 @@
 use std::{cmp::Ordering, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use crate::{
-    Framebuffer, Package, PlatformDisplay, ResourceLimits, Result, arm::ExtLifecycleRequest,
+    Error, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result, arm::ExtLifecycleRequest,
 };
 
 use super::{
     chunk::{Constant, MrChunk, Prototype},
-    host::{MrHost, MrHostConfig},
+    host::{MrHost, MrHostConfig, PreparedEntry},
     value::{Cell, Closure, ClosureRef, Table, TableRef, Value},
 };
 
@@ -15,6 +15,7 @@ mod stdlib;
 
 const RK_LIMIT: usize = 250;
 const SIGNATURE: &[u8; 4] = b"\x1bMRP";
+const EXT_SIGNATURE: &[u8; 8] = b"MRPGCMAP";
 
 pub struct MrVm {
     globals: TableRef,
@@ -23,12 +24,19 @@ pub struct MrVm {
     limits: ResourceLimits,
     instruction_count: u64,
     final_values: Vec<Value>,
+    native_entry: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LifecycleOutcome {
     Continue,
     ExitRequested,
+}
+
+#[derive(Debug)]
+pub(crate) enum LifecycleError {
+    BeforeCommit(Error),
+    AfterCommit(Error),
 }
 
 struct Frame {
@@ -67,6 +75,7 @@ impl MrVm {
             limits,
             instruction_count: 0,
             final_values: Vec::new(),
+            native_entry: false,
         };
         vm.register_libraries();
         vm
@@ -85,12 +94,31 @@ impl MrVm {
     }
 
     pub fn dispatch_native_timer(&mut self) -> Result<bool> {
-        self.host.dispatch_native_timer()
+        if !self.host.take_due_native_timer()? {
+            return Ok(false);
+        }
+        if self.native_entry || !self.call_global(b"dealtimer", Vec::new())? {
+            self.host.dispatch_native_timer()?;
+        }
+        Ok(true)
+    }
+
+    pub fn dispatch_external_action_completion(&mut self) -> Result<bool> {
+        self.host.dispatch_external_action_completion()
+    }
+
+    pub fn dispatch_pending_platform_event(&mut self) -> Result<bool> {
+        self.host.dispatch_pending_platform_event()
     }
 
     pub fn run_entry(&mut self, entry: &[u8]) -> Result<()> {
         self.host.set_current_entry(entry);
         let bytes = self.host.package.read_named(entry)?;
+        if bytes.starts_with(EXT_SIGNATURE) {
+            self.native_entry = true;
+            return self.host.run_native_entry(&bytes);
+        }
+        self.native_entry = false;
         if !bytes.starts_with(SIGNATURE) {
             return Err(crate::Error::UnsupportedMr(format!(
                 "text MR frontend is not implemented for {}",
@@ -121,28 +149,113 @@ impl MrVm {
         Ok(true)
     }
 
-    pub(crate) fn process_lifecycle_request(&mut self) -> Result<LifecycleOutcome> {
-        let Some(request) = self.host.lifecycle_request()? else {
+    pub(crate) fn process_lifecycle_request(
+        &mut self,
+    ) -> std::result::Result<LifecycleOutcome, LifecycleError> {
+        let Some(request) = self
+            .host
+            .lifecycle_request()
+            .map_err(LifecycleError::BeforeCommit)?
+        else {
             return Ok(LifecycleOutcome::Continue);
         };
         match request {
             ExtLifecycleRequest::Restart { package, entry } => {
-                let package = self.host.prepare_restart(&package, &entry)?;
+                let prepared = match self.host.prepare_restart(&package, &entry, &self.limits) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.host
+                            .acknowledge_lifecycle_request()
+                            .map_err(LifecycleError::BeforeCommit)?;
+                        return Err(LifecycleError::BeforeCommit(error));
+                    }
+                };
+                self.host
+                    .acknowledge_lifecycle_request()
+                    .map_err(LifecycleError::BeforeCommit)?;
+                let prepared_entry = self.host.commit_application(prepared);
                 self.globals = Table::new();
                 self.frames.clear();
                 self.instruction_count = 0;
                 self.final_values.clear();
-                self.host.reset_for_restart(package, &entry);
+                self.native_entry = false;
                 self.register_libraries();
-                self.run_entry(&entry)?;
+                if let Err(error) = self.run_prepared_entry(prepared_entry) {
+                    self.host.discard_failed_application_runtime();
+                    self.frames.clear();
+                    self.final_values.clear();
+                    self.native_entry = false;
+                    return Err(LifecycleError::AfterCommit(error));
+                }
+                Ok(LifecycleOutcome::Continue)
             }
-            ExtLifecycleRequest::Exit => return Ok(LifecycleOutcome::ExitRequested),
+            ExtLifecycleRequest::Exit => Ok(LifecycleOutcome::ExitRequested),
         }
-        Ok(LifecycleOutcome::Continue)
     }
 
-    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Option<(i32, i32, i32)> {
-        self.host.route_key_event(code, pressed)
+    fn run_prepared_entry(&mut self, prepared: PreparedEntry) -> Result<()> {
+        match prepared {
+            PreparedEntry::Native(bytes) => {
+                self.native_entry = true;
+                self.host.run_native_entry(&bytes)
+            }
+            PreparedEntry::Mr(prototype) => {
+                self.native_entry = false;
+                if std::env::var_os("SKYENGINE_TRACE_MR_PROTOTYPES").is_some() {
+                    trace_prototype(&prototype, 0);
+                }
+                let closure = Rc::new(Closure {
+                    prototype,
+                    upvalues: Vec::new(),
+                });
+                self.push_frame(closure, Vec::new(), None)?;
+                self.run_frames()
+            }
+        }
+    }
+
+    pub fn route_key_event(&mut self, code: i32, pressed: bool) -> Result<Option<(i32, i32, i32)>> {
+        let event = self.host.route_key_event(code, pressed)?;
+        if self.native_entry {
+            if let Some((event, parameter0, parameter1)) = event {
+                self.host
+                    .dispatch_native_event(event, parameter0, parameter1)?;
+            }
+            Ok(None)
+        } else {
+            Ok(event)
+        }
+    }
+
+    pub fn route_pointer_event(
+        &mut self,
+        x: i32,
+        y: i32,
+        pressed: bool,
+    ) -> Result<Option<(i32, i32, i32)>> {
+        let event = self.host.route_pointer_event(x, y, pressed)?;
+        if self.native_entry {
+            if let Some((event, parameter0, parameter1)) = event {
+                self.host
+                    .dispatch_native_event(event, parameter0, parameter1)?;
+            }
+            Ok(None)
+        } else {
+            Ok(event)
+        }
+    }
+
+    pub fn route_text_input(&mut self, text: &str) -> Result<Option<(i32, i32, i32)>> {
+        let event = self.host.route_text_input(text)?;
+        if self.native_entry {
+            if let Some((event, parameter0, parameter1)) = event {
+                self.host
+                    .dispatch_native_event(event, parameter0, parameter1)?;
+            }
+            Ok(None)
+        } else {
+            Ok(event)
+        }
     }
 
     fn run_frames(&mut self) -> Result<()> {
@@ -450,7 +563,7 @@ impl MrVm {
         };
 
         if tail {
-            self.frames.pop();
+            self.frames.pop().expect("active CALL frame");
         }
         match self.call_value(function, args, target, false)? {
             CallResult::Pushed => {}

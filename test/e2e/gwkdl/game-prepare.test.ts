@@ -35,18 +35,24 @@ describe("gwkdl 进入准备界面", () => {
     }
     // 是否检测内存？-> 是
     await engine.key('LEFT_SOFT', 1_000);
-    await engine.delay(15_000);
-    const boot = await engine.screen("bgm-select");
+    const boot = await engine.waitForScreen(
+      screen =>
+        screen.pixel(150, 308).toString() === "0,0,0" &&
+        screen.pixel(116, 84).toString() === "248,240,0",
+      { name: "bgm-select", timeoutMs: 30_000, intervalMs: 250 },
+    );
     expect(boot.pixel(150, 308)).toEqual([0, 0, 0]);
     // rgb(248, 240, 0)
     expect(boot.pixel(116, 84)).toEqual([248, 240, 0]);
 
     // 是否开启音乐？-> 否
     await engine.click(227, 301, 1_000);
-    await engine.delay(3_000);
 
     // 进入“请按任意键界面”
-    const wake = await engine.screen("menu");
+    const wake = await engine.waitForScreen(
+      screen => screen.uniqueColorCount() > 16,
+      { name: "menu", timeoutMs: 30_000, intervalMs: 250 },
+    );
     // 图片资源缺失时该画面只剩背景色和少量文字色；正常加载后会出现位图的多色像素。
     expect(wake.uniqueColorCount()).toBeGreaterThan(16);
   });

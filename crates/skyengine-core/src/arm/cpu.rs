@@ -10,6 +10,7 @@ pub struct ArmCpu {
     carry: bool,
     overflow: bool,
     thumb: bool,
+    semihosting_exit_reason: Option<u32>,
 }
 
 impl Default for ArmCpu {
@@ -27,6 +28,7 @@ impl ArmCpu {
             carry: false,
             overflow: false,
             thumb: false,
+            semihosting_exit_reason: None,
         }
     }
 
@@ -53,6 +55,10 @@ impl ArmCpu {
         } else {
             address & !3
         };
+    }
+
+    pub(crate) fn take_semihosting_exit_reason(&mut self) -> Option<u32> {
+        self.semihosting_exit_reason.take()
     }
 
     pub fn cpsr(&self) -> u32 {
@@ -84,6 +90,11 @@ impl ArmCpu {
             return self.execute_unconditional_arm(instruction, address);
         }
         if !self.condition_passed(condition) {
+            return Ok(());
+        }
+
+        if instruction == 0xef12_3456 && self.registers[0] == 0x18 {
+            self.semihosting_exit_reason = Some(self.registers[1]);
             return Ok(());
         }
 
@@ -575,6 +586,12 @@ impl ArmCpu {
                             self.registers[15] =
                                 address.wrapping_add(4).wrapping_add_signed(offset) & !1;
                         }
+                        Ok(())
+                    }
+                    0xdf00 if instruction == 0xdfab && self.registers[0] == 3 => {
+                        // The verified Thumb semihosting character-write form uses
+                        // operation 3 with r1 pointing at the byte to consume.
+                        memory.read_u8(GuestAddr(self.registers[1]))?;
                         Ok(())
                     }
                     _ => Err(self.unsupported_thumb(instruction, address)),

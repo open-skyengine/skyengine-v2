@@ -9,6 +9,7 @@ pub struct SdlDisplay {
     _sdl: sdl2::Sdl,
     canvas: Canvas<Window>,
     events: sdl2::EventPump,
+    scale: u32,
 }
 
 impl SdlDisplay {
@@ -54,11 +55,25 @@ impl SdlDisplay {
             _sdl: sdl,
             canvas,
             events,
+            scale,
         })
     }
 }
 
 impl PlatformDisplay for SdlDisplay {
+    fn resize(&mut self, width: u16, height: u16) -> Result<()> {
+        self.canvas
+            .set_logical_size(u32::from(width), u32::from(height))
+            .map_err(|error| Error::Platform(error.to_string()))?;
+        self.canvas
+            .window_mut()
+            .set_size(
+                u32::from(width).saturating_mul(self.scale),
+                u32::from(height).saturating_mul(self.scale),
+            )
+            .map_err(|error| Error::Platform(error.to_string()))
+    }
+
     fn present(&mut self, framebuffer: &Framebuffer) -> Result<()> {
         let creator = self.canvas.texture_creator();
         let mut texture = creator
@@ -76,7 +91,10 @@ impl PlatformDisplay for SdlDisplay {
                     .enumerate()
                 {
                     let destination = &mut output[row * pitch..row * pitch + source.len() * 2];
-                    for (pixel, output) in source.iter().zip(destination.chunks_exact_mut(2)) {
+                    for (pixel, output) in source
+                        .iter()
+                        .zip(destination.as_chunks_mut::<2>().0.iter_mut())
+                    {
                         output.copy_from_slice(&pixel.to_ne_bytes());
                     }
                 }

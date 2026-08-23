@@ -30,6 +30,10 @@ impl Permissions {
     fn union(self, additional: Self) -> Self {
         Self(self.0 | additional.0)
     }
+
+    fn without(self, removed: Self) -> Self {
+        Self(self.0 & !removed.0)
+    }
 }
 
 #[derive(Debug)]
@@ -38,6 +42,9 @@ struct Region {
     bytes: Vec<u8>,
     permissions: Permissions,
     name: String,
+    mapping_id: u64,
+    mapping_base: u32,
+    mapping_len: usize,
 }
 
 impl Region {
@@ -49,6 +56,7 @@ impl Region {
 #[derive(Debug, Default)]
 pub struct GuestMemory {
     regions: Vec<Region>,
+    next_mapping_id: u64,
 }
 
 impl GuestMemory {
@@ -98,11 +106,20 @@ impl GuestMemory {
                 region.end()
             )));
         }
+        let mapping_id = self.next_mapping_id;
+        self.next_mapping_id = self
+            .next_mapping_id
+            .checked_add(1)
+            .ok_or_else(|| Error::ArmFault("guest mapping identifier overflow".into()))?;
         self.regions.push(Region {
             base: base.0,
             bytes,
             permissions,
             name: name.into(),
+            mapping_id,
+            mapping_base: base.0,
+            mapping_len: usize::try_from(end - u64::from(base.0))
+                .expect("mapping length originated as usize"),
         });
         self.regions.sort_unstable_by_key(|region| region.base);
         Ok(())
@@ -182,6 +199,25 @@ impl GuestMemory {
         len: usize,
         permissions: Permissions,
     ) -> Result<()> {
+        self.change_permissions(address, len, permissions, true)
+    }
+
+    pub fn remove_permissions(
+        &mut self,
+        address: GuestAddr,
+        len: usize,
+        permissions: Permissions,
+    ) -> Result<()> {
+        self.change_permissions(address, len, permissions, false)
+    }
+
+    fn change_permissions(
+        &mut self,
+        address: GuestAddr,
+        len: usize,
+        permissions: Permissions,
+        add: bool,
+    ) -> Result<()> {
         if len == 0 {
             return Err(Error::ArmFault(
                 "cannot change permissions for an empty guest range".into(),
@@ -189,10 +225,10 @@ impl GuestMemory {
         }
 
         let segments = self.segments(address, len, Permissions(0))?;
-        let mapping_name = &self.regions[segments[0].0].name;
+        let mapping_id = self.regions[segments[0].0].mapping_id;
         if segments
             .iter()
-            .any(|(index, _, _)| self.regions[*index].name != *mapping_name)
+            .any(|(index, _, _)| self.regions[*index].mapping_id != mapping_id)
         {
             return Err(Error::ArmFault(format!(
                 "permission range at {:#010x} ({} bytes) crosses guest mappings",
@@ -218,6 +254,9 @@ impl GuestMemory {
                 mut bytes,
                 permissions: current_permissions,
                 name,
+                mapping_id,
+                mapping_base,
+                mapping_len,
             } = region;
             let after = bytes.split_off(overlap_end);
             let middle = bytes.split_off(overlap_start);
@@ -227,13 +266,23 @@ impl GuestMemory {
                     bytes,
                     permissions: current_permissions,
                     name: name.clone(),
+                    mapping_id,
+                    mapping_base,
+                    mapping_len,
                 });
             }
             replacements.push(Region {
                 base: base + overlap_start as u32,
                 bytes: middle,
-                permissions: current_permissions.union(permissions),
+                permissions: if add {
+                    current_permissions.union(permissions)
+                } else {
+                    current_permissions.without(permissions)
+                },
                 name: name.clone(),
+                mapping_id,
+                mapping_base,
+                mapping_len,
             });
             if !after.is_empty() {
                 replacements.push(Region {
@@ -241,6 +290,9 @@ impl GuestMemory {
                     bytes: after,
                     permissions: current_permissions,
                     name,
+                    mapping_id,
+                    mapping_base,
+                    mapping_len,
                 });
             }
         }
@@ -249,17 +301,44 @@ impl GuestMemory {
     }
 
     pub fn unmap(&mut self, base: GuestAddr, len: usize) -> Result<()> {
-        let Some(index) = self
-            .regions
-            .iter()
-            .position(|region| region.base == base.0 && region.bytes.len() == len)
-        else {
+        let requested_end = u64::from(base.0)
+            .checked_add(len as u64)
+            .ok_or_else(|| Error::ArmFault("guest unmap range overflow".into()))?;
+        let Some(first) = self.regions.iter().position(|region| region.base == base.0) else {
             return Err(Error::ArmFault(format!(
                 "guest unmap does not match a region at {:#010x} ({} bytes)",
                 base.0, len
             )));
         };
-        self.regions.remove(index);
+        let mapping_id = self.regions[first].mapping_id;
+        if self.regions[first].mapping_base != base.0 || self.regions[first].mapping_len != len {
+            return Err(Error::ArmFault(format!(
+                "guest unmap does not match the original mapping at {:#010x} ({} bytes)",
+                base.0, len
+            )));
+        }
+        let mut cursor = u64::from(base.0);
+        let mut after_last = first;
+        while cursor < requested_end {
+            let Some(region) = self.regions.get(after_last) else {
+                break;
+            };
+            if region.mapping_id != mapping_id
+                || u64::from(region.base) != cursor
+                || region.end() > requested_end
+            {
+                break;
+            }
+            cursor = region.end();
+            after_last += 1;
+        }
+        if cursor != requested_end || first == after_last {
+            return Err(Error::ArmFault(format!(
+                "guest unmap does not match contiguous regions at {:#010x} ({} bytes)",
+                base.0, len
+            )));
+        }
+        self.regions.drain(first..after_last);
         Ok(())
     }
 
@@ -466,10 +545,10 @@ mod tests {
     fn rejects_permission_changes_outside_one_mapped_region() {
         let mut memory = GuestMemory::new();
         memory
-            .map(GuestAddr(0x1000), 8, Permissions::READ_WRITE, "first")
+            .map(GuestAddr(0x1000), 8, Permissions::READ_WRITE, "same name")
             .unwrap();
         memory
-            .map(GuestAddr(0x1008), 8, Permissions::READ_WRITE, "second")
+            .map(GuestAddr(0x1008), 8, Permissions::READ_WRITE, "same name")
             .unwrap();
 
         assert!(
@@ -490,6 +569,26 @@ mod tests {
     }
 
     #[test]
+    fn removes_permissions_only_from_the_requested_mapping_range() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map(GuestAddr(0x1000), 16, Permissions::READ_WRITE, "heap")
+            .unwrap();
+        memory
+            .add_permissions(GuestAddr(0x1004), 4, Permissions::EXECUTE)
+            .unwrap();
+        assert_eq!(memory.fetch_u32(GuestAddr(0x1004)).unwrap(), 0);
+
+        memory
+            .remove_permissions(GuestAddr(0x1004), 4, Permissions::EXECUTE)
+            .unwrap();
+
+        assert!(memory.fetch_u16(GuestAddr(0x1004)).is_err());
+        assert_eq!(memory.read_u32(GuestAddr(0x1004)).unwrap(), 0);
+        memory.write_u32(GuestAddr(0x1004), 1).unwrap();
+    }
+
+    #[test]
     fn exact_mappings_can_be_unmapped() {
         let mut memory = GuestMemory::new();
         memory
@@ -499,5 +598,55 @@ mod tests {
         assert!(memory.unmap(GuestAddr(0x1000), 8).is_err());
         memory.unmap(GuestAddr(0x1000), 16).unwrap();
         assert!(memory.read_u8(GuestAddr(0x1000)).is_err());
+    }
+
+    #[test]
+    fn mappings_split_by_permissions_can_be_unmapped_as_one_exact_range() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map(GuestAddr(0x1000), 16, Permissions::READ_WRITE, "temporary")
+            .unwrap();
+        memory
+            .add_permissions(GuestAddr(0x1004), 4, Permissions::EXECUTE)
+            .unwrap();
+
+        assert!(memory.unmap(GuestAddr(0x1000), 8).is_err());
+        assert!(memory.unmap(GuestAddr(0x1004), 4).is_err());
+        memory.unmap(GuestAddr(0x1000), 16).unwrap();
+
+        assert!(memory.read_u8(GuestAddr(0x1000)).is_err());
+        assert!(memory.fetch_u16(GuestAddr(0x1004)).is_err());
+    }
+
+    #[test]
+    fn unmap_rejects_gaps_and_partial_boundary_regions() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map(GuestAddr(0x1000), 8, Permissions::READ_WRITE, "first")
+            .unwrap();
+        memory
+            .map(GuestAddr(0x1010), 8, Permissions::READ_WRITE, "second")
+            .unwrap();
+
+        assert!(memory.unmap(GuestAddr(0x1000), 24).is_err());
+        assert!(memory.unmap(GuestAddr(0x1000), 4).is_err());
+        assert!(memory.unmap(GuestAddr(0x1004), 4).is_err());
+        assert_eq!(memory.read_u8(GuestAddr(0x1000)).unwrap(), 0);
+        assert_eq!(memory.read_u8(GuestAddr(0x1010)).unwrap(), 0);
+    }
+
+    #[test]
+    fn unmap_rejects_adjacent_independent_mappings() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map(GuestAddr(0x1000), 8, Permissions::READ_WRITE, "temporary")
+            .unwrap();
+        memory
+            .map(GuestAddr(0x1008), 8, Permissions::READ_WRITE, "temporary")
+            .unwrap();
+
+        assert!(memory.unmap(GuestAddr(0x1000), 16).is_err());
+        assert_eq!(memory.read_u8(GuestAddr(0x1000)).unwrap(), 0);
+        assert_eq!(memory.read_u8(GuestAddr(0x1008)).unwrap(), 0);
     }
 }

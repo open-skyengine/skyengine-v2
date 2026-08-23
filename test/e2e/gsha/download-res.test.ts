@@ -1,16 +1,88 @@
 import { cpSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { createServer, type Server, type Socket } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
 
+interface HttpCaptureServer {
+  readonly port: number;
+  readonly requests: Buffer[];
+  close(): Promise<void>;
+}
+
+const NOT_FOUND_RESPONSE = Buffer.from(
+  "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+  "ascii",
+);
+
+async function startHttpCaptureServer(): Promise<HttpCaptureServer> {
+  const requests: Buffer[] = [];
+  const sockets = new Set<Socket>();
+  const server: Server = createServer(socket => {
+    sockets.add(socket);
+    let buffered = Buffer.alloc(0);
+    socket.on("data", chunk => {
+      buffered = Buffer.concat([buffered, chunk]);
+      const headerEnd = buffered.indexOf("\r\n\r\n");
+      if (headerEnd < 0) return;
+
+      const headers = buffered.subarray(0, headerEnd).toString("latin1");
+      const contentLength = /^Content-Length:\s*(\d+)$/im.exec(headers);
+      if (!contentLength) {
+        socket.destroy();
+        return;
+      }
+      const requestLength = headerEnd + 4 + Number(contentLength[1]);
+      if (buffered.length < requestLength) return;
+
+      requests.push(Buffer.from(buffered.subarray(0, requestLength)));
+      socket.end(NOT_FOUND_RESPONSE);
+    });
+    socket.on("error", () => {});
+    socket.on("close", () => sockets.delete(socket));
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => reject(error);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("HTTP capture server did not expose a TCP port");
+  }
+
+  return {
+    port: address.port,
+    requests,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      if (!server.listening) return;
+      await new Promise<void>((resolve, reject) => {
+        server.close(error => error ? reject(error) : resolve());
+      });
+    },
+  };
+}
+
+function requestHead(request: Buffer): string {
+  const headerEnd = request.indexOf("\r\n\r\n");
+  return headerEnd < 0 ? "" : request.subarray(0, headerEnd).toString("latin1");
+}
 
 describe("gsha", () => {
   let engine: SkyEngineE2e | undefined;
   let ws: SkyEngineWorkspace | undefined;
+  let httpServer: HttpCaptureServer | undefined;
 
   afterEach(async () => {
     await engine?.close();
     engine = undefined;
+    await httpServer?.close();
+    httpServer = undefined;
     await ws?.dispose();
     ws = undefined;
   });
@@ -19,10 +91,17 @@ describe("gsha", () => {
     ws = await SkyEngineWorkspace.create();
     // The app expects its extracted resource index under mythroad/gsha.
     cpSync("test/fixtures/gsha", ws.path("mythroad/gsha"), { recursive: true });
+    httpServer = await startHttpCaptureServer();
 
     engine = await SkyEngineE2e.start("test/fixtures/gsha.mrp", {
       workDir: ws.dir,
       captureLatestFrame: true,
+      // The app first connects to its fixed WAP proxy, then routes the resource
+      // Host. Keep both protocol stages inside this test's loopback endpoint.
+      dnsMap: [
+        `10.0.0.172->127.0.0.1:${httpServer.port}`,
+        `spd.skymobiapp.com->127.0.0.1:${httpServer.port}`,
+      ].join(";"),
     });
 
     await vi.waitFor(async () => {
@@ -70,9 +149,9 @@ describe("gsha", () => {
 
     // 向右移动，触发资源下载
     await vi.waitFor(async () => {
-      await engine!.key("RIGHT", 1_000);
+      await engine!.key("RIGHT", { holdMs: 250, waitForDraw: false });
+      await engine!.delay(300);
       const screen = await engine!.screen("character-move");
-      // rgb(40, 40, 40)
       expect(screen.pixel(29, 12)).toEqual([40, 40, 40]);
     }, { timeout: 10_000, interval: 1_000 });
     
@@ -85,17 +164,20 @@ describe("gsha", () => {
       expect(downloadStart.diffPixelCount(downloadProgress)).toBeGreaterThan(0);
     }, { timeout: 30_000, interval: 500 });
 
-    // 进程退出会刷新 C stdout；公网服务当前可能返回“资源不存在”，所以这里验证
-    // 模拟器负责的边界：同一 socket 已连接，并完整发送正确的下载请求。
-    await engine.stop();
-    const stdout = await readFile(engine.stdoutPath, "utf8");
-    // MSVC text stdout expands every LF to CRLF, including the request's existing
-    // CRLF bytes, so captured HTTP lines become CRCRLF. Normalize host line endings
-    // before applying the same protocol assertion on Windows and Unix.
-    const normalizedStdout = stdout.replace(/\r+\n/g, "\n");
-    const request = /my_getSocketState\((\d+)\): 0[\s\S]*?my_send\(s:\1, fd:\d+, len:(\d+)\): sent=(\d+),[^\n]*\n\[my_send\] data: POST \/simpleDownload HTTP\/1\.1\nHost: spd\.skymobiapp\.com:6009/.exec(normalizedStdout);
-    expect(request, "resource download request was not sent on the connected socket").not.toBeNull();
-    expect(request![3]).toBe(request![2]);
-
+    await vi.waitFor(() => {
+      expect(
+        httpServer!.requests.some(request => requestHead(request).startsWith("POST /simpleDownload HTTP/1.1")),
+        "resource download request was not received by the loopback endpoint",
+      ).toBe(true);
+    }, { timeout: 10_000, interval: 100 });
+    const request = httpServer.requests.find(request =>
+      requestHead(request).startsWith("POST /simpleDownload HTTP/1.1")
+    )!;
+    const headerEnd = request.indexOf("\r\n\r\n");
+    const headers = request.subarray(0, headerEnd).toString("latin1");
+    expect(headers).toContain("\r\nHost: spd.skymobiapp.com:6009");
+    const contentLength = Number(/^Content-Length:\s*(\d+)$/im.exec(headers)![1]);
+    expect(contentLength).toBeGreaterThan(0);
+    expect(request.length - headerEnd - 4).toBe(contentLength);
   });
 });

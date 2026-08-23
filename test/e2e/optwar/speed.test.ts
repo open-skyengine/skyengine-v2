@@ -137,37 +137,21 @@ describe("optwar", () => {
       })
     }
     {
-      // 进入广告/支付插件界面。
+      // Headless 运行时没有支付提供者，确认后应快速留在当前选项。
+      const confirmStartedAt = performance.now()
       await engine.key('ENTER', 1_000)
       await vi.waitFor(async () => {
-        const screen = await engine!.screen('pay-scene-1')
-        // rgb(232, 240, 248)
-        expect(screen.pixel(218, 256)).toEqual([232, 240, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 取消支付
-      const cancelStartedAt = performance.now()
-      await engine.key('RIGHT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('select-second-method-2')
-        // rgb(48, 188, 248)
+        const screen = await engine!.screen('token-unavailable')
         expect(screen.pixel(222, 287)).toEqual([48, 188, 248])
-        // rgb(168, 20, 32)
         expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
       }, {
         timeout: 1_000,
         interval: 1_000
       })
-      // 计时必须覆盖 KEY 自身的 guest callback 边界；否则 callback 内部的
-      // 主线程阻塞会发生在 waitFor 启动前，像素正确也会漏掉真实卡顿。
-      expect(performance.now() - cancelStartedAt).toBeLessThan(1_000)
+      expect(performance.now() - confirmStartedAt).toBeLessThan(1_000)
     }
     {
-      // 返回游戏菜单
+      // 支付方式页直接返回游戏菜单。
       await engine.key('RIGHT_SOFT', 1_000)
       await vi.waitFor(async () => {
         const screen = await engine!.screen('game-menu')
@@ -346,63 +330,22 @@ describe("optwar", () => {
       })
     }
     {
-      // 进入令牌插件下载界面
+      // 无支付提供者时确认不会伪造下载或支付成功。
       await engine.key('ENTER', 1_000)
       await vi.waitFor(async () => {
-        const screen = await engine!.screen('pay-scene-1')
-        // rgb(232, 240, 248)
-        expect(screen.pixel(218, 256)).toEqual([232, 240, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 确认下载
-      await engine.key('LEFT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('download-end')
-        // rgb(248, 252, 248)
-        expect(screen.pixel(30, 301)).toEqual([248, 252, 248])
-      }, {
-        timeout: 40_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 确定下载结果
-      await engine.key('LEFT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('select-second-method-2')
-        // rgb(48, 188, 248)
+        const screen = await engine!.screen('token-unavailable')
         expect(screen.pixel(222, 287)).toEqual([48, 188, 248])
-        // rgb(168, 20, 32)
         expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
       }, {
-        timeout: 3_000,
+        timeout: 1_000,
         interval: 1_000
       })
     }
     {
-      // 确定付费
-      await engine.key('LEFT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('pay-success')
-        // rgb(0, 0, 0)
-        expect(screen.pixel(170, 132)).toEqual([0, 0, 0])
-        // rgb(200, 252, 248)
-        expect(screen.pixel(52, 134)).toEqual([200, 252, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 确定付费结果
-      await engine.key('LEFT_SOFT', 1_000)
+      // 支付方式页直接返回游戏菜单。
+      await engine.key('RIGHT_SOFT', 1_000)
       await vi.waitFor(async () => {
         const screen = await engine!.screen('game-menu-2')
-        // rgb(48, 188, 248)
         expect(screen.pixel(175, 103)).toEqual([48, 188, 248])
       }, {
         timeout: 10_000,
@@ -410,8 +353,15 @@ describe("optwar", () => {
       })
     }
     {
-      // 确定付费结果
+      // 返回游戏界面，再检查绘制节奏没有持续漂移。
       await engine.key('RIGHT_SOFT', 1_000)
+      await vi.waitFor(async () => {
+        const screen = await engine!.screen('start-scene-returned')
+        expect(screen.pixel(22, 314)).toEqual([200, 252, 248])
+      }, {
+        timeout: 10_000,
+        interval: 1_000
+      })
     }
     {
       // 跳过返回边界的一次性恢复工作，再用长窗口排除持续倍速或冻结。

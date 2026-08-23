@@ -8,7 +8,11 @@ use std::{
 
 use crate::{
     DisplayEvent, Error, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result,
-    mr::{MrHostConfig, MrVm, value::Value, vm::LifecycleOutcome},
+    mr::{
+        MrHostConfig, MrVm,
+        value::Value,
+        vm::{LifecycleError, LifecycleOutcome},
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +222,15 @@ impl Runtime {
     }
 
     pub fn tick(&mut self) -> Result<()> {
+        let dispatched_completion = self.state == RuntimeState::Running
+            && (self.vm.dispatch_pending_platform_event()?
+                || self.vm.dispatch_external_action_completion()?);
+        if dispatched_completion {
+            self.apply_lifecycle_request()?;
+            if self.state == RuntimeState::Stopping {
+                return Ok(());
+            }
+        }
         while let Some(event) = self.vm.display_mut().poll_event()? {
             self.dispatch(event)?;
             if self.state == RuntimeState::Stopping {
@@ -242,7 +255,7 @@ impl Runtime {
             DisplayEvent::Quit => self.stop(),
             DisplayEvent::Key { code, pressed } if self.state == RuntimeState::Running => {
                 if let Some((event, parameter0, parameter1)) =
-                    self.vm.route_key_event(code, pressed)
+                    self.vm.route_key_event(code, pressed)?
                 {
                     self.vm.call_global(
                         b"dealevent",
@@ -252,18 +265,35 @@ impl Runtime {
                             Value::Number(f64::from(parameter1)),
                         ],
                     )?;
-                    self.apply_lifecycle_request()?;
                 }
+                self.apply_lifecycle_request()?;
             }
             DisplayEvent::Pointer { x, y, pressed } if self.state == RuntimeState::Running => {
-                self.vm.call_global(
-                    b"dealevent",
-                    vec![
-                        Value::Number(if pressed { 2.0 } else { 3.0 }),
-                        Value::Number(f64::from(x)),
-                        Value::Number(f64::from(y)),
-                    ],
-                )?;
+                if let Some((event, parameter0, parameter1)) =
+                    self.vm.route_pointer_event(x, y, pressed)?
+                {
+                    self.vm.call_global(
+                        b"dealevent",
+                        vec![
+                            Value::Number(f64::from(event)),
+                            Value::Number(f64::from(parameter0)),
+                            Value::Number(f64::from(parameter1)),
+                        ],
+                    )?;
+                }
+                self.apply_lifecycle_request()?;
+            }
+            DisplayEvent::TextInput { text } if self.state == RuntimeState::Running => {
+                if let Some((event, parameter0, parameter1)) = self.vm.route_text_input(&text)? {
+                    self.vm.call_global(
+                        b"dealevent",
+                        vec![
+                            Value::Number(f64::from(event)),
+                            Value::Number(f64::from(parameter0)),
+                            Value::Number(f64::from(parameter1)),
+                        ],
+                    )?;
+                }
                 self.apply_lifecycle_request()?;
             }
             _ => {}
@@ -272,10 +302,27 @@ impl Runtime {
     }
 
     fn apply_lifecycle_request(&mut self) -> Result<()> {
-        if self.vm.process_lifecycle_request()? == LifecycleOutcome::ExitRequested {
-            self.stop();
+        apply_lifecycle_result(&mut self.state, self.vm.process_lifecycle_request())
+    }
+}
+
+fn apply_lifecycle_result(
+    state: &mut RuntimeState,
+    result: std::result::Result<LifecycleOutcome, LifecycleError>,
+) -> Result<()> {
+    match result {
+        Ok(LifecycleOutcome::Continue) => Ok(()),
+        Ok(LifecycleOutcome::ExitRequested) => {
+            if !matches!(*state, RuntimeState::Stopping | RuntimeState::Stopped) {
+                *state = RuntimeState::Stopping;
+            }
+            Ok(())
         }
-        Ok(())
+        Err(LifecycleError::BeforeCommit(error)) => Err(error),
+        Err(LifecycleError::AfterCommit(error)) => {
+            *state = RuntimeState::Stopping;
+            Err(error)
+        }
     }
 }
 
@@ -329,5 +376,37 @@ mod tests {
             civil_date_from_unix_days(15_492),
             DeviceDate::new(2012, 6, 1).unwrap()
         );
+    }
+
+    #[test]
+    fn lifecycle_fault_after_replacement_commit_stops_dispatch() {
+        let mut state = RuntimeState::Running;
+
+        assert!(
+            apply_lifecycle_result(
+                &mut state,
+                Err(LifecycleError::AfterCommit(Error::ArmFault(
+                    "replacement init failed".into(),
+                ))),
+            )
+            .is_err()
+        );
+        assert_eq!(state, RuntimeState::Stopping);
+    }
+
+    #[test]
+    fn lifecycle_fault_before_replacement_commit_keeps_dispatch_running() {
+        let mut state = RuntimeState::Running;
+
+        assert!(
+            apply_lifecycle_result(
+                &mut state,
+                Err(LifecycleError::BeforeCommit(Error::Package(
+                    "replacement staging failed".into(),
+                ))),
+            )
+            .is_err()
+        );
+        assert_eq!(state, RuntimeState::Running);
     }
 }

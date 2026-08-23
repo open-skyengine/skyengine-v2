@@ -76,10 +76,29 @@ describe("gghjt 开始游戏", () => {
     {
       // 点击确定付费，进入游戏界面
       await engine.key('LEFT_SOFT', 3_000);
-      await engine.delay(4_000);
-      const screen = await engine.screen("game-start");
-      // rgb(0, 0, 0)
-      expect(screen.pixel(88, 44)).toEqual([0, 0, 0]);
+      const afterPay = await engine.waitForScreen(screen => {
+        const menu = screen.pixel(110, 27).toString() === "152,112,32";
+        const story = screen.pixel(10, 138).toString() === "248,252,248";
+        const title = screen.pixel(100, 30).toString() === "248,252,0";
+        return menu || story || title;
+      }, {
+        name: "after-pay",
+        timeoutMs: 10_000,
+        intervalMs: 250,
+      });
+      if (afterPay.pixel(110, 27).toString() === "152,112,32") {
+        // 支付回调已切回游戏，但首个剧情帧可能尚未提交，画面仍是旧菜单。
+        await engine.key('ENTER', 3_000);
+        await engine.waitForScreen(screen => {
+          const story = screen.pixel(10, 138).toString() === "248,252,248";
+          const title = screen.pixel(100, 30).toString() === "248,252,0";
+          return story || title;
+        }, {
+          name: "game-start",
+          timeoutMs: 15_000,
+          intervalMs: 250,
+        });
+      }
     }
 
     {
@@ -87,8 +106,17 @@ describe("gghjt 开始游戏", () => {
       await engine.key('ENTER', 3_000);
       await engine.delay(1_000);
       await engine.key('ENTER', 3_000);
-      await engine.delay(8_000);
-      const screen = await engine.screen("scene-render");
+      const screen = await engine.waitForScreen(screen =>
+        screen.pixel(55, 302).toString() === "192,148,96" &&
+        screen.pixel(92, 95).toString() === "72,60,72" &&
+        screen.pixel(108, 95).toString() === "128,128,112" &&
+        screen.pixel(124, 95).toString() === "128,128,112" &&
+        screen.pixel(172, 95).toString() === "208,200,136",
+      {
+        name: "scene-render",
+        timeoutMs: 15_000,
+        intervalMs: 100,
+      });
       // rgb(192, 148, 96)
       expect(screen.pixel(55, 302)).toEqual([192, 148, 96]);
       // 楼房背景由离屏 cache 合成后复制到主屏；这些点曾是深色条纹坏色。

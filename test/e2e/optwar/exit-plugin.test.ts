@@ -2,6 +2,20 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
 import fs from "fs";
 
+function countColor(
+  image: Awaited<ReturnType<SkyEngineE2e["screen"]>>,
+  color: readonly [number, number, number],
+  rect: { x: number; y: number; width: number; height: number },
+): number {
+  let count = 0;
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      if (image.pixel(x, y).toString() === color.toString()) count += 1;
+    }
+  }
+  return count;
+}
+
 describe("optwar 进入主菜单", () => {
   let engine: SkyEngineE2e | undefined;
   let ws: SkyEngineWorkspace | undefined;
@@ -16,8 +30,8 @@ describe("optwar 进入主菜单", () => {
   it("advbar", async () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
-    // 删除后，启动游戏会自动下载。
-    fs.rmSync(ws.path('mythroad/plugins/advbar.mrp'), { force: true });
+    // advbar 自身拥有更新逻辑；主应用不会在插件完全缺失时引导下载。
+    fs.cpSync('test/fixtures/plugins/advbar.mrp', ws.path('mythroad/plugins/advbar.mrp'));
     engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", { workDir: ws.dir });
 
     await engine.delay(10000);
@@ -41,7 +55,7 @@ describe("optwar 进入主菜单", () => {
     expect(wake.pixel(98, 264)).toEqual([0, 252, 0]);
 
   });
-  it("游戏退出时下载插件", async () => {
+  it("游戏退出时处理插件下载失败", async () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
     // 删除后，继续游戏会进入下载netpay插件界面。
@@ -55,7 +69,11 @@ describe("optwar 进入主菜单", () => {
     if (!fs.existsSync(ws.path('mythroad/plugins/advbar.mrp'))) {
       fs.cpSync('test/fixtures/plugins/advbar.mrp', ws.path('mythroad/plugins/advbar.mrp'));
     }
-    engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", { workDir: ws.dir });
+    engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", {
+      workDir: ws.dir,
+      // 把该游戏使用过的下载入口都固定到本机拒绝端口，避免测试依赖外网。
+      dnsMap: "10.0.0.172->127.0.0.1:1;spd.skymobiapp.com->127.0.0.1:1;rop.skymobiapp.com->127.0.0.1:1",
+    });
 
     await engine.delay(2000);
     const boot = await engine.screen("bgm-select");
@@ -113,26 +131,15 @@ describe("optwar 进入主菜单", () => {
     {
       // 点击确认后，开始下载
       await engine.key('LEFT_SOFT', 1_000)
-      console.info("等待下载完成，下载完成后会自动启动营销商店");
+      console.info("等待本地下载失败结果");
       await engine.delay(5_000);
-      console.info("下载完成");
       const screen = await engine.screen("download-result");
       // rgb(248, 0, 0)
-      expect(screen.pixel(134, 146)).not.toEqual([248, 0, 0]);
-      // rgb(0, 0, 0)
-      expect(screen.pixel(107, 151)).toEqual([0, 0, 0]);
-      // rgb(248, 252, 248)
-      expect(screen.pixel(32, 301)).toEqual([248, 252, 248]);
-    }
-    {
-      // 启动营销商店。这个按键会先进入插件文件/网络启动路径，不保证在
-      // 按键命令的 3s 窗口内重绘；回归点是后续 ARM 侧启动不应再异常退出。
-      console.info("启动营销商店");
-      await engine.key('LEFT_SOFT', 3_000)
-      await engine.delay(20_000);
-      // 会请求dl_confirm
-      const screen = await engine.screen("promote-start");
-      expect(screen.pixel(104, 296)).not.toEqual([0, 0, 0]);
+      expect(screen.pixel(134, 146)).toEqual([248, 0, 0]);
+      expect(countColor(screen, [248, 0, 0], { x: 80, y: 144, width: 80, height: 18 })).toBeGreaterThan(250);
+      // rgb(40, 176, 216)
+      expect(screen.pixel(32, 301)).toEqual([40, 176, 216]);
+      expect(fs.existsSync(ws.path('mythroad/plugins/promote.mrp'))).toBe(false);
     }
   });
 });

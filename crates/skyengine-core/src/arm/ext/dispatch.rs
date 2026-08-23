@@ -8,7 +8,8 @@ impl ExtRuntime {
         cpu: &mut ArmCpu,
         services: &mut dyn NativeServices,
     ) -> Result<()> {
-        if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+        let trace_arm = std::env::var_os("SKYENGINE_TRACE_ARM").is_some();
+        if trace_arm {
             eprintln!(
                 "[arm-trap] module={module} slot={slot} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r9={:#010x}",
                 cpu.register(0),
@@ -19,19 +20,40 @@ impl ExtRuntime {
             );
         }
         match slot {
-            0..=20 => self.dispatch_libc(slot, cpu)?,
+            0..=20 => self.dispatch_libc(slot, module, cpu)?,
             25 => {
                 let helper = cpu.register(0);
+                let expected_image = self
+                    .modules
+                    .get(module)
+                    .ok_or_else(|| {
+                        Error::Abi(format!("helper registration for missing module {module}"))
+                    })?
+                    .executable_image(helper)
+                    .map(|(image, _)| image)
+                    .ok_or_else(|| {
+                        Error::Abi(format!(
+                            "helper {helper:#010x} is outside module {module} executable images"
+                        ))
+                    })?;
                 let parameter_len = cpu.register(1).max(20) as usize;
-                let parameter = self.allocate(parameter_len, 8)?;
+                let parameter = self
+                    .allocate_guest_block_for_module(parameter_len, module)?
+                    .ok_or_else(|| {
+                        Error::ArmFault(
+                            "guest heap exhausted while allocating helper parameter".into(),
+                        )
+                    })?;
                 self.memory.write(parameter, &vec![0; parameter_len])?;
-                let function = GuestFunction {
-                    module,
-                    address: helper,
-                };
                 let context = self.modules.get_mut(module).ok_or_else(|| {
                     Error::Abi(format!("helper registration for missing module {module}"))
                 })?;
+                let function = GuestFunction {
+                    module,
+                    address: helper,
+                    expected_image: Some(expected_image),
+                    captured_r9: None,
+                };
                 context.helper = Some(function);
                 context.helper_parameter = parameter;
                 self.active_helper = Some(function);
@@ -39,7 +61,7 @@ impl ExtRuntime {
             }
             26 => {
                 let format = self.read_c_string(GuestAddr(cpu.register(0)), 64 * 1024)?;
-                if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
+                if trace_arm {
                     eprintln!(
                         "[guest-printf] format={:?} r1={:#010x} r2={:#010x} r3={:#010x}",
                         String::from_utf8_lossy(&format),
@@ -130,19 +152,11 @@ impl ExtRuntime {
             }
             35 => {
                 let output = GuestAddr(cpu.register(0));
-                match self.device_info_profile {
-                    DeviceInfoProfile::Unavailable => {
-                        // The baseline profile has no device-information provider.
-                        // Leave the caller-owned output buffer untouched.
-                        cpu.set_register(0, u32::MAX);
-                    }
-                    DeviceInfoProfile::DeterministicMtk if output.0 == 0 => {
-                        cpu.set_register(0, u32::MAX);
-                    }
-                    DeviceInfoProfile::DeterministicMtk => {
-                        self.memory.write(output, &platform_user_info())?;
-                        cpu.set_register(0, 0);
-                    }
+                if output.0 == 0 {
+                    cpu.set_register(0, u32::MAX);
+                } else {
+                    self.memory.write(output, &platform_user_info())?;
+                    cpu.set_register(0, 0);
                 }
             }
             36 => {
@@ -151,23 +165,41 @@ impl ExtRuntime {
                 cpu.set_register(0, 0);
             }
             37 => match (cpu.register(0), cpu.register(1)) {
+                // Select the normal portrait mode or the rotated landscape mode.
+                // The command changes dimensions, not the screen-buffer address.
+                (101, mode @ (0 | 3)) => {
+                    self.set_screen_orientation(mode == 3, services)?;
+                    cpu.set_register(0, 0);
+                }
                 // Poll a non-blocking socket created through slots 84 and 85.
                 (1_001, handle) => {
                     cpu.set_register(0, self.native_socket_state(handle as i32) as u32)
                 }
                 // Baseline SDK initialization notification; the return value is ignored.
                 (1_106, 0) => cpu.set_register(0, 0),
+                // Network/payment helpers announce their foreground operation.
+                // The headless host has no separate foreground UI state.
+                (1_011, mode) if mode <= 1 => cpu.set_register(0, 0),
                 // Optional device metric. Repository EXT callers decode values above
                 // 1000 and explicitly treat -1 as an unavailable neutral result.
                 (1_101, 2) => cpu.set_register(0, u32::MAX),
+                // Optional runtime profile query. The caller has a defined
+                // fallback state for values other than the two vendor profiles.
+                (1_100, 0) => cpu.set_register(0, u32::MAX),
                 // Report the normal storage profile. 1002 denotes USB mass-storage
                 // mode, in which applications must not access their regular volume.
                 (1_218, 0) => cpu.set_register(0, 1_001),
                 // RX initialization announces its default platform mode and does
                 // not consume a result beyond whether the call is accepted.
-                (1_214, 0) => cpu.set_register(0, 0),
+                (1_214, mode) if mode <= 1 => cpu.set_register(0, 0),
                 // Network request compatibility version used by message.ext.
                 (1_205, 0) => cpu.set_register(0, 1_001),
+                // Initialize the motion-event provider. The deterministic headless
+                // profile accepts registration but emits no sensor samples.
+                (1_206, 0) => cpu.set_register(0, 0),
+                // Query and configure the same deterministic motion provider.
+                // Mode 2 is the verified event-driven form used after startup.
+                (4_002, 0) | (4_005, 2) => cpu.set_register(0, 0),
                 // Native audio wrappers use a five-step multimedia volume. The
                 // deterministic profile has no output device, but still accepts
                 // and acknowledges valid gain changes so guest audio state can
@@ -178,6 +210,25 @@ impl ExtRuntime {
                 (1_327, 0) => cpu.set_register(0, u32::MAX),
                 // No explicit SIM/network selection is configured.
                 (1_328, 0) => cpu.set_register(0, u32::MAX),
+                // Optional runtime-service notifications with no headless state.
+                // Accept only the observed parameterless forms.
+                (1_016 | 1_018 | 1_215 | 1_216, 0) => cpu.set_register(0, 0),
+                // Parameterless platform notification. Its wrapper normalizes the
+                // result to 0/-1, and every verified caller discards that result.
+                (2_703, 0) => cpu.set_register(0, 0),
+                // The network-state notification uses 1 for the normal profile;
+                // callers branch away from startup unless they receive 1 or 1000.
+                (1_020, 0) => cpu.set_register(0, 1),
+                // Legacy file-position query. Successful positions are encoded
+                // with a 1000 bias; invalid handles retain the normal -1 result.
+                (1_231, handle) => {
+                    let result = services
+                        .seek_file(handle as i32, 0, 1)?
+                        .and_then(|position| position.checked_add(1_000))
+                        .and_then(|position| u32::try_from(position).ok())
+                        .unwrap_or(u32::MAX);
+                    cpu.set_register(0, result);
+                }
                 (command, argument) => {
                     return Err(Error::Abi(format!(
                         "unsupported platform slot 37 command ({command}, {argument}) called by module {module} at LR {:#010x} (r2={:#010x}, r3={:#010x})",
@@ -191,14 +242,27 @@ impl ExtRuntime {
                 // Requests an additional guest-memory arena. The requested byte
                 // count is carried in input_len even though input is null; the
                 // returned arena follows the normal mr_platEx output convention.
-                1_014 if cpu.register(1) == 0 => self.allocate_platform_memory_extension(cpu)?,
+                1_014 if cpu.register(1) == 0 => {
+                    self.allocate_platform_memory_extension(module, cpu)?
+                }
                 // Releases an arena returned by command 1014. The ABI carries
                 // the 32-bit guest address as a four-byte input buffer.
-                1_015 => self.release_platform_memory_extension(cpu)?,
+                1_015 => self.release_platform_memory_extension(module, cpu)?,
                 // Resolve the logical application storage volume to a drive.
                 1_204 => self.return_platform_storage_drive(cpu)?,
+                // Convert caller-owned UCS-2BE into a caller-owned legacy C string.
+                1_207 => self.convert_platform_ucs2_to_legacy(cpu)?,
+                // Return the deterministic baseline runtime-state record.
+                1_224 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
+                    self.return_platform_runtime_profile(cpu)?
+                }
                 // Optional platform metadata query. No metadata provider is configured.
                 1_222 => self.return_unavailable_platform_extension(cpu)?,
+                // Optional hardware and callback-backed capability queries. The
+                // baseline profile exposes neither, and their callers support -1.
+                1_017 | 1_324 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
+                    self.return_unavailable_platform_extension(cpu)?
+                }
                 // Optional device metadata blob used to enrich network requests.
                 1_116 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
                     self.return_unavailable_platform_extension(cpu)?
@@ -210,9 +274,145 @@ impl ExtRuntime {
                 }
                 // Disk geometry used by the guest's startup space check.
                 1_305 => self.return_platform_storage_info(cpu)?,
-                // Optional platform control/query without input or output buffers.
+                // Synchronous JPEG metadata and RGB565 decode operations. These
+                // commands use caller-owned source and destination buffers.
+                3_001 => self.return_platform_jpeg_info(cpu)?,
+                3_002 => self.decode_platform_jpeg(cpu)?,
+                // The handle-backed decoder uses an opaque platform object whose
+                // full layout and lifetime contract are not part of the verified subset.
+                command @ (3_004 | 3_005) => {
+                    return Err(Error::Abi(format!(
+                        "unsupported platform JPEG handle command {command} called by module {module}"
+                    )));
+                }
+                // Paired platform-state notification; callers ignore the result
+                // and continue their normal guest control flow.
                 1_223 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
                     cpu.set_register(0, u32::MAX)
+                }
+                // Optional parameterless vendor notification. The baseline has no
+                // corresponding provider and reports the standard unavailable value.
+                2_013
+                    if cpu.register(1) == 0
+                        && cpu.register(2) == 0
+                        && cpu.register(3) == 0
+                        && self.memory.read_u32(GuestAddr(cpu.register(13)))? == 0
+                        && self
+                            .memory
+                            .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
+                            == 0 =>
+                {
+                    cpu.set_register(0, u32::MAX)
+                }
+                // File-backed MP3 playback uses a caller-owned path. The headless
+                // profile verifies the resource and consumes it through a silent sink.
+                2_023 => {
+                    let path_address = GuestAddr(cpu.register(1));
+                    let path_len = cpu.register(2) as usize;
+                    let stack_pointer = GuestAddr(cpu.register(13));
+                    if path_address.0 == 0
+                        || path_len == 0
+                        || path_len > 4 * 1024
+                        || cpu.register(3) != 0
+                        || self.memory.read_u32(stack_pointer)? != 0
+                        || self.memory.read_u32(stack_pointer.checked_add(4)?)? != 0
+                    {
+                        return Err(Error::Abi(format!(
+                            "unsupported platform MP3 request called by module {module}"
+                        )));
+                    }
+                    let path = self.memory.read(path_address, path_len)?;
+                    let components = path
+                        .split(|byte| matches!(byte, b'/' | b'\\'))
+                        .collect::<Vec<_>>();
+                    let file_name = components.last().copied().unwrap_or_default();
+                    if path.contains(&0)
+                        || components.iter().any(|component| {
+                            component.is_empty() || matches!(*component, b"." | b"..")
+                        })
+                        || file_name.len() <= 4
+                        || !file_name[file_name.len() - 4..].eq_ignore_ascii_case(b".mp3")
+                    {
+                        return Err(Error::Abi(format!(
+                            "unsupported platform MP3 path called by module {module}"
+                        )));
+                    }
+                    let mut available = services.file_len(&path)?.is_some_and(|len| len != 0);
+                    if !available {
+                        let package_name = self.read_c_string(PACKAGE_NAME_DATA, 256)?;
+                        let packaged = services.read_package_file(&package_name, file_name)?;
+                        available = packaged.is_some_and(|bytes| !bytes.is_empty());
+                    }
+                    cpu.set_register(0, if available { 0 } else { u32::MAX });
+                }
+                // Parameterless state transition paired with the verified MP3 sink.
+                // The caller requires zero to continue after a successful 2023 request.
+                2_043
+                    if cpu.register(1) == 0
+                        && cpu.register(2) == 0
+                        && cpu.register(3) == 0
+                        && self.memory.read_u32(GuestAddr(cpu.register(13)))? == 0
+                        && self
+                            .memory
+                            .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
+                            == 0 =>
+                {
+                    cpu.set_register(0, 0)
+                }
+                // Parameterless multimedia-state query. Local callers consistently
+                // recognize 1003 as the idle state for the headless audio profile.
+                2_093
+                    if cpu.register(1) == 0
+                        && cpu.register(2) == 0
+                        && cpu.register(3) == 0
+                        && self.memory.read_u32(GuestAddr(cpu.register(13)))? == 0
+                        && self
+                            .memory
+                            .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
+                            == 0 =>
+                {
+                    cpu.set_register(0, 1_003)
+                }
+                // Caller-owned WAV recording request. The headless profile has no
+                // capture provider, so the verified request shape reports unavailable.
+                2_700 => {
+                    let input_address = GuestAddr(cpu.register(1));
+                    let stack_pointer = GuestAddr(cpu.register(13));
+                    if input_address.0 == 0
+                        || cpu.register(2) != 16
+                        || cpu.register(3) != 0
+                        || self.memory.read_u32(stack_pointer)? != 0
+                        || self.memory.read_u32(stack_pointer.checked_add(4)?)? != 0
+                    {
+                        return Err(Error::Abi(format!(
+                            "unsupported platform WAV recording request called by module {module}"
+                        )));
+                    }
+                    let path_address = GuestAddr(self.memory.read_u32(input_address)?);
+                    let reserved_1 = self.memory.read_u32(input_address.checked_add(4)?)?;
+                    let reserved_2 = self.memory.read_u32(input_address.checked_add(8)?)?;
+                    let mode = self.memory.read_u32(input_address.checked_add(12)?)?;
+                    if path_address.0 == 0 || reserved_1 != 0 || reserved_2 != 0 || mode != 1 {
+                        return Err(Error::Abi(format!(
+                            "unsupported platform WAV recording request called by module {module}"
+                        )));
+                    }
+                    let path = self.read_c_string(path_address, 4 * 1024)?;
+                    let components = path
+                        .split(|byte| matches!(byte, b'/' | b'\\'))
+                        .collect::<Vec<_>>();
+                    let file_name = components.last().copied().unwrap_or_default();
+                    if components
+                        .iter()
+                        .any(|component| component.is_empty() || matches!(*component, b"." | b".."))
+                        || file_name.len() <= 4
+                        || !file_name[file_name.len() - 4..].eq_ignore_ascii_case(b".wav")
+                    {
+                        return Err(Error::Abi(format!(
+                            "unsupported platform WAV recording path called by module {module}"
+                        )));
+                    }
+                    cpu.set_register(0, u32::MAX);
                 }
                 // Vendor initialization notification with no input or output buffers.
                 2_011 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
@@ -236,6 +436,16 @@ impl ExtRuntime {
                 0x0007_0001 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
                     self.return_unavailable_platform_extension(cpu)?
                 }
+                // Optional runtime profile query. The caller has a defined
+                // fallback for values other than its two recognized profiles.
+                4_033
+                    if cpu.register(1) == 0
+                        && cpu.register(2) == 0
+                        && cpu.register(3) == 0
+                        && self.memory.read_u32(GuestAddr(cpu.register(13)))? == 0 =>
+                {
+                    cpu.set_register(0, u32::MAX)
+                }
                 command => {
                     return Err(Error::Abi(format!(
                         "unsupported platform slot 38 command {command} called by module {module}"
@@ -244,24 +454,27 @@ impl ExtRuntime {
             },
             40 => {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
-                cpu.set_register(0, services.open_file(&name, cpu.register(1))? as u32);
+                let mode = cpu.register(1);
+                let result = services.open_file(&name, mode)?;
+                cpu.set_register(0, result as u32);
             }
             41 => {
                 cpu.set_register(0, services.close_file(cpu.register(0) as i32)? as u32);
             }
             42 => {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
-                cpu.set_register(0, services.file_info(&name)? as u32);
+                let result = services.file_info(&name)?;
+                cpu.set_register(0, result as u32);
             }
             43 => {
                 let handle = cpu.register(0) as i32;
-                if handle < 0 {
+                let input = GuestAddr(cpu.register(1));
+                let len = cpu.register(2) as i32;
+                if handle < 0 || input.0 == 0 || len < 0 {
                     cpu.set_register(0, u32::MAX);
                     return Ok(());
                 }
-                let bytes = self
-                    .memory
-                    .read(GuestAddr(cpu.register(1)), cpu.register(2) as usize)?;
+                let bytes = self.memory.read(input, len as usize)?;
                 cpu.set_register(
                     0,
                     services
@@ -283,12 +496,12 @@ impl ExtRuntime {
                 }
             }
             45 => {
-                let succeeded = services.seek_file(
+                let position = services.seek_file(
                     cpu.register(0) as i32,
                     cpu.register(1) as i32,
                     cpu.register(2),
                 )?;
-                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+                cpu.set_register(0, if position.is_some() { 0 } else { u32::MAX });
             }
             46 => {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
@@ -353,15 +566,77 @@ impl ExtRuntime {
                 self.exit_requested = true;
                 cpu.set_register(0, 0);
             }
+            57 => {
+                let sound_type = cpu.register(0);
+                let sound = GuestAddr(cpu.register(1));
+                let len = cpu.register(2) as usize;
+                let looped = cpu.register(3);
+                if !matches!(sound_type, 0 | 2) || sound.0 == 0 || len == 0 || looped > 1 {
+                    return Err(Error::Abi(format!(
+                        "unsupported headless sound request (type {sound_type}, address {:#010x}, len {len}, looped {looped}) called by module {module}",
+                        sound.0,
+                    )));
+                }
+                // Types 0 and 2 are the verified in-memory MIDI and MP3 forms.
+                // The headless profile consumes the guest buffer through an
+                // explicit silent sink so applications can advance their audio
+                // state safely.
+                let _ = self.memory.read(sound, len)?;
+                cpu.set_register(0, 0);
+            }
             58 => {
                 // The headless profile uses an explicit no-output audio sink.
                 // Stopping an absent or completed sound remains idempotent.
+                cpu.set_register(0, 0);
+            }
+            59 => {
+                let number = GuestAddr(cpu.register(0));
+                let message = GuestAddr(cpu.register(1));
+                let message_len = cpu.register(2) as usize;
+                if number.0 == 0 || message.0 == 0 || message_len == 0 || message_len > 64 * 1024 {
+                    cpu.set_register(0, u32::MAX);
+                    return Ok(());
+                }
+                let number = self.read_c_string(number, 64)?;
+                if number.is_empty() {
+                    cpu.set_register(0, u32::MAX);
+                    return Ok(());
+                }
+                // Consume the bounded request without exposing a host messaging
+                // capability. The deterministic headless provider only reports
+                // acceptance so callers can exercise their local result path.
+                let _ = self.memory.read(message, message_len)?;
                 cpu.set_register(0, 0);
             }
             61 => {
                 // The offline profile still exposes a deterministic default
                 // network identity; connectivity is reported by socket calls.
                 cpu.set_register(0, 0);
+            }
+            63 => {
+                let title = self.read_wide_string_be(GuestAddr(cpu.register(0)), 1024)?;
+                let item_count = cpu.register(1) as usize;
+                let handle = self.create_platform_menu(title, item_count)?;
+                cpu.set_register(0, handle);
+            }
+            64 => {
+                let handle = cpu.register(0);
+                let text = self.read_wide_string_be(GuestAddr(cpu.register(1)), 1024)?;
+                let index = cpu.register(2) as usize;
+                let succeeded = self.set_platform_menu_item(handle, index, text);
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            65 => {
+                let succeeded = self.show_platform_menu(cpu.register(0), services)?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            67 => {
+                let succeeded = self.release_platform_menu(cpu.register(0), services)?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            68 => {
+                let succeeded = self.refresh_platform_menu(cpu.register(0), services)?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
             }
             69 => {
                 let title = self.read_wide_string_be(GuestAddr(cpu.register(0)), 1024)?;
@@ -371,14 +646,8 @@ impl ExtRuntime {
                 cpu.set_register(0, handle);
             }
             70 => {
-                let handle = cpu.register(0);
-                let Some(dialog) = self.dialogs.remove(&handle) else {
-                    cpu.set_register(0, u32::MAX);
-                    return Ok(());
-                };
-                self.memory.write(SCREEN_BASE, &dialog.previous_screen)?;
-                self.present_screen(services)?;
-                cpu.set_register(0, 0);
+                let succeeded = self.release_platform_dialog(cpu.register(0), services)?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
             }
             71 => {
                 let handle = cpu.register(0);
@@ -390,6 +659,66 @@ impl ExtRuntime {
                 self.memory.write(SCREEN_BASE, &screen)?;
                 self.present_screen(services)?;
                 cpu.set_register(0, 0);
+            }
+            72 => {
+                let title = self.read_wide_string_be(GuestAddr(cpu.register(0)), 1024)?;
+                let text = self.read_wide_string_be(GuestAddr(cpu.register(1)), 16 * 1024)?;
+                let style = cpu.register(2);
+                let handle = self.create_platform_text_viewer(&title, &text, style, services)?;
+                cpu.set_register(0, handle);
+            }
+            73 => {
+                let succeeded = self.release_platform_text_viewer(cpu.register(0), services)?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            74 => {
+                let succeeded = self.refresh_platform_text_viewer(cpu.register(0), services)?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            75 => {
+                let max_code_units = cpu.register(3) as usize;
+                if max_code_units > MAX_PLATFORM_EDITOR_CODE_UNITS {
+                    return Err(Error::ResourceLimit(format!(
+                        "platform editor requested {max_code_units} code units (limit {MAX_PLATFORM_EDITOR_CODE_UNITS})"
+                    )));
+                }
+                let title_address = GuestAddr(cpu.register(0));
+                let text_address = GuestAddr(cpu.register(1));
+                let title = if title_address.0 == 0 {
+                    Vec::new()
+                } else {
+                    self.read_wide_string_be(title_address, 1024)?
+                };
+                let text = if text_address.0 == 0 {
+                    Vec::new()
+                } else {
+                    self.read_wide_string_be(text_address, max_code_units.saturating_add(1))?
+                };
+                let handle = self.create_platform_editor(
+                    module,
+                    title,
+                    text,
+                    cpu.register(2),
+                    max_code_units,
+                )?;
+                cpu.set_register(0, handle);
+            }
+            76 => {
+                let succeeded = self.release_platform_editor(module, cpu.register(0))?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
+            }
+            77 => {
+                let text = self.platform_editor_text(module, cpu.register(0))?;
+                cpu.set_register(0, text.map_or(0, |address| address.0));
+            }
+            78 => {
+                // Headless windows are opaque lifetime tokens. The guest requires
+                // a positive handle even though no host-native window is created.
+                cpu.set_register(0, self.create_native_window(module)?);
+            }
+            79 => {
+                let succeeded = self.release_native_window(module, cpu.register(0))?;
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
             }
             80 => {
                 let info = GuestAddr(cpu.register(0));
@@ -499,9 +828,11 @@ impl ExtRuntime {
                 let source_x = self.memory.read_u32(stack.checked_add(12)?)? as usize;
                 let source_y = self.memory.read_u32(stack.checked_add(16)?)? as usize;
                 let source_stride = self.memory.read_u32(stack.checked_add(20)?)? as usize;
-                let transparent_color = match mode {
-                    2 => None,
-                    6 => Some(transparent_color),
+                let draw_mode = match mode {
+                    0 => BitmapDrawMode::Or,
+                    2 => BitmapDrawMode::Copy,
+                    6 => BitmapDrawMode::Transparent(transparent_color),
+                    8 => BitmapDrawMode::Gray(transparent_color),
                     _ => {
                         return Err(Error::Abi(format!(
                             "unsupported bitmap drawing mode {mode} called by module {module}"
@@ -548,7 +879,7 @@ impl ExtRuntime {
                     }
                     pixels
                 };
-                self.draw_bitmap_region_to_screen(&pixels, x, y, width, height, transparent_color)?;
+                self.draw_bitmap_region_to_screen(&pixels, x, y, width, height, draw_mode)?;
                 cpu.set_register(0, 0);
             }
             121 => {
@@ -649,14 +980,21 @@ impl ExtRuntime {
                     return Ok(());
                 };
                 let prepared_output = if use_ram_package {
-                    self.compact_ram_output_target(GuestAddr(ram_address), ram_len, bytes.len())?
+                    self.compact_ram_output_target(
+                        GuestAddr(ram_address),
+                        ram_len,
+                        bytes.len(),
+                        module,
+                    )?
                 } else {
                     None
                 };
                 let output = match prepared_output {
                     Some(output) => output,
                     None => {
-                        let Some(output) = self.allocate_guest_block(bytes.len())? else {
+                        let Some(output) =
+                            self.allocate_guest_block_for_module(bytes.len(), module)?
+                        else {
                             let len_pointer = GuestAddr(cpu.register(1));
                             if len_pointer.0 != 0 {
                                 self.memory.write_u32(len_pointer, 0)?;
@@ -667,6 +1005,10 @@ impl ExtRuntime {
                         output
                     }
                 };
+                if prepared_output.is_some() {
+                    let block_len = heap::aligned_heap_len(bytes.len())?;
+                    self.claim_prepared_output_for_module(output, block_len, module)?;
+                }
                 self.memory.write(output, &bytes)?;
                 let len_pointer = GuestAddr(cpu.register(1));
                 if len_pointer.0 != 0 {
@@ -692,6 +1034,162 @@ impl ExtRuntime {
                 // Marks a dynamically loaded native module as executable.
                 (0, 9, address, len) if len != 0 => {
                     let address = GuestAddr(address);
+                    let requested = ExecutableRange {
+                        base: address,
+                        len: len as usize,
+                    };
+                    let Some(context_generation) =
+                        self.modules.get(module).map(|context| context.generation)
+                    else {
+                        return Err(Error::Abi(format!(
+                            "executable-range registration for missing module {module}"
+                        )));
+                    };
+                    let requested_end = requested.end().ok_or_else(|| {
+                        Error::Abi("dynamic executable image range overflow".into())
+                    })?;
+                    let mtk_window = ExecutableRange {
+                        base: MTK_NATIVE_EXTENSION_BASE,
+                        len: MTK_NATIVE_EXTENSION_LEN,
+                    };
+                    let uses_mtk_window = mtk_window.contains_range(requested);
+                    let allocation_owner = if uses_mtk_window {
+                        self.mtk_native_extension_owner
+                            .unwrap_or(context_generation)
+                    } else {
+                        self.allocation_owner_for_range(requested).ok_or_else(|| {
+                            Error::Abi(format!(
+                                "dynamic executable image {:#010x}..{requested_end:#010x} is not inside memory allocated by module {module}",
+                                address.0
+                            ))
+                        })?
+                    };
+                    if allocation_owner != context_generation {
+                        return Err(Error::Abi(format!(
+                            "dynamic executable image {:#010x}..{requested_end:#010x} belongs to another module",
+                            address.0
+                        )));
+                    }
+
+                    let mut compatible_images = Vec::new();
+                    for (owner, candidate) in self.modules.iter().enumerate() {
+                        if candidate.image_range().overlaps(requested) {
+                            return Err(Error::Abi(format!(
+                                "dynamic executable image {:#010x}..{requested_end:#010x} overlaps module {owner}",
+                                address.0,
+                            )));
+                        }
+                        for (image_index, image) in
+                            candidate.dynamic_executable_ranges.iter().enumerate()
+                        {
+                            let Some(image) = image.as_ref() else {
+                                continue;
+                            };
+                            if !image
+                                .intervals
+                                .iter()
+                                .any(|range| range.overlaps(requested))
+                            {
+                                continue;
+                            }
+                            if owner == module {
+                                compatible_images.push(image_index);
+                                continue;
+                            }
+                            return Err(Error::Abi(format!(
+                                "dynamic executable image {:#010x}..{requested_end:#010x} overlaps module {owner} image {image_index}",
+                                address.0,
+                            )));
+                        }
+                    }
+
+                    let mut extended_image = None;
+                    let new_intervals = if compatible_images.len() == 1 {
+                        let image_index = compatible_images[0];
+                        let mut intervals = self.modules[module].dynamic_executable_ranges
+                            [image_index]
+                            .as_ref()
+                            .expect("compatible dynamic image exists")
+                            .intervals
+                            .clone();
+                        intervals.push(requested);
+                        let intervals = merge_executable_intervals(intervals);
+                        let merged_base = intervals
+                            .first()
+                            .map(|range| range.base.0)
+                            .unwrap_or(requested.base.0);
+                        let merged_end = intervals
+                            .iter()
+                            .filter_map(|range| range.end())
+                            .max()
+                            .unwrap_or(requested_end);
+                        let merged_bounds = ExecutableRange {
+                            base: GuestAddr(merged_base),
+                            len: (merged_end - merged_base) as usize,
+                        };
+                        let merged_owner = if mtk_window.contains_range(merged_bounds) {
+                            self.mtk_native_extension_owner
+                                .unwrap_or(context_generation)
+                        } else {
+                            self.allocation_owner_for_range(merged_bounds).ok_or_else(|| {
+                                Error::Abi(format!(
+                                    "merged dynamic executable image {merged_base:#010x}..{merged_end:#010x} is not inside one tracked allocation"
+                                ))
+                            })?
+                        };
+                        if merged_owner != context_generation {
+                            return Err(Error::Abi(format!(
+                                "merged dynamic executable image {merged_base:#010x}..{merged_end:#010x} belongs to another module"
+                            )));
+                        }
+                        extended_image = Some((image_index, intervals));
+                        Vec::new()
+                    } else if compatible_images.is_empty() {
+                        vec![requested]
+                    } else {
+                        // Slot 131 grants execute permission; it does not replace code that
+                        // was already registered. Preserve every existing image identity so
+                        // live callbacks remain tied to the bytes that established them, and
+                        // track only newly covered gaps as a distinct image.
+                        let mut uncovered = vec![requested];
+                        for image_index in &compatible_images {
+                            let image = self.modules[module].dynamic_executable_ranges
+                                [*image_index]
+                                .as_ref()
+                                .expect("compatible dynamic image exists");
+                            for interval in &image.intervals {
+                                uncovered = uncovered
+                                    .into_iter()
+                                    .flat_map(|range| range.subtract(*interval))
+                                    .collect();
+                            }
+                        }
+                        merge_executable_intervals(uncovered)
+                    };
+                    if !new_intervals.is_empty()
+                        && !self.modules[module]
+                            .dynamic_executable_ranges
+                            .iter()
+                            .any(DynamicExecutableImageSlot::is_none)
+                        && self.modules[module].dynamic_executable_ranges.len() >= 64
+                    {
+                        return Err(Error::Abi(format!(
+                            "module {module} exceeded 64 dynamic executable images"
+                        )));
+                    }
+                    let vacant_image = self.modules[module]
+                        .dynamic_executable_ranges
+                        .iter()
+                        .position(DynamicExecutableImageSlot::is_none);
+                    let new_image = if !new_intervals.is_empty() {
+                        let id = self.modules[module].next_dynamic_executable_image_id;
+                        let next_id = id.checked_add(1).ok_or_else(|| {
+                            Error::Abi("dynamic executable image identifier overflow".into())
+                        })?;
+                        Some((vacant_image, id, next_id))
+                    } else {
+                        None
+                    };
                     let image = self.memory.read(address, len as usize)?;
                     if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
                         eprintln!(
@@ -702,6 +1200,29 @@ impl ExtRuntime {
                     }
                     self.memory
                         .add_permissions(address, len as usize, Permissions::EXECUTE)?;
+                    if uses_mtk_window && self.mtk_native_extension_owner.is_none() {
+                        self.mtk_native_extension_owner = Some(context_generation);
+                    }
+                    if let Some((image_index, intervals)) = extended_image {
+                        self.modules[module].dynamic_executable_ranges[image_index]
+                            .as_mut()
+                            .expect("compatible dynamic image exists")
+                            .intervals = intervals;
+                    } else if let Some((vacant_image, id, next_id)) = new_image {
+                        let dynamic_image = DynamicExecutableImage {
+                            id,
+                            intervals: new_intervals,
+                        };
+                        self.modules[module].next_dynamic_executable_image_id = next_id;
+                        if let Some(image_index) = vacant_image {
+                            self.modules[module].dynamic_executable_ranges[image_index].0 =
+                                Some(dynamic_image);
+                        } else {
+                            self.modules[module]
+                                .dynamic_executable_ranges
+                                .push(DynamicExecutableImageSlot(Some(dynamic_image)));
+                        }
+                    }
                     cpu.set_register(0, 0);
                 }
                 (command, argument, address, len) => {
@@ -710,6 +1231,7 @@ impl ExtRuntime {
                     )));
                 }
             },
+            132 => self.convert_legacy_string_to_ucs2(module, cpu)?,
             other => {
                 let return_address = cpu.register(14) & !1;
                 let caller_start = return_address.saturating_sub(24);

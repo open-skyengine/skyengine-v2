@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn native_tostring(args: &[Value]) -> Value {
+    let value = args.first().unwrap_or(&Value::Nil);
+    value
+        .bytes()
+        .map(Value::Bytes)
+        .unwrap_or_else(|| bytes(format!("{value:?}").as_bytes()))
+}
+
 pub(super) fn native_tonumber(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Nil;
