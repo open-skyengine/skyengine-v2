@@ -916,15 +916,20 @@ impl ExtRuntime {
             }
             123 => {
                 let stack = GuestAddr(cpu.register(13));
-                let flags = self.memory.read_u32(stack.checked_add(12)?)?;
-                if flags > 2 {
+                let is_unicode = self.memory.read_u32(stack.checked_add(8)?)?;
+                let font = self.memory.read_u32(stack.checked_add(12)?)?;
+                if font > 2 {
                     return Err(Error::Abi(format!(
-                        "unsupported text drawing flags {flags} called by module {module}"
+                        "unsupported text drawing font {font} called by module {module}"
                     )));
                 }
                 let text_address = GuestAddr(cpu.register(0));
                 let text = if text_address.0 == 0 {
                     Vec::new()
+                } else if is_unicode == 0 {
+                    let encoded = self.read_c_string(text_address, 64 * 1024)?;
+                    let (decoded, _, _) = encoding_rs::GBK.decode(&encoded);
+                    decoded.encode_utf16().collect()
                 } else {
                     self.read_wide_string_be(text_address, 64 * 1024)?
                 };
@@ -938,7 +943,7 @@ impl ExtRuntime {
                     cpu.register(1) as i32,
                     cpu.register(2) as i32,
                     color,
-                    self.memory.read_u32(stack.checked_add(8)?)?,
+                    font,
                     services,
                 )?;
                 cpu.set_register(0, 0);

@@ -1886,27 +1886,110 @@ fn platform_storage_drive_query_resolves_supported_volumes() {
 }
 
 #[test]
-fn text_drawing_accepts_the_baseline_wide_text_flags() {
+fn text_drawing_decodes_legacy_gbk_and_uses_the_font_argument() {
+    let mut runtime =
+        ExtRuntime::new(24, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let text = runtime.allocate(5, 1).unwrap();
+    runtime
+        .memory
+        .write(text, &[0xc8, 0xb7, 0xb6, 0xa8, 0])
+        .unwrap();
+    let stack = runtime.allocate(16, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(stack.checked_add(8).unwrap(), 0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(stack.checked_add(12).unwrap(), 1)
+        .unwrap();
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, text.0);
+    cpu.set_register(3, 255);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(123, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), 0);
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(7, 0, 24).unwrap())
+            .unwrap(),
+        0xf800
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(16, 0, 24).unwrap())
+            .unwrap(),
+        0xf800
+    );
+}
+
+#[test]
+fn text_drawing_reads_ucs2_be_when_requested() {
+    let mut runtime =
+        ExtRuntime::new(24, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let text = runtime.allocate(6, 2).unwrap();
+    runtime
+        .memory
+        .write(text, &[0x78, 0x6e, 0x5b, 0x9a, 0, 0])
+        .unwrap();
+    let stack = runtime.allocate(16, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(stack.checked_add(8).unwrap(), 1)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(stack.checked_add(12).unwrap(), 2)
+        .unwrap();
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, text.0);
+    cpu.set_register(3, 255);
+    cpu.set_register(13, stack.0);
+
+    runtime
+        .dispatch(123, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), 0);
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(7, 0, 24).unwrap())
+            .unwrap(),
+        0xf800
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(16, 0, 24).unwrap())
+            .unwrap(),
+        0xf800
+    );
+}
+
+#[test]
+fn text_drawing_rejects_invalid_font_arguments() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let text = runtime.allocate(4, 2).unwrap();
     runtime.memory.write(text, &[0, b'A', 0, 0]).unwrap();
     let stack = runtime.allocate(16, 4).unwrap();
-
     let mut cpu = ArmCpu::new();
+    cpu.set_register(0, text.0);
     cpu.set_register(13, stack.0);
-    for flags in 0..=2 {
-        runtime
-            .memory
-            .write_u32(stack.checked_add(12).unwrap(), flags)
-            .unwrap();
-        cpu.set_register(0, text.0);
-        runtime
-            .dispatch(123, 0, &mut cpu, &mut StubServices)
-            .unwrap();
-        assert_eq!(cpu.register(0), 0);
-    }
 
+    runtime
+        .memory
+        .write_u32(stack.checked_add(8).unwrap(), 1)
+        .unwrap();
     runtime
         .memory
         .write_u32(stack.checked_add(12).unwrap(), 3)
@@ -1914,7 +1997,7 @@ fn text_drawing_accepts_the_baseline_wide_text_flags() {
     assert!(matches!(
         runtime.dispatch(123, 0, &mut cpu, &mut StubServices),
         Err(Error::Abi(message))
-            if message == "unsupported text drawing flags 3 called by module 0"
+            if message == "unsupported text drawing font 3 called by module 0"
     ));
 }
 

@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
+import { SkyEngineE2e, SkyEngineWorkspace, type PpmImage } from "../engine-e2e.js";
 import fs from "fs";
+
+function glyphPixels(screen: PpmImage, originX: number, originY: number) {
+  return Array.from({ length: 16 * 16 }, (_, index) =>
+    screen.pixel(originX + index % 16, originY + Math.floor(index / 16))
+  );
+}
 
 describe("gghjt 开始游戏", () => {
   let engine: SkyEngineE2e | undefined;
@@ -29,6 +35,12 @@ describe("gghjt 开始游戏", () => {
     {
       // 检测内存
       await engine.delay(1_000);
+      const prompt = await engine.screen("memory-prompt");
+      // 底部软键与正文中的“确定/取消”应使用完全相同的 Unicode 字形。
+      expect(glyphPixels(prompt, 5, 290)).toEqual(glyphPixels(prompt, 29, 59));
+      expect(glyphPixels(prompt, 21, 290)).toEqual(glyphPixels(prompt, 45, 59));
+      expect(glyphPixels(prompt, 190, 290)).toEqual(glyphPixels(prompt, 29, 77));
+      expect(glyphPixels(prompt, 206, 290)).toEqual(glyphPixels(prompt, 45, 77));
       await engine.key('LEFT_SOFT', 1_000);
       await engine.delay(1_000);
 
