@@ -169,13 +169,13 @@ fn key_code(key: Keycode) -> Option<i32> {
         Keycode::Num9 | Keycode::Kp9 => 9,
         Keycode::Asterisk => 10,
         Keycode::Hash => 11,
-        Keycode::Up => 12,
-        Keycode::Down => 13,
-        Keycode::Left => 14,
-        Keycode::Right => 15,
+        Keycode::Up | Keycode::W => 12,
+        Keycode::Down | Keycode::S => 13,
+        Keycode::Left | Keycode::A => 14,
+        Keycode::Right | Keycode::D => 15,
         Keycode::Escape => 16,
-        Keycode::F1 => 17,
-        Keycode::F2 | Keycode::Backspace => 18,
+        Keycode::F1 | Keycode::Q => 17,
+        Keycode::F2 | Keycode::Backspace | Keycode::E => 18,
         Keycode::Return | Keycode::KpEnter | Keycode::Space => 20,
         _ => return None,
     })
@@ -184,6 +184,16 @@ fn key_code(key: Keycode) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letter_keys_map_to_softkeys_and_directions() {
+        assert_eq!(key_code(Keycode::Q), Some(17));
+        assert_eq!(key_code(Keycode::E), Some(18));
+        assert_eq!(key_code(Keycode::W), Some(12));
+        assert_eq!(key_code(Keycode::A), Some(14));
+        assert_eq!(key_code(Keycode::S), Some(13));
+        assert_eq!(key_code(Keycode::D), Some(15));
+    }
 
     #[test]
     fn dummy_driver_presents_an_rgb565_frame() {
