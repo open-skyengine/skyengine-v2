@@ -112,6 +112,9 @@ jobs:
 
       - name: Build release binaries
         shell: bash
+        env:
+          # Bundled SDL2 declares CMake 3.0 compatibility, which CMake 4 removed.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: >-
           cargo build --release --locked --workspace
           --features sdl2/bundled,sdl2/static-link
