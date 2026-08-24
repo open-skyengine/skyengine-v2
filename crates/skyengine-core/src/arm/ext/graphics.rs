@@ -361,13 +361,41 @@ impl ExtRuntime {
         handle: u32,
         services: &mut dyn NativeServices,
     ) -> Result<bool> {
-        if self.active_platform_ui.last() != Some(&ActivePlatformUi::Menu(handle)) {
+        let ui = ActivePlatformUi::Menu(handle);
+        if self.active_platform_ui.last() == Some(&ui) {
+            if self.pending_platform_menu_selection == Some(handle) {
+                self.pending_platform_menu_selection = None;
+            }
+            self.render_platform_menu(handle, services)?;
+            return Ok(true);
+        }
+        if !self
+            .menus
+            .get(&handle)
+            .is_some_and(|menu| menu.modal_detached)
+            || !self
+                .active_platform_ui
+                .iter()
+                .all(|active| matches!(active, ActivePlatformUi::Menu(_)))
+        {
             return Ok(false);
         }
         if self.pending_platform_menu_selection == Some(handle) {
             self.pending_platform_menu_selection = None;
         }
-        self.render_platform_menu(handle, services)?;
+        self.menus
+            .get_mut(&handle)
+            .expect("detached menu handle was checked")
+            .modal_detached = false;
+        self.active_platform_ui.push(ui);
+        if let Err(error) = self.render_platform_menu(handle, services) {
+            self.active_platform_ui.pop();
+            self.menus
+                .get_mut(&handle)
+                .expect("detached menu handle remains live")
+                .modal_detached = true;
+            return Err(error);
+        }
         Ok(true)
     }
 

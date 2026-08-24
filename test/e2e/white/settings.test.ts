@@ -96,8 +96,7 @@ describe("white", () => {
     const savedDialogFirstDraw = await engine.drawCount();
     await engine.key('ENTER', 1_000);
     await expectNoMainMenuTransition(engine, savedDialogFirstDraw, "setting-saved-transition");
-    // 保存后 white 会创建 MR_DIALOG_OK 的“设置成功”平台提示；确认并退出
-    // 恢复出来的父菜单后，再验证底层 guest 菜单能继续接收方向键。
+    // 保存后 white 会创建 MR_DIALOG_OK 的“设置成功”平台提示。
     await vi.waitFor(async () => {
         const screen = await engine!.screen("setting-saved")
         expect(screen.uniqueColorCount()).toBe(2);
@@ -106,10 +105,51 @@ describe("white", () => {
         timeout: 30_000,
         interval: 1_000
     });
-    const parentMenuFirstDraw = await engine.drawCount();
+    const restoredChildMenuFirstDraw = await engine.drawCount();
     await engine.key('LEFT_SOFT', 1_000);
-    await expectNoMainMenuTransition(engine, parentMenuFirstDraw, "setting-parent-transition");
-    // 成功提示关闭后，white 会重新 show 仍在事件栈中的父“游戏设置”菜单。
+    await expectNoMainMenuTransition(engine, restoredChildMenuFirstDraw, "setting-child-restored-transition");
+    // 成功提示关闭后，white 会 refresh 仍在事件栈中的“游戏难度”菜单。
+    await vi.waitFor(async () => {
+        const screen = await engine!.screen("setting-child-restored")
+        expect(screen.pixel(144, 50)).toEqual([0, 0, 248]);
+        expectMenuSoftkeyLabels(screen);
+    }, {
+        timeout: 30_000,
+        interval: 1_000
+    });
+
+    // 改选另一难度并再次保存；回归“设置成功”确认后无法进行第二次设置。
+    await engine.key('DOWN', 1_000);
+    await vi.waitFor(async () => {
+        const screen = await engine!.screen("setting-2-selected")
+        expect(screen.pixel(144, 74)).toEqual([0, 0, 248]);
+        expectMenuSoftkeyLabels(screen);
+    }, {
+        timeout: 30_000,
+        interval: 1_000
+    });
+    const secondSavedDialogFirstDraw = await engine.drawCount();
+    await engine.key('ENTER', 1_000);
+    await expectNoMainMenuTransition(engine, secondSavedDialogFirstDraw, "setting-saved-2-transition");
+    await vi.waitFor(async () => {
+        const screen = await engine!.screen("setting-saved-2")
+        expect(screen.uniqueColorCount()).toBe(2);
+        expect(screen.pixel(0, 294)).toEqual([0, 252, 0]);
+    }, {
+        timeout: 30_000,
+        interval: 1_000
+    });
+    await engine.key('LEFT_SOFT', 1_000);
+    await vi.waitFor(async () => {
+        const screen = await engine!.screen("setting-child-restored-2")
+        expect(screen.pixel(144, 74)).toEqual([0, 0, 248]);
+        expectMenuSoftkeyLabels(screen);
+    }, {
+        timeout: 30_000,
+        interval: 1_000
+    });
+
+    await engine.key('RIGHT_SOFT', 1_000);
     await vi.waitFor(async () => {
         const screen = await engine!.screen("setting-parent")
         expect(screen.pixel(144, 50)).toEqual([0, 0, 248]);

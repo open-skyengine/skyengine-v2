@@ -1145,6 +1145,60 @@ fn releasing_a_modal_detached_menu_unwinds_the_parent_menu_stack() {
 }
 
 #[test]
+fn refreshing_a_modal_detached_menu_reattaches_it_above_its_parent() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let parent = runtime
+        .create_platform_menu(vec![0x7236, 0x83dc], 1)
+        .unwrap();
+    runtime.menus.get_mut(&parent).unwrap().items = vec![Some(vec![0x5b50, 0x83dc])];
+    let child = runtime
+        .create_platform_menu(vec![0x5b50, 0x83dc], 2)
+        .unwrap();
+    runtime.menus.get_mut(&child).unwrap().items =
+        vec![Some(vec![0x7b2c, 0x4e00]), Some(vec![0x7b2c, 0x4e8c])];
+    let mut services = StubServices;
+    runtime.show_platform_menu(parent, &mut services).unwrap();
+    runtime.show_platform_menu(child, &mut services).unwrap();
+    let child_screen = runtime.menus[&child].menu_screen.clone().unwrap();
+    assert_eq!(
+        runtime.route_key_event(20, true, &mut services).unwrap(),
+        Some((4, 0, 0))
+    );
+
+    let dialog = runtime
+        .create_platform_dialog(&[], &[], 0, &mut services)
+        .unwrap();
+    runtime
+        .release_platform_dialog(dialog, &mut services)
+        .unwrap();
+    assert_eq!(runtime.active_platform_ui, [ActivePlatformUi::Menu(parent)]);
+    assert!(runtime.menus[&child].modal_detached);
+
+    assert!(runtime.refresh_platform_menu(child, &mut services).unwrap());
+    assert_eq!(
+        runtime.active_platform_ui,
+        [
+            ActivePlatformUi::Menu(parent),
+            ActivePlatformUi::Menu(child)
+        ]
+    );
+    assert!(!runtime.menus[&child].modal_detached);
+    assert_eq!(runtime.pending_platform_menu_selection, None);
+    assert_eq!(
+        runtime
+            .memory
+            .read(SCREEN_BASE, child_screen.len())
+            .unwrap(),
+        child_screen
+    );
+
+    assert!(runtime.release_platform_menu(child, &mut services).unwrap());
+    assert_eq!(runtime.active_platform_ui, [ActivePlatformUi::Menu(parent)]);
+    assert_eq!(runtime.pending_platform_menu_returns, 0);
+}
+
+#[test]
 fn platform_text_viewer_reports_cancel_then_guest_release_restores_the_screen() {
     let mut runtime =
         ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
