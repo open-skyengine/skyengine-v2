@@ -25,5 +25,6 @@ symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
 thiserror = "2.0.12"
 
 [profile.release]
-lto = "thin"
+# ThinLTO can leave Rust symbols unresolved in MSVC static and dynamic libraries.
+lto = "fat"
 strip = "debuginfo"

@@ -110,14 +110,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}-
 
-      - name: Build release binaries
+      - name: Build release executables
         shell: bash
         env:
           # Bundled SDL2 declares CMake 3.0 compatibility, which CMake 4 removed.
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: >-
-          cargo build --release --locked --workspace
+          cargo build --release --locked --workspace --exclude skyengine-ffi
           --features sdl2/bundled,sdl2/static-link
+
+      # The executable and FFI library are both named skyengine. Build them
+      # separately so their Windows PDB and top-level outputs cannot collide.
+      - name: Build release library
+        shell: bash
+        run: cargo build --release --locked --package skyengine-ffi
 
       - name: Package Linux release
         if: runner.os == 'Linux'
