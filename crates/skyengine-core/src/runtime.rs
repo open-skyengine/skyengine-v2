@@ -133,11 +133,22 @@ impl RuntimeConfig {
             memory_limit: 1024 * 1024,
             screen_width: 240,
             screen_height: 320,
-            dns_mappings: Vec::new(),
+            dns_mappings: default_dns_mappings(),
             device_date: DeviceDate::default(),
             limits: ResourceLimits::default(),
         }
     }
+}
+
+fn default_dns_mappings() -> Vec<DnsMapping> {
+    ["rop.skymobiapp.com", "spd.skymobiapp.com", "wap.skmeg.com"]
+        .into_iter()
+        .map(|source| DnsMapping {
+            source: source.into(),
+            address: Ipv4Addr::new(159, 75, 119, 124),
+            port: None,
+        })
+        .collect()
 }
 
 pub struct Runtime {
@@ -375,6 +386,25 @@ mod tests {
         assert_eq!(
             RuntimeConfig::for_app("app.mrp").font_path,
             PathBuf::from("mythroad/system/gb16.uc2")
+        );
+    }
+
+    #[test]
+    fn uses_skymobi_dns_mappings_by_default() {
+        assert_eq!(
+            RuntimeConfig::for_app("app.mrp").dns_mappings,
+            [
+                DnsMapping {
+                    source: "rop.skymobiapp.com".into(),
+                    address: Ipv4Addr::new(159, 75, 119, 124),
+                    port: None,
+                },
+                DnsMapping {
+                    source: "spd.skymobiapp.com".into(),
+                    address: Ipv4Addr::new(159, 75, 119, 124),
+                    port: None,
+                },
+            ]
         );
     }
 

@@ -112,6 +112,8 @@ The output is a binary P6 PPM image. `--frame-output` implies headless mode. Use
 `--entry NAME`, `--work-dir DIR`, `--font FILE`, `--screen WIDTHxHEIGHT`,
 `--dns-map 'HOST->IPv4[:PORT];...'`, and `--device-date YYYY-M-D|host`. The guest path
 `C:/` maps to `--work-dir`, so `C:/mythroad/...` maps to its `mythroad/...` subtree.
+By default, `rop.skymobiapp.com` and `spd.skymobiapp.com` map to `159.75.119.124`;
+passing `--dns-map` replaces these defaults.
 
 ## Run With SDL2
 

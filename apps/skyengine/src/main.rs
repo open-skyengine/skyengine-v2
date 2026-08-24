@@ -114,11 +114,7 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     config.screen_width = width;
     config.screen_height = height;
     config.memory_limit = memory_limit;
-    config.dns_mappings = dns_map
-        .as_deref()
-        .map(parse_dns_mappings)
-        .transpose()?
-        .unwrap_or_default();
+    apply_dns_map_option(&mut config, dns_map.as_deref())?;
     if let Some(device_date) = device_date {
         config.device_date = parse_device_date(&device_date)?;
     }
@@ -314,6 +310,13 @@ fn parse_dns_mappings(value: &str) -> Result<Vec<DnsMapping>> {
     Ok(mappings)
 }
 
+fn apply_dns_map_option(config: &mut RuntimeConfig, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        config.dns_mappings = parse_dns_mappings(value)?;
+    }
+    Ok(())
+}
+
 fn parse_device_date(value: &str) -> Result<DeviceDate> {
     if value == "host" {
         return Ok(DeviceDate::host_today());
@@ -400,6 +403,7 @@ fn print_help() {
          --work-dir is the device root; installed MRP files live in mythroad/.\n  \
          Relative font paths are resolved from --work-dir.\n  \
          DNS MAP is a semicolon-separated SOURCE->IPv4[:PORT] list.\n  \
+         DNS MAP maps rop.skymobiapp.com and spd.skymobiapp.com to 159.75.119.124 by default.\n  \
          Device date defaults to 2012-6-20 or SKYENGINE_DEVICE_DATE when set.\n  \
          Memory SIZE is one of 1M, 2M, 4M, 6M, 8M, or 16M.\n  \
          The default font is mythroad/system/gb16.uc2."
@@ -472,6 +476,25 @@ mod tests {
         assert!(parse_dns_mappings("example.com=127.0.0.1").is_err());
         assert!(parse_dns_mappings("example.com->localhost").is_err());
         assert!(parse_dns_mappings("a.example->127.0.0.1;a.example->127.0.0.2").is_err());
+    }
+
+    #[test]
+    fn dns_map_option_overrides_defaults_only_when_present() {
+        let mut config = RuntimeConfig::for_app("app.mrp");
+        let defaults = config.dns_mappings.clone();
+
+        apply_dns_map_option(&mut config, None).unwrap();
+        assert_eq!(config.dns_mappings, defaults);
+
+        apply_dns_map_option(&mut config, Some("example.com->127.0.0.1:8080")).unwrap();
+        assert_eq!(
+            config.dns_mappings,
+            [DnsMapping {
+                source: "example.com".into(),
+                address: Ipv4Addr::LOCALHOST,
+                port: Some(8080),
+            }]
+        );
     }
 
     #[test]
