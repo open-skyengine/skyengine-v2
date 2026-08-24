@@ -413,6 +413,9 @@ struct PlatformDialog {
 #[derive(Debug)]
 struct PlatformTextViewer {
     previous_screen: Vec<u8>,
+    title: Vec<u16>,
+    lines: Vec<Vec<u16>>,
+    first_visible_line: usize,
     viewer_screen: Vec<u8>,
 }
 
@@ -1126,7 +1129,15 @@ impl ExtRuntime {
                 16 | 18 => Ok(Some((6, 0, 0))),
                 _ => Ok(None),
             },
-            ActivePlatformUi::TextViewer(_) => match code {
+            ActivePlatformUi::TextViewer(handle) => match code {
+                12 => {
+                    self.move_platform_text_viewer(handle, -1, services)?;
+                    Ok(None)
+                }
+                13 => {
+                    self.move_platform_text_viewer(handle, 1, services)?;
+                    Ok(None)
+                }
                 // Text viewers report the same dialog result ABI. The guest
                 // releases the viewer through slot 73 after receiving cancel.
                 16 | 18 => Ok(Some((6, 1, 0))),

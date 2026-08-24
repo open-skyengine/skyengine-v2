@@ -144,7 +144,7 @@ impl NativeServices for StubServices {
 
     fn char_bitmap(&mut self, codepoint: u32, font: u32) -> Result<Option<(Vec<u8>, u32, u32)>> {
         Ok(match (codepoint, font) {
-            (0x2603, 2 | 7) | (0x786e | 0x5b9a, 1 | 2) => {
+            (0x2603, 0 | 2 | 7) | (0x786e | 0x5b9a, 1 | 2) => {
                 Some((vec![0x01, 0x80, 0x96, 0x4b], 9, 2))
             }
             (0x25, 1) => Some((vec![0x80, 0x55, 0x40, 0xaa], 8, 2)),

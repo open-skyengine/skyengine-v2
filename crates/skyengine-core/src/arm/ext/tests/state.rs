@@ -1256,6 +1256,94 @@ fn platform_text_viewer_reports_cancel_then_guest_release_restores_the_screen() 
 }
 
 #[test]
+fn platform_text_viewer_scrolls_long_text_without_overwriting_the_softkey_bar() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.memory.write_u16(SCREEN_BASE, 0x1234).unwrap();
+    let mut text = Vec::new();
+    for line in 1..=14 {
+        text.extend(std::iter::repeat_n(0x2603, line));
+        if line != 14 {
+            text.push(b'\n' as u16);
+        }
+    }
+    let mut services = StubServices;
+
+    let handle = runtime
+        .create_platform_text_viewer(&[b'T' as u16], &text, 2, &mut services)
+        .unwrap();
+
+    assert_eq!(runtime.text_viewers[&handle].lines.len(), 14);
+    assert_eq!(runtime.text_viewers[&handle].first_visible_line, 0);
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(15, 274, 240).unwrap())
+            .unwrap(),
+        Framebuffer::rgb565(0, 252, 0)
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(15, 296, 240).unwrap())
+            .unwrap(),
+        Framebuffer::rgb565(0, 0, 0)
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(234, 32, 240).unwrap())
+            .unwrap(),
+        Framebuffer::rgb565(0, 252, 0)
+    );
+    let first_screen = runtime.text_viewers[&handle].viewer_screen.clone();
+
+    assert!(
+        runtime
+            .move_platform_text_viewer(handle, 1, &mut services)
+            .unwrap()
+    );
+    assert_eq!(runtime.text_viewers[&handle].first_visible_line, 1);
+    assert_ne!(runtime.text_viewers[&handle].viewer_screen, first_screen);
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(runtime.screen_address(234, 32, 240).unwrap())
+            .unwrap(),
+        Framebuffer::rgb565(0, 0, 0)
+    );
+    assert!(
+        runtime
+            .move_platform_text_viewer(handle, 1, &mut services)
+            .unwrap()
+    );
+    assert_eq!(runtime.text_viewers[&handle].first_visible_line, 2);
+    assert!(
+        !runtime
+            .move_platform_text_viewer(handle, 1, &mut services)
+            .unwrap()
+    );
+
+    assert!(
+        runtime
+            .move_platform_text_viewer(handle, -1, &mut services)
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .move_platform_text_viewer(handle, -1, &mut services)
+            .unwrap()
+    );
+    assert_eq!(runtime.text_viewers[&handle].first_visible_line, 0);
+    assert_eq!(runtime.text_viewers[&handle].viewer_screen, first_screen);
+    assert!(
+        !runtime
+            .move_platform_text_viewer(handle, -1, &mut services)
+            .unwrap()
+    );
+}
+
+#[test]
 fn platform_editor_routes_bounded_text_and_enforces_handle_ownership() {
     let mut runtime =
         ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

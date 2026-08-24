@@ -1,6 +1,11 @@
 use super::ram_package::read_le_u32;
 use super::*;
 
+const TEXT_VIEWER_BODY_TOP: i32 = 32;
+const TEXT_VIEWER_LINE_HEIGHT: i32 = 22;
+const TEXT_VIEWER_GLYPH_HEIGHT: i32 = 16;
+const PLATFORM_SOFTKEY_HEIGHT: i32 = 26;
+
 impl ExtRuntime {
     pub(super) fn create_platform_editor(
         &mut self,
@@ -743,15 +748,104 @@ impl ExtRuntime {
             .unwrap_or_else(|| self.capture_platform_screen(services))?;
         self.memory.write(SCREEN_BASE, &previous_screen)?;
 
+        let (width, _) = self.screen_dimensions()?;
+        self.text_viewers.insert(
+            handle,
+            PlatformTextViewer {
+                previous_screen,
+                title: title.to_vec(),
+                lines: Self::wrap_platform_text(text, width.saturating_sub(16)),
+                first_visible_line: 0,
+                viewer_screen: Vec::new(),
+            },
+        );
+        self.active_platform_ui
+            .push(ActivePlatformUi::TextViewer(handle));
+        if let Err(error) = self.render_platform_text_viewer(handle, services) {
+            self.active_platform_ui.pop();
+            if let Some(viewer) = self.text_viewers.remove(&handle) {
+                self.memory.write(SCREEN_BASE, &viewer.previous_screen)?;
+            }
+            return Err(error);
+        }
+        Ok(handle)
+    }
+
+    pub(super) fn move_platform_text_viewer(
+        &mut self,
+        handle: u32,
+        direction: i32,
+        services: &mut dyn NativeServices,
+    ) -> Result<bool> {
+        let (_, height) = self.screen_dimensions()?;
+        let visible_lines = Self::platform_text_viewer_visible_lines(height);
+        let Some(viewer) = self.text_viewers.get(&handle) else {
+            return Ok(false);
+        };
+        let max_first_line = viewer.lines.len().saturating_sub(visible_lines);
+        let next = if direction < 0 {
+            viewer.first_visible_line.saturating_sub(1)
+        } else {
+            viewer
+                .first_visible_line
+                .saturating_add(1)
+                .min(max_first_line)
+        };
+        if next == viewer.first_visible_line {
+            return Ok(false);
+        }
+        self.text_viewers
+            .get_mut(&handle)
+            .expect("text viewer handle was checked")
+            .first_visible_line = next;
+        self.render_platform_text_viewer(handle, services)?;
+        Ok(true)
+    }
+
+    fn render_platform_text_viewer(
+        &mut self,
+        handle: u32,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        let (title, lines, first_visible_line) = {
+            let viewer = self.text_viewers.get(&handle).ok_or_else(|| {
+                Error::Abi(format!("missing platform text viewer handle {handle}"))
+            })?;
+            (
+                viewer.title.clone(),
+                viewer.lines.clone(),
+                viewer.first_visible_line,
+            )
+        };
         let (width, height) = self.screen_dimensions()?;
+        let softkey_top = height.saturating_sub(PLATFORM_SOFTKEY_HEIGHT);
+        let visible_lines = Self::platform_text_viewer_visible_lines(height);
+        let max_first_line = lines.len().saturating_sub(visible_lines);
+        let first_visible_line = first_visible_line.min(max_first_line);
         let black = Framebuffer::rgb565(0, 0, 0);
         let green = Framebuffer::rgb565(0, 252, 0);
-        self.draw_rectangle_to_screen(0, 0, width, height, black)?;
-        self.draw_text_to_screen(title, 7, 6, green, 0, services)?;
-        self.draw_rectangle_to_screen(0, 26, width, 1, green)?;
-        self.draw_wrapped_text_to_screen(text, 8, 32, width - 16, green, services)?;
 
-        let softkey_top = height.saturating_sub(26);
+        self.draw_rectangle_to_screen(0, 0, width, height, black)?;
+        self.draw_text_to_screen(&title, 7, 6, green, 0, services)?;
+        self.draw_rectangle_to_screen(0, 26, width, 1, green)?;
+        for (visible_index, line) in lines
+            .iter()
+            .skip(first_visible_line)
+            .take(visible_lines)
+            .enumerate()
+        {
+            let y = TEXT_VIEWER_BODY_TOP
+                + i32::try_from(visible_index).unwrap_or(i32::MAX) * TEXT_VIEWER_LINE_HEIGHT;
+            self.draw_text_to_screen(line, 8, y, green, 0, services)?;
+        }
+        self.draw_platform_text_viewer_scrollbar(
+            width,
+            softkey_top,
+            lines.len(),
+            visible_lines,
+            first_visible_line,
+            green,
+        )?;
         self.draw_rectangle_to_screen(0, softkey_top, width, 1, green)?;
         self.draw_text_to_screen(
             &[0x8fd4, 0x56de],
@@ -765,17 +859,84 @@ impl ExtRuntime {
         let viewer_screen = self
             .memory
             .read(SCREEN_BASE, self.platform_screen_byte_len()?)?;
-        self.text_viewers.insert(
-            handle,
-            PlatformTextViewer {
-                previous_screen,
-                viewer_screen,
-            },
-        );
-        self.active_platform_ui
-            .push(ActivePlatformUi::TextViewer(handle));
-        self.present_screen(services)?;
-        Ok(handle)
+        let viewer = self
+            .text_viewers
+            .get_mut(&handle)
+            .expect("text viewer handle remained live while rendering");
+        viewer.first_visible_line = first_visible_line;
+        viewer.viewer_screen = viewer_screen;
+        self.present_screen(services)
+    }
+
+    fn draw_platform_text_viewer_scrollbar(
+        &mut self,
+        width: i32,
+        softkey_top: i32,
+        total_lines: usize,
+        visible_lines: usize,
+        first_visible_line: usize,
+        color: u16,
+    ) -> Result<()> {
+        if total_lines <= visible_lines || visible_lines == 0 {
+            return Ok(());
+        }
+        let track_height = softkey_top.saturating_sub(TEXT_VIEWER_BODY_TOP);
+        if track_height <= 0 {
+            return Ok(());
+        }
+        let thumb_height = (i64::from(track_height)
+            * i64::try_from(visible_lines).unwrap_or(i64::MAX)
+            / i64::try_from(total_lines).unwrap_or(i64::MAX))
+        .clamp(12, i64::from(track_height)) as i32;
+        let max_first_line = total_lines - visible_lines;
+        let thumb_travel = track_height - thumb_height;
+        let thumb_offset = i64::from(thumb_travel)
+            * i64::try_from(first_visible_line).unwrap_or(i64::MAX)
+            / i64::try_from(max_first_line).unwrap_or(i64::MAX);
+        let track_x = width.saturating_sub(3);
+        self.draw_rectangle_to_screen(track_x, TEXT_VIEWER_BODY_TOP, 1, track_height, color)?;
+        self.draw_rectangle_to_screen(
+            width.saturating_sub(6),
+            TEXT_VIEWER_BODY_TOP + i32::try_from(thumb_offset).unwrap_or(i32::MAX),
+            6,
+            thumb_height,
+            color,
+        )
+    }
+
+    fn platform_text_viewer_visible_lines(height: i32) -> usize {
+        let available_height = height
+            .saturating_sub(PLATFORM_SOFTKEY_HEIGHT)
+            .saturating_sub(TEXT_VIEWER_BODY_TOP);
+        if available_height < TEXT_VIEWER_GLYPH_HEIGHT {
+            return 0;
+        }
+        usize::try_from(1 + (available_height - TEXT_VIEWER_GLYPH_HEIGHT) / TEXT_VIEWER_LINE_HEIGHT)
+            .unwrap_or(0)
+    }
+
+    fn wrap_platform_text(text: &[u16], max_width: i32) -> Vec<Vec<u16>> {
+        let mut lines = Vec::new();
+        let mut line = Vec::new();
+        let mut line_width = 0_i32;
+        for &codepoint in text {
+            if codepoint == b'\n' as u16 {
+                lines.push(std::mem::take(&mut line));
+                line_width = 0;
+                continue;
+            }
+            let glyph_width = if codepoint < 128 { 8 } else { 16 };
+            if !line.is_empty() && line_width.saturating_add(glyph_width) > max_width {
+                lines.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            line.push(codepoint);
+            line_width = line_width.saturating_add(glyph_width);
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
     }
 
     pub(super) fn release_platform_text_viewer(
