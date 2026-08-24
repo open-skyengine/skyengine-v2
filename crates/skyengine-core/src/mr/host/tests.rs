@@ -81,6 +81,19 @@ fn run_file_requests_a_managed_application_restart() {
     assert_eq!(host.lifecycle_request().unwrap(), None);
 }
 
+#[test]
+fn exit_requests_runtime_shutdown() {
+    let mut host = test_host();
+    host.call("Exit", &[]).unwrap();
+
+    assert_eq!(
+        host.lifecycle_request().unwrap(),
+        Some(ExtLifecycleRequest::Exit)
+    );
+    host.acknowledge_lifecycle_request().unwrap();
+    assert_eq!(host.lifecycle_request().unwrap(), None);
+}
+
 struct TestDisplay;
 
 impl PlatformDisplay for TestDisplay {

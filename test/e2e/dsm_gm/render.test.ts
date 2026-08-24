@@ -137,6 +137,27 @@ describe("dsm_gm", () => {
     ws = undefined;
   });
 
+  it("在根菜单按右软键退出", async () => {
+    ws = await SkyEngineWorkspace.create();
+    engine = await SkyEngineE2e.start("test/fixtures/dsm_gm.mrp", {
+      workDir: ws.dir,
+      dnsMap:
+        "rop.skymobiapp.com->159.75.119.124;" +
+        "spd.skymobiapp.com->159.75.119.124;" +
+        "proxy.51mrp.com->127.0.0.1;" +
+        "proxy2.51mrp.com->127.0.0.1",
+    });
+
+    const initial = await engine.waitForScreen(
+      (screen) => isSelectedMenuRow(screen, 45) && hasFourthMenuRow(screen),
+      { name: "exit-initial-menu", timeoutMs: 10_000, intervalMs: 250 },
+    );
+    expectSelectedMenuRow(initial, 45);
+
+    await engine.key("RIGHT_SOFT", { holdMs: 80, waitForDraw: false });
+    expect(await engine.waitForExit(2_000)).toBe(true);
+  });
+
   it("向下移动后完整绘制焦点行", async () => {
     ws = await SkyEngineWorkspace.create();
     engine = await SkyEngineE2e.start("test/fixtures/dsm_gm.mrp", {

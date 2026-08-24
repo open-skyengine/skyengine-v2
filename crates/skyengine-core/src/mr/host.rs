@@ -311,7 +311,10 @@ impl MrHost {
             "TimerStop" => self.timer_stop(),
             "mr_c_load" => self.mr_c_load(args),
             "_gc" => Ok(Vec::new()),
-            "Exit" => Ok(Vec::new()),
+            "Exit" => {
+                self.mr_lifecycle_request = Some(ExtLifecycleRequest::Exit);
+                Ok(Vec::new())
+            }
             _ => Err(crate::Error::Platform(format!(
                 "unsupported MR platform function {name}"
             ))),
