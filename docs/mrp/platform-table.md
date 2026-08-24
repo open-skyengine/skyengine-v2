@@ -110,12 +110,14 @@ native extension 固定内存窗口相互独立。
   返回寄存器；基线 profile 不建立未经证实的平台状态，并返回统一的不可用值 `-1`。
 - `2023` 只接受最长 4096 字节、不含 NUL、以 `.mp3` 结尾且可解析为非空文件的
   caller-owned 路径，输出和回调必须为空。资源可以是工作区文件，也可以是当前包中
-  与路径 basename 精确同名的条目；headless profile 通过静默音频 sink 消费该请求。
-  文件不存在时返回 `-1`，其他未经验证的形态保持 Unsupported。
-- `2043` 的本地调用紧跟已验证的 `2023` 请求；只白名单全空参数形式，headless 音频
-  sink 确认该状态转换并返回 `0`。任何输入、输出或回调非空的形态保持 Unsupported。
-- `2093` 只白名单全空参数的多媒体状态查询，确定性 headless profile 返回调用方已
-  验证为 idle 的 `1003`。任何输入、输出或回调非空的形态保持 Unsupported。
+  与路径 basename 精确同名的条目；有输出能力的宿主解码并播放该资源，headless
+  profile 通过静默音频 sink 消费请求。文件不存在或音频无法解码时返回 `-1`，其他
+  未经验证的形态保持 Unsupported。
+- `2043` 的本地调用紧跟已验证的 `2023` 请求；只白名单全空参数形式，停止当前音轨
+  并返回 `0`。任何输入、输出或回调非空的形态保持 Unsupported。
+- `2093` 只白名单全空参数的多媒体状态查询；播放中返回 `1001`，空闲返回 `1003`。
+  确定性 headless profile 始终为空闲。任何输入、输出或回调非空的形态保持
+  Unsupported。
 - `2700` 只接受 16 字节 `{WAV 路径地址, 0, 0, 1}` 和全空输出/回调；路径是最长
   4096 字节、以 `.wav` 结尾且不含空路径段的 caller-owned C 字符串。headless
   profile 没有录音 provider，返回统一的不可用值 `-1`，也不创建或写入目标文件。
@@ -162,8 +164,9 @@ native extension 固定内存窗口相互独立。
 基线 headless profile 支持 `mr_playSound(type, data, len, looped)` 的内存 MIDI
 （类型 `0`）和 MP3（类型 `2`）形式，其中 `data` 和 `len` 必须指向非空的有效
 guest 缓冲区，`looped` 为 `0` 或 `1`。
-该 profile 使用无输出音频 sink；调用成功推进 guest 音频状态，但不产生宿主声音。
-`mr_stopSound` 在没有正在播放的声音时也成功返回。
+有输出能力的宿主把资源解码为 44.1 kHz 双声道 PCM，并支持单曲循环；headless
+profile 使用无输出音频 sink，调用成功推进 guest 状态但不产生宿主声音。
+`mr_stopSound` 停止当前音轨，在没有正在播放的声音时也成功返回。
 
 ## UI 与网络（槽 63-90）
 

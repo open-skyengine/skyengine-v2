@@ -11,8 +11,8 @@ use std::{
 };
 
 use skyengine_core::{
-    DeviceDate, DisplayEvent, DnsMapping, Framebuffer, PlatformDisplay, Result as CoreResult,
-    Runtime, RuntimeConfig, RuntimeState,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioPlayer, DeviceDate, DisplayEvent, DnsMapping,
+    Framebuffer, PlatformDisplay, Result as CoreResult, Runtime, RuntimeConfig, RuntimeState,
 };
 
 const DEFAULT_WIDTH: u16 = 240;
@@ -80,6 +80,7 @@ struct Worker {
 struct Shared {
     state: Mutex<SharedState>,
     wake: Condvar,
+    audio: AudioPlayer,
 }
 
 impl Shared {
@@ -99,6 +100,7 @@ impl Shared {
                 last_error: None,
             }),
             wake: Condvar::new(),
+            audio: AudioPlayer::default(),
         }
     }
 
@@ -338,7 +340,11 @@ fn worker_main(
     runtime_config.dns_mappings = config.dns_mappings;
     runtime_config.device_date = config.device_date;
 
-    let mut runtime = match Runtime::load(runtime_config, Box::new(display)) {
+    let mut runtime = match Runtime::load_with_audio(
+        runtime_config,
+        Box::new(display),
+        Box::new(shared.audio.clone()),
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             let message = error.to_string();
@@ -400,6 +406,7 @@ fn worker_main(
         shared.wait_timeout(WORKER_INTERVAL);
     }
 
+    shared.audio.stop();
     let mut state = lock(&shared.state);
     state.running = false;
     state.paused = false;
@@ -457,6 +464,7 @@ fn stop_worker() {
             state.stop_requested = true;
             state.events.clear();
         }
+        worker.shared.audio.stop();
         worker.shared.wake.notify_all();
         if worker.thread.join().is_err() {
             set_last_error("SkyEngine runtime thread panicked during shutdown");
@@ -830,26 +838,72 @@ pub extern "C" fn skyengine_api_get_screen_rotation() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn skyengine_api_audio_sample_rate() -> i32 {
-    0
+    AUDIO_SAMPLE_RATE as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn skyengine_api_audio_channels() -> i32 {
-    0
+    AUDIO_CHANNELS as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn skyengine_api_audio_is_active() -> i32 {
-    0
+    catch_unwind(AssertUnwindSafe(|| {
+        lock(&ENGINE)
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.shared.audio.is_active()) as i32
+    }))
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn skyengine_api_audio_render_s16le(_output: *mut c_void, _frames: i32) -> i32 {
-    0
+/// # Safety
+///
+/// `output` must point to writable storage for `frames * 2` `int16_t` samples.
+pub unsafe extern "C" fn skyengine_api_audio_render_s16le(output: *mut c_void, frames: i32) -> i32 {
+    ffi_result(|| {
+        let frames = usize::try_from(frames).map_err(|_| "audio frame count is negative")?;
+        if frames == 0 {
+            return Ok(0);
+        }
+        if output.is_null() {
+            return Err("audio output must not be null".into());
+        }
+        let sample_count = frames
+            .checked_mul(AUDIO_CHANNELS)
+            .ok_or("audio output length overflows")?;
+        if sample_count > isize::MAX as usize / size_of::<i16>() {
+            return Err("audio output length exceeds the addressable range".into());
+        }
+        let shared = lock(&ENGINE)
+            .worker
+            .as_ref()
+            .map(|worker| worker.shared.clone());
+        // SAFETY: The C contract requires writable storage for sample_count i16 values.
+        let output = unsafe { std::slice::from_raw_parts_mut(output.cast::<i16>(), sample_count) };
+        Ok(match shared {
+            Some(shared) if !lock(&shared.state).paused => shared.audio.render(output) as i32,
+            None => {
+                output.fill(0);
+                0
+            }
+            Some(_) => {
+                output.fill(0);
+                0
+            }
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn skyengine_api_audio_stop() {}
+pub extern "C" fn skyengine_api_audio_stop() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(worker) = lock(&ENGINE).worker.as_ref() {
+            worker.shared.audio.stop();
+        }
+    }));
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn skyengine_api_is_edit_active() -> i32 {

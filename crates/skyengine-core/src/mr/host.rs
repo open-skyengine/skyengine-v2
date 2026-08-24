@@ -12,8 +12,8 @@ use std::{
 use encoding_rs::GBK;
 
 use crate::{
-    DnsMapping, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result, VIRTUAL_IMEI,
-    VIRTUAL_IMSI,
+    DnsMapping, Framebuffer, Package, PlatformAudio, PlatformDisplay, ResourceLimits, Result,
+    VIRTUAL_IMEI, VIRTUAL_IMSI,
     arm::{
         ExtLifecycleRequest, ExtRuntime, GuestAddr, NativeExtensionProfile, NativeServices,
         START_FILE_PARAMETER_LEN,
@@ -95,6 +95,7 @@ pub(crate) struct MrHost {
     pub package: Arc<Package>,
     pub framebuffer: Framebuffer,
     pub display: Box<dyn PlatformDisplay>,
+    audio: Box<dyn PlatformAudio>,
     pub work_dir: PathBuf,
     font: Arc<[u8]>,
     memory_limit: u32,
@@ -137,12 +138,14 @@ impl MrHost {
         package: Arc<Package>,
         framebuffer: Framebuffer,
         display: Box<dyn PlatformDisplay>,
+        audio: Box<dyn PlatformAudio>,
         config: MrHostConfig,
     ) -> Self {
         Self {
             package,
             framebuffer,
             display,
+            audio,
             work_dir: config.work_dir,
             font: config.font,
             memory_limit: config.memory_limit,
@@ -373,6 +376,7 @@ impl MrHost {
                 font: &self.font,
                 framebuffer: &mut self.framebuffer,
                 display: self.display.as_mut(),
+                audio: self.audio.as_mut(),
             };
             runtime.dispatch_pending_external_action(&mut services)
         };
@@ -395,6 +399,7 @@ impl MrHost {
                 font: &self.font,
                 framebuffer: &mut self.framebuffer,
                 display: self.display.as_mut(),
+                audio: self.audio.as_mut(),
             };
             runtime.dispatch_pending_platform_event(&mut services)
         };
@@ -481,6 +486,7 @@ impl MrHost {
             font: &self.font,
             framebuffer: &mut self.framebuffer,
             display: self.display.as_mut(),
+            audio: self.audio.as_mut(),
         }
     }
 
@@ -509,6 +515,7 @@ impl MrHost {
                 font: &self.font,
                 framebuffer: &mut self.framebuffer,
                 display: self.display.as_mut(),
+                audio: self.audio.as_mut(),
             };
             runtime.route_key_event(code, pressed, &mut services)
         };
@@ -536,6 +543,7 @@ impl MrHost {
                 font: &self.font,
                 framebuffer: &mut self.framebuffer,
                 display: self.display.as_mut(),
+                audio: self.audio.as_mut(),
             };
             runtime.route_pointer_event(x, y, pressed, &mut services)
         };
@@ -681,6 +689,10 @@ impl MrHost {
         }
     }
 
+    pub(crate) fn stop_audio(&mut self) {
+        let _ = self.audio.stop_sound();
+    }
+
     pub fn commit_application(&mut self, prepared: PreparedApplication) -> PreparedEntry {
         match prepared.stack_transition {
             ApplicationStackTransition::Stay => {}
@@ -696,6 +708,7 @@ impl MrHost {
         self.previous_application = prepared.previous_application;
         self.package = prepared.package;
         self.bitmaps.clear();
+        self.stop_audio();
         self.directory_searches.clear();
         self.next_directory_handle = 1;
         self.native_files.clear();
@@ -710,6 +723,7 @@ impl MrHost {
     pub(crate) fn discard_failed_application_runtime(&mut self) {
         self.ext_runtime = None;
         self.bitmaps.clear();
+        self.stop_audio();
         self.directory_searches.clear();
         self.next_directory_handle = 1;
         self.native_files.clear();
@@ -1035,6 +1049,7 @@ impl MrHost {
                     font: &self.font,
                     framebuffer: &mut self.framebuffer,
                     display: self.display.as_mut(),
+                    audio: self.audio.as_mut(),
                 };
                 let result = match source {
                     ImageSource::Bytes(image) => {
@@ -1075,6 +1090,7 @@ impl MrHost {
                 font: &self.font,
                 framebuffer: &mut self.framebuffer,
                 display: self.display.as_mut(),
+                audio: self.audio.as_mut(),
             };
             runtime.load_and_call_entry(image, 0, &mut services)
         };
@@ -1155,6 +1171,7 @@ impl MrHost {
                 font: &self.font,
                 framebuffer: &mut self.framebuffer,
                 display: self.display.as_mut(),
+                audio: self.audio.as_mut(),
             };
             match input {
                 ExtHelperInput::Buffer(input) => {

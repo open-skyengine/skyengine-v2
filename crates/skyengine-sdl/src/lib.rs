@@ -1,15 +1,37 @@
 use std::time::Duration;
 
 use sdl2::{
-    event::Event, keyboard::Keycode, pixels::PixelFormatEnum, render::Canvas, video::Window,
+    audio::{AudioCallback, AudioDevice, AudioSpecDesired},
+    event::Event,
+    keyboard::Keycode,
+    pixels::PixelFormatEnum,
+    render::Canvas,
+    video::Window,
 };
-use skyengine_core::{DisplayEvent, Error, Framebuffer, PlatformDisplay, Result};
+use skyengine_core::{
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioPlayer, DisplayEvent, Error, Framebuffer,
+    PlatformDisplay, Result,
+};
+
+struct SdlAudio {
+    player: AudioPlayer,
+}
+
+impl AudioCallback for SdlAudio {
+    type Channel = i16;
+
+    fn callback(&mut self, output: &mut [i16]) {
+        self.player.render(output);
+    }
+}
 
 pub struct SdlDisplay {
     _sdl: sdl2::Sdl,
     canvas: Canvas<Window>,
     events: sdl2::EventPump,
     scale: u32,
+    audio: AudioPlayer,
+    _audio_device: Option<AudioDevice<SdlAudio>>,
 }
 
 impl SdlDisplay {
@@ -51,12 +73,47 @@ impl SdlDisplay {
             .set_logical_size(u32::from(width), u32::from(height))
             .map_err(|error| Error::Platform(error.to_string()))?;
         let events = sdl.event_pump().map_err(Error::Platform)?;
+        let audio = AudioPlayer::default();
+        let audio_device = sdl
+            .audio()
+            .and_then(|subsystem| {
+                let desired = AudioSpecDesired {
+                    freq: Some(AUDIO_SAMPLE_RATE as i32),
+                    channels: Some(AUDIO_CHANNELS as u8),
+                    samples: Some(1024),
+                };
+                subsystem
+                    .open_playback(None, &desired, |_| SdlAudio {
+                        player: audio.clone(),
+                    })
+                    .and_then(|device| {
+                        let spec = device.spec();
+                        if spec.freq != AUDIO_SAMPLE_RATE as i32
+                            || usize::from(spec.channels) != AUDIO_CHANNELS
+                        {
+                            return Err(format!(
+                                "unsupported output format {} Hz / {} channels",
+                                spec.freq, spec.channels
+                            ));
+                        }
+                        device.resume();
+                        Ok(device)
+                    })
+            })
+            .map_err(|error| eprintln!("[skyengine-sdl] audio disabled: {error}"))
+            .ok();
         Ok(Self {
             _sdl: sdl,
             canvas,
             events,
             scale,
+            audio,
+            _audio_device: audio_device,
         })
+    }
+
+    pub fn audio_player(&self) -> Option<AudioPlayer> {
+        self._audio_device.as_ref().map(|_| self.audio.clone())
     }
 }
 

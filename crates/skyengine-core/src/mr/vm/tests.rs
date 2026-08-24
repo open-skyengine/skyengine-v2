@@ -190,6 +190,7 @@ fn immediate_restart_vm() -> (MrVm, std::path::PathBuf, std::path::PathBuf) {
         package,
         Framebuffer::new(240, 320).unwrap(),
         Box::new(LifecycleTestDisplay),
+        Box::new(crate::SilentAudio),
         MrHostConfig {
             work_dir: root.clone(),
             font: Arc::from(&b""[..]),

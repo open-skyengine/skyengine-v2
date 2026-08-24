@@ -100,6 +100,7 @@ fn test_host() -> MrHost {
         Arc::new(package_with_entries(&[])),
         Framebuffer::new(240, 320).unwrap(),
         Box::new(TestDisplay),
+        Box::new(crate::SilentAudio),
         MrHostConfig {
             work_dir: PathBuf::from("device"),
             font: Arc::from(&b""[..]),
@@ -122,6 +123,7 @@ fn test_services(host: &mut MrHost) -> services::PackageServices<'_> {
         font: &host.font,
         framebuffer: &mut host.framebuffer,
         display: host.display.as_mut(),
+        audio: host.audio.as_mut(),
     }
 }
 
@@ -794,6 +796,7 @@ fn prepare_restart_honors_an_explicit_path_when_the_parent_has_the_same_identity
         package.clone(),
         Framebuffer::new(240, 320).unwrap(),
         Box::new(TestDisplay),
+        Box::new(crate::SilentAudio),
         MrHostConfig {
             work_dir: root.clone(),
             font: Arc::from(&b""[..]),
@@ -843,6 +846,7 @@ fn application_replacement_is_cold_and_carries_the_latest_session_parameter() {
         parent_package,
         Framebuffer::new(240, 320).unwrap(),
         Box::new(TestDisplay),
+        Box::new(crate::SilentAudio),
         MrHostConfig {
             work_dir: fixture_root,
             font: Arc::from(&b""[..]),
@@ -1003,6 +1007,7 @@ fn restart_rejects_a_symlink_target_without_committing() {
         package.clone(),
         Framebuffer::new(240, 320).unwrap(),
         Box::new(TestDisplay),
+        Box::new(crate::SilentAudio),
         host_config,
     );
 
@@ -1060,6 +1065,7 @@ fn failed_staging_preserves_the_running_application_and_resources() {
         package.clone(),
         Framebuffer::new(240, 320).unwrap(),
         Box::new(TestDisplay),
+        Box::new(crate::SilentAudio),
         MrHostConfig {
             work_dir: root.clone(),
             font: Arc::from(&b""[..]),
