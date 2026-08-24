@@ -402,7 +402,7 @@ fn pure_mr_file_objects_write_and_remove_work_files() {
     assert_eq!(
         vm.call_native(
             "file_seek",
-            &[file.clone(), Value::Number(1.0), Value::Number(0.0)],
+            &[file.clone(), Value::Number(0.0), Value::Number(1.0)],
         )
         .unwrap()[0]
             .number(),

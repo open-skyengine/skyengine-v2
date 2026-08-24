@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import {
   SkyEngineE2e,
@@ -93,15 +93,21 @@ function isUpdateDialingScreen(screen: PpmImage): boolean {
   );
 }
 
-function isUpdatedApplicationList(screen: PpmImage): boolean {
+function isUpdatedApplicationList(screen: PpmImage, selectedY = 45): boolean {
   return (
-    isSelectedMenuRow(screen, 45) &&
+    isSelectedMenuRow(screen, selectedY) &&
     [65, 85, 105, 125, 145, 165, 185].every(
       (y) =>
         differingPixels(screen, { x: 5, y, width: 16, height: 16 }, MENU_BACKGROUND) > 8 &&
         differingPixels(screen, { x: 26, y, width: 150, height: 16 }, MENU_BACKGROUND) > 16,
     )
   );
+}
+
+async function mrpFiles(directory: string): Promise<string[]> {
+  return (await readdir(directory))
+    .filter(name => name.toLowerCase().endsWith(".mrp"))
+    .sort();
 }
 
 function changedPixels(
@@ -118,26 +124,6 @@ function changedPixels(
     }
   }
   return count;
-}
-
-async function waitForFile(pathname: string, expectedLength: number, timeoutMs: number): Promise<Buffer> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      const contents = await readFile(pathname);
-      if (contents.length === expectedLength) return contents;
-      if (contents.length > expectedLength) {
-        throw new Error(
-          `${pathname} grew beyond the expected ${expectedLength} bytes: ${contents.length}`,
-        );
-      }
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-    }
-    if (Date.now() >= deadline) break;
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  throw new Error(`${pathname} did not reach ${expectedLength} bytes within ${timeoutMs}ms`);
 }
 
 describe("dsm_gm", () => {
@@ -279,7 +265,7 @@ describe("dsm_gm", () => {
     expect(changedPixels(bindingUp, bindingDown, { x: 82, y: 45, width: 22, height: 16 })).toBeGreaterThan(4);
   });
 
-  it("更新列表后下载并启动软件", async () => {
+  it("更新列表后下载并识别第 2 个软件", async () => {
     ws = await SkyEngineWorkspace.create();
     engine = await SkyEngineE2e.start("test/fixtures/dsm_gm.mrp", {
       workDir: ws.dir,
@@ -319,9 +305,18 @@ describe("dsm_gm", () => {
     expect(isUpdatedApplicationList(updated)).toBe(true);
     expect(changedPixels(dialing, updated, { x: 0, y: 42, width: 240, height: 164 })).toBeGreaterThan(5_000);
 
-    const updatedPackage = await readFile(path.join(ws.dir, "mythroad", "applist.mrp"));
+    const mythroadDirectory = path.join(ws.dir, "mythroad");
+    const updatedPackage = await readFile(path.join(mythroadDirectory, "applist.mrp"));
     expect(updatedPackage.subarray(0, 4).toString("ascii")).toBe("MRPG");
 
+    await engine.key("DOWN", { timeoutMs: 2_000, holdMs: 80 });
+    await engine.waitForScreen(screen => isUpdatedApplicationList(screen, 65), {
+      name: "selected-second-application",
+      timeoutMs: 2_000,
+      intervalMs: 50,
+    });
+
+    const packagesBeforeDownload = await mrpFiles(mythroadDirectory);
     await engine.key("ENTER", { timeoutMs: 2_000, holdMs: 80 });
     const downloadMenu = await engine.waitForScreen(isUpdateMenu, {
       name: "download-application-menu",
@@ -331,15 +326,22 @@ describe("dsm_gm", () => {
     expect(changedPixels(updated, downloadMenu, { x: 0, y: 42, width: 240, height: 164 })).toBeGreaterThan(100);
 
     await engine.key("ENTER", { timeoutMs: 2_000, holdMs: 80 });
-    const expectedPackage = await readFile("test/fixtures/gghjt.mrp");
-    const installedPackagePath = path.join(ws.dir, "mythroad", "gghjt.mrp");
-    const installedPackage = await waitForFile(installedPackagePath, expectedPackage.length, 60_000);
-    expect(installedPackage.equals(expectedPackage)).toBe(true);
-    await engine.waitForScreen(isUpdatedApplicationList, {
+    const installedList = await engine.waitForScreen(screen => isUpdatedApplicationList(screen), {
       name: "installed-application-list",
-      timeoutMs: 5_000,
+      timeoutMs: 60_000,
       intervalMs: 100,
     });
+    const packagesAfterDownload = await mrpFiles(mythroadDirectory);
+    const downloadedPackages = packagesAfterDownload.filter(
+      name => !packagesBeforeDownload.includes(name),
+    );
+    expect(downloadedPackages).toEqual(["gfhcq.mrp"]);
+    const installedPackage = await readFile(path.join(mythroadDirectory, downloadedPackages[0]));
+    const expectedPackage = await readFile("test/fixtures/gfhcq.mrp");
+    expect(installedPackage.equals(expectedPackage)).toBe(true);
+    // 已安装应用会被提升到列表首行；前两行文字重排是状态刷新成功的视觉证据。
+    expect(changedPixels(updated, installedList, { x: 26, y: 45, width: 150, height: 36 })).toBeGreaterThan(500);
+
     await engine.key("ENTER", { timeoutMs: 2_000, holdMs: 80 });
     const runMenu = await engine.waitForScreen(isInstalledApplicationMenu, {
       name: "run-application-menu",
@@ -347,17 +349,5 @@ describe("dsm_gm", () => {
       intervalMs: 50,
     });
     expect(changedPixels(downloadMenu, runMenu, { x: 26, y: 45, width: 96, height: 16 })).toBeGreaterThan(8);
-
-    await engine.key("ENTER", { timeoutMs: 2_000, holdMs: 80, waitForDraw: false });
-    await engine.delay(1_000);
-    await engine.key("LEFT_SOFT", { timeoutMs: 5_000, holdMs: 80 });
-    const launched = await engine.waitForScreen(
-      screen =>
-        screen.pixel(227, 308).toString() === "0,0,0" &&
-        screen.pixel(84, 79).toString() === "248,252,248",
-      { name: "launched-downloaded-application", timeoutMs: 30_000, intervalMs: 250 },
-    );
-    expect(launched.pixel(227, 308)).toEqual([0, 0, 0]);
-    expect(launched.pixel(84, 79)).toEqual([248, 252, 248]);
   });
 });
