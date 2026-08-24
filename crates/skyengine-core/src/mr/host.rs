@@ -539,6 +539,13 @@ impl MrHost {
         result
     }
 
+    pub fn route_pointer_move(&self, x: i32, y: i32) -> Option<(i32, i32, i32)> {
+        match self.ext_runtime.as_ref() {
+            Some(runtime) => runtime.route_pointer_move(x, y),
+            None => Some((12, x, y)),
+        }
+    }
+
     pub fn route_text_input(&mut self, text: &str) -> Result<Option<(i32, i32, i32)>> {
         let Some(mut runtime) = self.ext_runtime.take() else {
             return Ok(None);
@@ -546,6 +553,12 @@ impl MrHost {
         let result = runtime.route_text_input(text);
         self.ext_runtime = Some(runtime);
         result
+    }
+
+    pub fn active_editor_text(&self) -> Option<String> {
+        self.ext_runtime
+            .as_ref()
+            .and_then(ExtRuntime::active_editor_text)
     }
 
     pub fn dispatch_native_event(

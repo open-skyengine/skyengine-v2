@@ -193,6 +193,14 @@ impl Runtime {
         self.vm.framebuffer()
     }
 
+    /// Returns the text of the native editor currently owned by the guest.
+    ///
+    /// Platform frontends use this to present their own text input UI. `None`
+    /// means that the runtime is not waiting for editor input.
+    pub fn active_editor_text(&self) -> Option<String> {
+        self.vm.active_editor_text()
+    }
+
     pub fn start(&mut self) -> Result<()> {
         if self.state != RuntimeState::Loaded {
             return Err(Error::MrFault(format!(
@@ -272,6 +280,19 @@ impl Runtime {
                 if let Some((event, parameter0, parameter1)) =
                     self.vm.route_pointer_event(x, y, pressed)?
                 {
+                    self.vm.call_global(
+                        b"dealevent",
+                        vec![
+                            Value::Number(f64::from(event)),
+                            Value::Number(f64::from(parameter0)),
+                            Value::Number(f64::from(parameter1)),
+                        ],
+                    )?;
+                }
+                self.apply_lifecycle_request()?;
+            }
+            DisplayEvent::PointerMove { x, y } if self.state == RuntimeState::Running => {
+                if let Some((event, parameter0, parameter1)) = self.vm.route_pointer_move(x, y)? {
                     self.vm.call_global(
                         b"dealevent",
                         vec![

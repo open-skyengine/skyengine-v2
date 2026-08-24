@@ -1,0 +1,12 @@
+[package]
+name = "skyengine-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skyengine"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+skyengine-core = { path = "../skyengine-core" }

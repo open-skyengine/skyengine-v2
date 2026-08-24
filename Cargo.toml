@@ -3,6 +3,7 @@ members = [
     "apps/skyengine",
     "apps/skydbg",
     "crates/skyengine-core",
+    "crates/skyengine-ffi",
     "crates/skyengine-sdl",
 ]
 resolver = "2"

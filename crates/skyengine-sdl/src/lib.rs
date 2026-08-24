@@ -141,6 +141,9 @@ impl PlatformDisplay for SdlDisplay {
                     y,
                     pressed: false,
                 }),
+                Event::MouseMotion {
+                    x, y, mousestate, ..
+                } if mousestate.left() => Some(DisplayEvent::PointerMove { x, y }),
                 _ => None,
             };
             if mapped.is_some() {

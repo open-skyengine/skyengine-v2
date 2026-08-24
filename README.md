@@ -33,6 +33,46 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Flutter And C ABI
+
+`skyengine-ffi` exposes the runtime as a C-compatible library for Flutter and
+other native hosts. Cargo produces `libskyengine.so`, `skyengine.dll`, or
+`libskyengine.dylib`; the root `CMakeLists.txt` also provides a real shared
+library target named `skyengine-shared` so Android Gradle and desktop Flutter
+builds can package it normally.
+
+The bridge owns one runtime per process. `skyengine_api_start` loads the package
+and starts a native worker thread. Key and pointer calls enqueue display events,
+timers execute on that worker, and each presented RGB565 frame is copied into a
+stable RGBA snapshot for `dart:ffi`. `skyengine_api_destroy` wakes and joins the
+worker before releasing its state. See [`include/skyengine.h`](include/skyengine.h)
+for the complete ABI.
+
+Build the host shared library directly with Cargo:
+
+```bash
+cargo build --release -p skyengine-ffi
+```
+
+Or consume the CMake target from a parent application:
+
+```cmake
+set(SKYENGINE_BUILD_SHARED_ONLY ON CACHE BOOL "" FORCE)
+add_subdirectory(path/to/skyengine build/skyengine)
+```
+
+Android cross-compilation requires the Rust standard-library target matching
+the requested ABI:
+
+```bash
+rustup target add aarch64-linux-android armv7-linux-androideabi
+```
+
+The bridge currently exposes real rendering, lifecycle, timer, keyboard,
+pointer, and platform-editor integration. Audio, vibration, and motion symbols
+remain ABI-compatible but report inactive because the v2 core currently uses a
+silent headless audio profile and has no host sensor/output service yet.
+
 To exercise the SDL renderer without a window server:
 
 ```bash

@@ -250,6 +250,19 @@ impl MrVm {
         }
     }
 
+    pub fn route_pointer_move(&mut self, x: i32, y: i32) -> Result<Option<(i32, i32, i32)>> {
+        let event = self.host.route_pointer_move(x, y);
+        if self.native_entry {
+            if let Some((event, parameter0, parameter1)) = event {
+                self.host
+                    .dispatch_native_event(event, parameter0, parameter1)?;
+            }
+            Ok(None)
+        } else {
+            Ok(event)
+        }
+    }
+
     pub fn route_text_input(&mut self, text: &str) -> Result<Option<(i32, i32, i32)>> {
         let event = self.host.route_text_input(text)?;
         if self.native_entry {
@@ -261,6 +274,10 @@ impl MrVm {
         } else {
             Ok(event)
         }
+    }
+
+    pub fn active_editor_text(&self) -> Option<String> {
+        self.host.active_editor_text()
     }
 
     fn run_frames(&mut self) -> Result<()> {

@@ -547,7 +547,13 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match listener.accept() {
-                Ok((stream, _)) => return stream,
+                Ok((stream, _)) => {
+                    // Accepted sockets inherit nonblocking mode on Windows but
+                    // not on every Unix platform. Server-side test reads below
+                    // require the same blocking behavior on every host.
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "TCP accept timed out");
                     thread::sleep(Duration::from_millis(1));
@@ -698,7 +704,7 @@ mod tests {
         let initial_server = thread::spawn(move || {
             let mut stream = accept_before(initial_listener);
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(NETWORK_CONNECT_TIMEOUT + Duration::from_secs(2)))
                 .unwrap();
             let mut received = Vec::new();
             stream.read_to_end(&mut received).unwrap();

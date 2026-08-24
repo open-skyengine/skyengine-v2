@@ -203,6 +203,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "skyengine-ffi"
+version = "0.1.0"
+dependencies = [
+ "skyengine-core",
+]
+
+[[package]]
 name = "skyengine-sdl"
 version = "0.1.0"
 dependencies = [

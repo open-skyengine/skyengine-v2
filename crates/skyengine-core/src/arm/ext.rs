@@ -1139,6 +1139,15 @@ impl ExtRuntime {
         Ok(Some((6, 0, 0)))
     }
 
+    pub(crate) fn active_editor_text(&self) -> Option<String> {
+        let ActivePlatformUi::Editor(handle) = self.active_platform_ui.last().copied()? else {
+            return None;
+        };
+        self.editors
+            .get(&handle)
+            .map(|editor| String::from_utf16_lossy(&editor.text))
+    }
+
     pub fn route_pointer_event(
         &mut self,
         x: i32,
@@ -1201,6 +1210,10 @@ impl ExtRuntime {
             PlatformPointerAction::TextViewerReturn => Some((6, 1, 0)),
             PlatformPointerAction::None => None,
         })
+    }
+
+    pub fn route_pointer_move(&self, x: i32, y: i32) -> Option<(i32, i32, i32)> {
+        self.active_platform_ui.is_empty().then_some((12, x, y))
     }
 
     fn lifecycle_state(&self) -> Result<ExtLifecycleState> {
