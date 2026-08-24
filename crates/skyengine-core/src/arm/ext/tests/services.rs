@@ -1206,6 +1206,13 @@ fn headless_audio_accepts_in_memory_midi_without_producing_output() {
         .unwrap();
 
     assert_eq!(cpu.register(0), 0);
+    STUB_SOUND.with(|sound| {
+        let sound = sound.borrow();
+        let (sound_type, data, looped) = sound.as_ref().unwrap();
+        assert_eq!(*sound_type, SoundType::Midi);
+        assert_eq!(data, b"MThd\0\0\0\x06\0\0\0\x01\0\x78");
+        assert!(*looped);
+    });
 
     cpu.set_register(0, 2);
     cpu.set_register(3, 0);
@@ -1213,6 +1220,16 @@ fn headless_audio_accepts_in_memory_midi_without_producing_output() {
         .dispatch(57, 0, &mut cpu, &mut StubServices)
         .unwrap();
     assert_eq!(cpu.register(0), 0);
+    STUB_SOUND.with(|sound| {
+        let sound = sound.borrow();
+        assert_eq!(sound.as_ref().unwrap().0, SoundType::Mp3);
+        assert!(!sound.as_ref().unwrap().2);
+    });
+
+    runtime
+        .dispatch(58, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    STUB_SOUND.with(|sound| assert!(sound.borrow().is_none()));
 }
 
 #[test]

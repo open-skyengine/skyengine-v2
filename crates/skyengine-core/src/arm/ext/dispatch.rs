@@ -200,11 +200,11 @@ impl ExtRuntime {
                 // Query and configure the same deterministic motion provider.
                 // Mode 2 is the verified event-driven form used after startup.
                 (4_002, 0) | (4_005, 2) => cpu.set_register(0, 0),
-                // Native audio wrappers use a five-step multimedia volume. The
-                // deterministic profile has no output device, but still accepts
-                // and acknowledges valid gain changes so guest audio state can
-                // advance independently of the host sink.
-                (1_302, volume) if volume <= 5 => cpu.set_register(0, 0),
+                // Native audio wrappers use a five-step multimedia volume.
+                (1_302, volume) if volume <= 5 => {
+                    services.set_sound_volume(volume as u8)?;
+                    cpu.set_register(0, 0);
+                }
                 // Optional dual-SIM selection probe. A false result keeps the
                 // guest on its default network selection path.
                 (1_327, 0) => cpu.set_register(0, u32::MAX),
@@ -337,13 +337,16 @@ impl ExtRuntime {
                             "unsupported platform MP3 path called by module {module}"
                         )));
                     }
-                    let mut available = services.file_len(&path)?.is_some_and(|len| len != 0);
-                    if !available {
+                    let mut sound = services.read_sound_file(&path)?;
+                    if sound.as_ref().is_none_or(Vec::is_empty) {
                         let package_name = self.read_c_string(PACKAGE_NAME_DATA, 256)?;
-                        let packaged = services.read_package_file(&package_name, file_name)?;
-                        available = packaged.is_some_and(|bytes| !bytes.is_empty());
+                        sound = services.read_package_file(&package_name, file_name)?;
                     }
-                    cpu.set_register(0, if available { 0 } else { u32::MAX });
+                    let succeeded = match sound.filter(|bytes| !bytes.is_empty()) {
+                        Some(sound) => services.play_sound(SoundType::Mp3, &sound, false).is_ok(),
+                        None => false,
+                    };
+                    cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
                 }
                 // Parameterless state transition paired with the verified MP3 sink.
                 // The caller requires zero to continue after a successful 2023 request.
@@ -357,6 +360,7 @@ impl ExtRuntime {
                             .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
                             == 0 =>
                 {
+                    services.stop_sound()?;
                     cpu.set_register(0, 0)
                 }
                 // Parameterless multimedia-state query. Local callers consistently
@@ -371,7 +375,14 @@ impl ExtRuntime {
                             .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
                             == 0 =>
                 {
-                    cpu.set_register(0, 1_003)
+                    cpu.set_register(
+                        0,
+                        if services.sound_is_active() {
+                            1_001
+                        } else {
+                            1_003
+                        },
+                    )
                 }
                 // Caller-owned WAV recording request. The headless profile has no
                 // capture provider, so the verified request shape reports unavailable.
@@ -571,22 +582,26 @@ impl ExtRuntime {
                 let sound = GuestAddr(cpu.register(1));
                 let len = cpu.register(2) as usize;
                 let looped = cpu.register(3);
-                if !matches!(sound_type, 0 | 2) || sound.0 == 0 || len == 0 || looped > 1 {
+                let Some(sound_type) = SoundType::from_mrp(sound_type) else {
                     return Err(Error::Abi(format!(
-                        "unsupported headless sound request (type {sound_type}, address {:#010x}, len {len}, looped {looped}) called by module {module}",
+                        "unsupported headless sound request (type {}, address {:#010x}, len {len}, looped {looped}) called by module {module}",
+                        cpu.register(0),
+                        sound.0,
+                    )));
+                };
+                if sound.0 == 0 || len == 0 || looped > 1 {
+                    return Err(Error::Abi(format!(
+                        "unsupported headless sound request (type {}, address {:#010x}, len {len}, looped {looped}) called by module {module}",
+                        cpu.register(0),
                         sound.0,
                     )));
                 }
-                // Types 0 and 2 are the verified in-memory MIDI and MP3 forms.
-                // The headless profile consumes the guest buffer through an
-                // explicit silent sink so applications can advance their audio
-                // state safely.
-                let _ = self.memory.read(sound, len)?;
-                cpu.set_register(0, 0);
+                let data = self.memory.read(sound, len)?;
+                let succeeded = services.play_sound(sound_type, &data, looped != 0).is_ok();
+                cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
             }
             58 => {
-                // The headless profile uses an explicit no-output audio sink.
-                // Stopping an absent or completed sound remains idempotent.
+                services.stop_sound()?;
                 cpu.set_register(0, 0);
             }
             59 => {
@@ -759,7 +774,7 @@ impl ExtRuntime {
             }
             86 => {
                 let handle = cpu.register(0) as i32;
-                let result = if self.native_sockets.remove(&handle).is_some() {
+                let result: i32 = if self.native_sockets.remove(&handle).is_some() {
                     0
                 } else {
                     -1

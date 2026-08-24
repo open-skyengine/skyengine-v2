@@ -141,8 +141,14 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
                     // Initialize SDL before binding the E2E socket so a failed preview
                     // does not leave a detached control-server thread behind.
                     let preview = SdlDisplay::new(width, height, 2)?;
+                    let audio = preview.audio_player();
                     let control = e2e::E2eDisplay::new(PathBuf::from(socket_path), width, height)?;
-                    Box::new(E2eSdlDisplay { control, preview })
+                    let display = Box::new(E2eSdlDisplay { control, preview });
+                    return match audio {
+                        Some(audio) => Runtime::load_with_audio(config, display, Box::new(audio))?,
+                        None => Runtime::load(config, display)?,
+                    }
+                    .run();
                 } else {
                     Box::new(e2e::E2eDisplay::new(
                         PathBuf::from(socket_path),
@@ -162,7 +168,12 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     }
 
     let display = SdlDisplay::new(width, height, 2)?;
-    Runtime::load(config, Box::new(display))?.run()
+    let audio = display.audio_player();
+    match audio {
+        Some(audio) => Runtime::load_with_audio(config, Box::new(display), Box::new(audio))?,
+        None => Runtime::load(config, Box::new(display))?,
+    }
+    .run()
 }
 
 fn e2e_sdl_preview_enabled(video_driver: Option<&OsStr>) -> bool {

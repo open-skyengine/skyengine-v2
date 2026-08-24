@@ -6,6 +6,9 @@ std::thread_local! {
     static STUB_FRAMEBUFFER: std::cell::RefCell<Option<Vec<u8>>> = const {
         std::cell::RefCell::new(None)
     };
+    static STUB_SOUND: std::cell::RefCell<Option<(SoundType, Vec<u8>, bool)>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 struct StubFramebufferCapture;
@@ -109,6 +112,22 @@ impl NativeServices for StubServices {
 
     fn file_len(&mut self, name: &[u8]) -> Result<Option<u64>> {
         Ok((name == b"media/clip.mp3").then_some(4))
+    }
+
+    fn read_sound_file(&mut self, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok((name == b"media/clip.mp3").then(|| b"ID3!".to_vec()))
+    }
+
+    fn play_sound(&mut self, sound_type: SoundType, data: &[u8], looped: bool) -> Result<()> {
+        STUB_SOUND.with(|sound| {
+            *sound.borrow_mut() = Some((sound_type, data.to_vec(), looped));
+        });
+        Ok(())
+    }
+
+    fn stop_sound(&mut self) -> Result<()> {
+        STUB_SOUND.with(|sound| *sound.borrow_mut() = None);
+        Ok(())
     }
 
     fn find_start(&mut self, _directory: &[u8]) -> Result<Option<(i32, Vec<u8>)>> {

@@ -46,6 +46,8 @@ SKYENGINE_EXPORT int32_t skyengine_api_get_screen_rotation(void);
 SKYENGINE_EXPORT int32_t skyengine_api_audio_sample_rate(void);
 SKYENGINE_EXPORT int32_t skyengine_api_audio_channels(void);
 SKYENGINE_EXPORT int32_t skyengine_api_audio_is_active(void);
+/* Writes interleaved stereo S16LE PCM and returns the number of audio frames written.
+ * output must be suitably aligned for int16_t and hold frames * 2 samples. */
 SKYENGINE_EXPORT int32_t skyengine_api_audio_render_s16le(
     void *output,
     int32_t frames);

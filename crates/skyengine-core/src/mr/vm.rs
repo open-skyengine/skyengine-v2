@@ -1,7 +1,8 @@
 use std::{cmp::Ordering, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use crate::{
-    Error, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result, arm::ExtLifecycleRequest,
+    Error, Framebuffer, Package, PlatformAudio, PlatformDisplay, ResourceLimits, Result,
+    arm::ExtLifecycleRequest,
 };
 
 use super::{
@@ -65,6 +66,7 @@ impl MrVm {
         package: Arc<Package>,
         framebuffer: Framebuffer,
         display: Box<dyn PlatformDisplay>,
+        audio: Box<dyn PlatformAudio>,
         host_config: MrHostConfig,
         limits: ResourceLimits,
     ) -> Self {
@@ -72,7 +74,7 @@ impl MrVm {
         let mut vm = Self {
             globals,
             frames: Vec::new(),
-            host: MrHost::new(package, framebuffer, display, host_config),
+            host: MrHost::new(package, framebuffer, display, audio, host_config),
             limits,
             instruction_count: 0,
             final_values: Vec::new(),
@@ -88,6 +90,10 @@ impl MrVm {
 
     pub fn display_mut(&mut self) -> &mut dyn PlatformDisplay {
         self.host.display.as_mut()
+    }
+
+    pub(crate) fn stop_audio(&mut self) {
+        self.host.stop_audio();
     }
 
     pub fn native_timer_due_in(&self) -> Option<Duration> {

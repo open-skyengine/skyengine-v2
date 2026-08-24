@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    DisplayEvent, Error, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result,
+    DisplayEvent, Error, Framebuffer, Package, PlatformAudio, PlatformDisplay, ResourceLimits,
+    Result, SilentAudio,
     mr::{
         MrHostConfig, MrVm,
         value::Value,
@@ -161,6 +162,14 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn load(config: RuntimeConfig, display: Box<dyn PlatformDisplay>) -> Result<Self> {
+        Self::load_with_audio(config, display, Box::new(SilentAudio))
+    }
+
+    pub fn load_with_audio(
+        config: RuntimeConfig,
+        display: Box<dyn PlatformDisplay>,
+        audio: Box<dyn PlatformAudio>,
+    ) -> Result<Self> {
         let package = Arc::new(Package::open(&config.app_path, config.limits.clone())?);
         package.resolve(&config.entry)?;
 
@@ -183,6 +192,7 @@ impl Runtime {
             package,
             framebuffer,
             display,
+            audio,
             MrHostConfig {
                 work_dir: config.work_dir,
                 font: font.into(),
@@ -272,6 +282,7 @@ impl Runtime {
         if !matches!(self.state, RuntimeState::Stopping | RuntimeState::Stopped) {
             self.state = RuntimeState::Stopping;
         }
+        self.vm.stop_audio();
     }
 
     fn dispatch(&mut self, event: DisplayEvent) -> Result<()> {
@@ -339,7 +350,17 @@ impl Runtime {
     }
 
     fn apply_lifecycle_request(&mut self) -> Result<()> {
-        apply_lifecycle_result(&mut self.state, self.vm.process_lifecycle_request())
+        let result = apply_lifecycle_result(&mut self.state, self.vm.process_lifecycle_request());
+        if matches!(self.state, RuntimeState::Stopping | RuntimeState::Stopped) {
+            self.vm.stop_audio();
+        }
+        result
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.vm.stop_audio();
     }
 }
 
@@ -389,7 +410,82 @@ fn resolve_font_path(work_dir: &Path, font_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use super::*;
+
+    struct TestDisplay;
+
+    impl PlatformDisplay for TestDisplay {
+        fn present(&mut self, _framebuffer: &Framebuffer) -> Result<()> {
+            Ok(())
+        }
+
+        fn poll_event(&mut self) -> Result<Option<DisplayEvent>> {
+            Ok(None)
+        }
+
+        fn wait_timeout(&mut self, _milliseconds: u32) {}
+    }
+
+    struct TrackingAudio {
+        active: Arc<AtomicBool>,
+    }
+
+    impl PlatformAudio for TrackingAudio {
+        fn play_sound(
+            &mut self,
+            _sound_type: crate::SoundType,
+            _data: &[u8],
+            _looped: bool,
+        ) -> Result<()> {
+            self.active.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn stop_sound(&mut self) -> Result<()> {
+            self.active.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            self.active.load(Ordering::Relaxed)
+        }
+
+        fn set_volume(&mut self, _volume: u8) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn runtime_with_active_audio(active: Arc<AtomicBool>) -> Runtime {
+        let limits = ResourceLimits::default();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/talkcat.mrp");
+        let package = Arc::new(Package::open(fixture, limits.clone()).unwrap());
+        let vm = MrVm::new(
+            package,
+            Framebuffer::new(240, 320).unwrap(),
+            Box::new(TestDisplay),
+            Box::new(TrackingAudio { active }),
+            MrHostConfig {
+                work_dir: PathBuf::from("."),
+                font: Arc::from(&b""[..]),
+                memory_limit: 1024 * 1024,
+                dns_mappings: Arc::from([]),
+                device_date: DeviceDate::default(),
+                wap_proxy_endpoint: None,
+            },
+            limits,
+        );
+        Runtime {
+            state: RuntimeState::Running,
+            entry: b"start.mr".to_vec(),
+            vm,
+            _wap_proxy: None,
+        }
+    }
 
     #[test]
     fn resolves_relative_font_paths_from_the_work_directory() {
@@ -475,6 +571,18 @@ mod tests {
             civil_date_from_unix_days(15_492),
             DeviceDate::new(2012, 6, 1).unwrap()
         );
+    }
+
+    #[test]
+    fn stopping_or_dropping_the_runtime_stops_host_audio() {
+        let stopped = Arc::new(AtomicBool::new(true));
+        let mut runtime = runtime_with_active_audio(stopped.clone());
+        runtime.stop();
+        assert!(!stopped.load(Ordering::Relaxed));
+
+        let dropped = Arc::new(AtomicBool::new(true));
+        drop(runtime_with_active_audio(dropped.clone()));
+        assert!(!dropped.load(Ordering::Relaxed));
     }
 
     #[test]

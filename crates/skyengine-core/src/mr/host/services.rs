@@ -1,4 +1,5 @@
 use super::*;
+use crate::SoundType;
 
 const FILE_INFO_FILE: i32 = 1;
 const FILE_INFO_DIRECTORY: i32 = 2;
@@ -14,6 +15,7 @@ pub(super) struct PackageServices<'a> {
     pub(super) font: &'a [u8],
     pub(super) framebuffer: &'a mut Framebuffer,
     pub(super) display: &'a mut dyn PlatformDisplay,
+    pub(super) audio: &'a mut dyn PlatformAudio,
 }
 
 impl PackageServices<'_> {
@@ -221,6 +223,50 @@ impl NativeServices for PackageServices<'_> {
             bytes.extend_from_slice(&pixel.to_le_bytes());
         }
         Ok(Some(bytes))
+    }
+
+    fn read_sound_file(&mut self, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(path) = self.file_path(name) {
+            let file = match File::open(&path) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => return Err(crate::Error::Io { path, source }),
+            };
+            if let Some(file) = file {
+                let limit = self.package.limits().max_expanded_file_len;
+                let mut bytes = Vec::new();
+                file.take(limit.saturating_add(1) as u64)
+                    .read_to_end(&mut bytes)
+                    .map_err(|source| crate::Error::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                if bytes.len() > limit {
+                    return Err(crate::Error::ResourceLimit(format!(
+                        "sound file {} exceeds {limit} bytes",
+                        path.display()
+                    )));
+                }
+                return Ok(Some(bytes));
+            }
+        }
+        self.read_current_package_file(name)
+    }
+
+    fn play_sound(&mut self, sound_type: SoundType, data: &[u8], looped: bool) -> Result<()> {
+        self.audio.play_sound(sound_type, data, looped)
+    }
+
+    fn stop_sound(&mut self) -> Result<()> {
+        self.audio.stop_sound()
+    }
+
+    fn sound_is_active(&self) -> bool {
+        self.audio.is_active()
+    }
+
+    fn set_sound_volume(&mut self, volume: u8) -> Result<()> {
+        self.audio.set_volume(volume)
     }
 
     fn read_package_file(&mut self, package_name: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>> {

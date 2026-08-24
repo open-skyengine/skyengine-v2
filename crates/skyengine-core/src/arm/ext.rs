@@ -11,8 +11,8 @@ use std::{
 use flate2::read::GzDecoder;
 
 use crate::{
-    DeviceDate, DnsMapping, Error, Framebuffer, Package, ResourceLimits, Result, VIRTUAL_IMEI,
-    VIRTUAL_IMSI,
+    DeviceDate, DnsMapping, Error, Framebuffer, Package, ResourceLimits, Result, SoundType,
+    VIRTUAL_IMEI, VIRTUAL_IMSI,
 };
 
 use super::{ArmCpu, GuestAddr, GuestMemory, Permissions};
@@ -130,6 +130,21 @@ pub(crate) trait NativeServices {
         width: usize,
         height: usize,
     ) -> Result<()>;
+    fn read_sound_file(&mut self, _name: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn play_sound(&mut self, _sound_type: SoundType, _data: &[u8], _looped: bool) -> Result<()> {
+        Ok(())
+    }
+    fn stop_sound(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn sound_is_active(&self) -> bool {
+        false
+    }
+    fn set_sound_volume(&mut self, _volume: u8) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

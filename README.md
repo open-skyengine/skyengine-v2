@@ -68,10 +68,14 @@ the requested ABI:
 rustup target add aarch64-linux-android armv7-linux-androideabi
 ```
 
-The bridge currently exposes real rendering, lifecycle, timer, keyboard,
-pointer, and platform-editor integration. Audio, vibration, and motion symbols
-remain ABI-compatible but report inactive because the v2 core currently uses a
-silent headless audio profile and has no host sensor/output service yet.
+The bridge exposes rendering, lifecycle, timer, keyboard, pointer, platform-editor,
+and audio integration. MIDI and MP3 playback is decoded to interleaved stereo S16LE
+at 44.1 kHz. Native hosts pull frames through `skyengine_api_audio_render_s16le`;
+`skyengine_api_audio_is_active` reports whether playback is still active. The SDL
+frontend opens a matching playback device automatically. Headless runs retain a
+silent audio provider so E2E timing remains deterministic. Vibration and motion
+symbols remain ABI-compatible but report inactive because no host sensor/output
+service exists for them yet.
 
 To exercise the SDL renderer without a window server:
 
@@ -132,6 +136,7 @@ maps to Select, `F1` and `F2` map to the soft keys, and Escape maps to Back.
 
 This basic release implements the container reader, precompiled MR chunk frontend, core MR VM,
 the standard-library and platform calls needed by the fixture, RGB565 bitmap/sprite/text drawing,
-safe work-directory enumeration, and deterministic headless output. Text MR compilation, ARM/Thumb
-EXT execution, complete file/network/audio services, and the `skydbg` transport remain later design
-milestones. Unsupported formats and platform operations fail explicitly.
+MIDI/MP3 playback, safe work-directory enumeration, and deterministic headless output. Text MR
+compilation, ARM/Thumb EXT execution, the remaining file/network services, and the `skydbg`
+transport remain later design milestones. Unsupported formats and platform operations fail
+explicitly.

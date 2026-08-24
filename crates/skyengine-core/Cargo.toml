@@ -8,5 +8,7 @@ license.workspace = true
 encoding_rs.workspace = true
 flate2.workspace = true
 jpeg-decoder.workspace = true
+midly.workspace = true
 serde.workspace = true
+symphonia.workspace = true
 thiserror.workspace = true
