@@ -621,6 +621,29 @@ fn guest_character_bitmap_uses_lsb_first_bytes() {
 }
 
 #[test]
+fn guest_ascii_character_bitmap_uses_one_byte_per_scanline() {
+    let mut runtime =
+        ExtRuntime::new(16, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let width_out = runtime.allocate(4, 4).unwrap();
+    let height_out = runtime.allocate(4, 4).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, u32::from(b'%'));
+    cpu.set_register(1, 1);
+    cpu.set_register(2, width_out.0);
+    cpu.set_register(3, height_out.0);
+
+    runtime
+        .dispatch(30, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    let bitmap = GuestAddr(cpu.register(0));
+    assert_ne!(bitmap.0, 0);
+    assert_eq!(runtime.memory.read(bitmap, 2).unwrap(), [0x01, 0x02]);
+    assert_eq!(runtime.memory.read_u32(width_out).unwrap(), 8);
+    assert_eq!(runtime.memory.read_u32(height_out).unwrap(), 2);
+}
+
+#[test]
 fn host_text_drawing_keeps_msb_first_glyph_bytes() {
     let mut runtime =
         ExtRuntime::new(16, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -1213,6 +1236,13 @@ fn headless_audio_accepts_in_memory_midi_without_producing_output() {
         assert_eq!(data, b"MThd\0\0\0\x06\0\0\0\x01\0\x78");
         assert!(*looped);
     });
+
+    cpu.set_register(3, u32::MAX);
+    runtime
+        .dispatch(57, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 0);
+    STUB_SOUND.with(|sound| assert!(sound.borrow().as_ref().unwrap().2));
 
     cpu.set_register(0, 2);
     cpu.set_register(3, 0);

@@ -92,10 +92,30 @@ impl ExtRuntime {
                     Some(glyph) => Some(glyph),
                     None => match services.char_bitmap(codepoint, font)? {
                         Some((bitmap, width, height)) => {
-                            let bitmap =
-                                bitmap.into_iter().map(u8::reverse_bits).collect::<Vec<_>>();
-                            let address = self.allocate(bitmap.len(), 4)?;
-                            self.memory.write(address, &bitmap)?;
+                            if width == 0 || width > 16 || height == 0 || height > 16 {
+                                return Err(Error::Abi(format!(
+                                    "unsupported character bitmap dimensions {width}x{height} for {codepoint:#06x}"
+                                )));
+                            }
+                            let height_usize = height as usize;
+                            let required = height_usize.checked_mul(2).ok_or_else(|| {
+                                Error::Abi("character bitmap size overflow".into())
+                            })?;
+                            if bitmap.len() < required {
+                                return Err(Error::Abi(format!(
+                                    "character bitmap for {codepoint:#06x} has {} bytes, needs {required}",
+                                    bitmap.len()
+                                )));
+                            }
+                            let guest_stride = width.div_ceil(8) as usize;
+                            let mut guest_bitmap = Vec::with_capacity(guest_stride * height_usize);
+                            for row in bitmap[..required].as_chunks::<2>().0 {
+                                guest_bitmap.extend(
+                                    row[..guest_stride].iter().map(|byte| byte.reverse_bits()),
+                                );
+                            }
+                            let address = self.allocate(guest_bitmap.len(), 4)?;
+                            self.memory.write(address, &guest_bitmap)?;
                             let glyph = GuestGlyph {
                                 address,
                                 width,
@@ -589,7 +609,7 @@ impl ExtRuntime {
                         sound.0,
                     )));
                 };
-                if sound.0 == 0 || len == 0 || looped > 1 {
+                if sound.0 == 0 || len == 0 || !matches!(looped, 0 | 1 | u32::MAX) {
                     return Err(Error::Abi(format!(
                         "unsupported headless sound request (type {}, address {:#010x}, len {len}, looped {looped}) called by module {module}",
                         cpu.register(0),

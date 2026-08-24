@@ -121,6 +121,8 @@ pub(crate) trait NativeServices {
     fn find_start(&mut self, directory: &[u8]) -> Result<Option<(i32, Vec<u8>)>>;
     fn find_next(&mut self, handle: i32) -> Result<Option<Vec<u8>>>;
     fn find_stop(&mut self, handle: i32) -> Result<bool>;
+    /// Returns an MSB-first glyph with two bytes per scanline. The platform
+    /// table adapter repacks narrow glyphs to the guest ABI's byte stride.
     fn char_bitmap(&mut self, codepoint: u32, font: u32) -> Result<Option<(Vec<u8>, u32, u32)>>;
     fn draw_bitmap(
         &mut self,

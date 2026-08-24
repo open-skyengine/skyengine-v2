@@ -147,6 +147,7 @@ impl NativeServices for StubServices {
             (0x2603, 2 | 7) | (0x786e | 0x5b9a, 1 | 2) => {
                 Some((vec![0x01, 0x80, 0x96, 0x4b], 9, 2))
             }
+            (0x25, 1) => Some((vec![0x80, 0x55, 0x40, 0xaa], 8, 2)),
             _ => None,
         })
     }

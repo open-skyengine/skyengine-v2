@@ -163,7 +163,8 @@ native extension 固定内存窗口相互独立。
 
 基线 headless profile 支持 `mr_playSound(type, data, len, looped)` 的内存 MIDI
 （类型 `0`）和 MP3（类型 `2`）形式，其中 `data` 和 `len` 必须指向非空的有效
-guest 缓冲区，`looped` 为 `0` 或 `1`。
+guest 缓冲区；`looped` 为 `0` 时单次播放，为 `1` 或有符号值 `-1`
+（寄存器值 `0xffffffff`）时循环播放。
 有输出能力的宿主把资源解码为 44.1 kHz 双声道 PCM，并支持单曲循环；headless
 profile 使用无输出音频 sink，调用成功推进 guest 状态但不产生宿主声音。
 `mr_stopSound` 停止当前音轨，在没有正在播放的声音时也成功返回。
