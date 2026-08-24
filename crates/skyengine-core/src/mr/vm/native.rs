@@ -375,10 +375,10 @@ impl MrVm {
 
     fn file_seek(&mut self, args: &[Value]) -> Result<Vec<Value>> {
         let handle = file_handle(args.first())?;
-        let offset = i32::try_from(integer_number(args.get(1).unwrap_or(&Value::Nil))?)
-            .map_err(|_| crate::Error::MrFault("file.seek offset is out of range".into()))?;
-        let origin = u32::try_from(integer_number(args.get(2).unwrap_or(&Value::Nil))?)
+        let origin = u32::try_from(integer_number(args.get(1).unwrap_or(&Value::Nil))?)
             .map_err(|_| crate::Error::MrFault("file.seek origin is negative".into()))?;
+        let offset = i32::try_from(integer_number(args.get(2).unwrap_or(&Value::Nil))?)
+            .map_err(|_| crate::Error::MrFault("file.seek offset is out of range".into()))?;
         Ok(vec![
             self.host
                 .mr_file_seek(handle, offset, origin)?
