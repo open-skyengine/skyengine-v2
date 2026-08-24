@@ -5,6 +5,8 @@ pub mod mr;
 pub mod package;
 pub mod runtime;
 
+mod wap_proxy;
+
 pub(crate) const VIRTUAL_IMEI: &[u8; 15] = b"000000000000000";
 pub(crate) const VIRTUAL_IMSI: &[u8; 15] = b"460019707327302";
 

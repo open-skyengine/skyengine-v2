@@ -112,8 +112,10 @@ The output is a binary P6 PPM image. `--frame-output` implies headless mode. Use
 `--entry NAME`, `--work-dir DIR`, `--font FILE`, `--screen WIDTHxHEIGHT`,
 `--dns-map 'HOST->IPv4[:PORT];...'`, and `--device-date YYYY-M-D|host`. The guest path
 `C:/` maps to `--work-dir`, so `C:/mythroad/...` maps to its `mythroad/...` subtree.
-By default, `rop.skymobiapp.com` and `spd.skymobiapp.com` map to `159.75.119.124`;
-passing `--dns-map` replaces these defaults.
+By default, `rop.skymobiapp.com`, `spd.skymobiapp.com`, and `wap.skmeg.com` map to
+`159.75.119.124`. Connections to the legacy WAP gateway `10.0.0.172` are handled by an
+in-process HTTP/CONNECT proxy. Passing `--dns-map` replaces the hostname defaults, and an
+explicit mapping for `10.0.0.172` overrides the in-process proxy.
 
 ## Run With SDL2
 

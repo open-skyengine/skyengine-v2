@@ -196,6 +196,7 @@ fn immediate_restart_vm() -> (MrVm, std::path::PathBuf, std::path::PathBuf) {
             memory_limit: 2 * 1024 * 1024,
             dns_mappings: Vec::<crate::DnsMapping>::new().into(),
             device_date: crate::DeviceDate::default(),
+            wap_proxy_endpoint: None,
         },
         limits,
     );

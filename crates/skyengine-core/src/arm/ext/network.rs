@@ -1,4 +1,5 @@
 use super::*;
+use crate::wap_proxy::WAP_PROXY_ADDRESS;
 
 const MAX_HTTP_HEADER_INSPECTION: usize = 64 * 1024;
 
@@ -155,6 +156,14 @@ impl ExtRuntime {
             return (
                 u32::from_be_bytes(mapping.address.octets()),
                 mapping.port.map_or(port, u32::from),
+            );
+        }
+        if address == WAP_PROXY_ADDRESS
+            && let Some(endpoint) = self.wap_proxy_endpoint
+        {
+            return (
+                u32::from_be_bytes(endpoint.ip().octets()),
+                u32::from(endpoint.port()),
             );
         }
         if let Some(mapping) = self

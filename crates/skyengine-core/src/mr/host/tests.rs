@@ -106,6 +106,7 @@ fn test_host() -> MrHost {
             memory_limit: 1024 * 1024,
             dns_mappings: Vec::<DnsMapping>::new().into(),
             device_date: crate::DeviceDate::default(),
+            wap_proxy_endpoint: None,
         },
     )
 }
@@ -799,6 +800,7 @@ fn prepare_restart_honors_an_explicit_path_when_the_parent_has_the_same_identity
             memory_limit: 2 * 1024 * 1024,
             dns_mappings: Vec::<DnsMapping>::new().into(),
             device_date: crate::DeviceDate::default(),
+            wap_proxy_endpoint: None,
         },
     );
     host.application_stack.push((
@@ -847,6 +849,7 @@ fn application_replacement_is_cold_and_carries_the_latest_session_parameter() {
             memory_limit: 2 * 1024 * 1024,
             dns_mappings: Vec::<DnsMapping>::new().into(),
             device_date: crate::DeviceDate::default(),
+            wap_proxy_endpoint: None,
         },
     );
     let parameter = std::array::from_fn(|index| (index as u8).wrapping_mul(29));
@@ -994,6 +997,7 @@ fn restart_rejects_a_symlink_target_without_committing() {
         memory_limit: 2 * 1024 * 1024,
         dns_mappings: Vec::<DnsMapping>::new().into(),
         device_date: crate::DeviceDate::default(),
+        wap_proxy_endpoint: None,
     };
     let host = MrHost::new(
         package.clone(),
@@ -1062,6 +1066,7 @@ fn failed_staging_preserves_the_running_application_and_resources() {
             memory_limit: 2 * 1024 * 1024,
             dns_mappings: Vec::<DnsMapping>::new().into(),
             device_date: crate::DeviceDate::default(),
+            wap_proxy_endpoint: None,
         },
     );
     let parameter = std::array::from_fn(|index| index as u8 ^ 0xa5);

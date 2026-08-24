@@ -1,6 +1,6 @@
 use std::{
     fs,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -13,6 +13,7 @@ use crate::{
         value::Value,
         vm::{LifecycleError, LifecycleOutcome},
     },
+    wap_proxy::{WAP_PROXY_ADDRESS, WapProxyService},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +156,7 @@ pub struct Runtime {
     state: RuntimeState,
     entry: Vec<u8>,
     vm: MrVm,
+    _wap_proxy: Option<WapProxyService>,
 }
 
 impl Runtime {
@@ -176,6 +178,7 @@ impl Runtime {
             )));
         }
         let framebuffer = Framebuffer::new(config.screen_width, config.screen_height)?;
+        let (wap_proxy, wap_proxy_endpoint) = start_wap_proxy(&config.dns_mappings)?;
         let vm = MrVm::new(
             package,
             framebuffer,
@@ -186,6 +189,7 @@ impl Runtime {
                 memory_limit: config.memory_limit,
                 dns_mappings: config.dns_mappings.into(),
                 device_date: config.device_date,
+                wap_proxy_endpoint,
             },
             config.limits,
         );
@@ -193,6 +197,7 @@ impl Runtime {
             state: RuntimeState::Loaded,
             entry: config.entry,
             vm,
+            _wap_proxy: wap_proxy,
         })
     }
 
@@ -338,6 +343,22 @@ impl Runtime {
     }
 }
 
+fn start_wap_proxy(
+    dns_mappings: &[DnsMapping],
+) -> Result<(Option<WapProxyService>, Option<SocketAddrV4>)> {
+    if dns_mappings
+        .iter()
+        .any(|mapping| mapping.source.parse::<Ipv4Addr>() == Ok(WAP_PROXY_ADDRESS))
+    {
+        return Ok((None, None));
+    }
+    let proxy = WapProxyService::start(dns_mappings.into()).map_err(|error| {
+        Error::Platform(format!("failed to start the WAP proxy service: {error}"))
+    })?;
+    let endpoint = proxy.endpoint();
+    Ok((Some(proxy), Some(endpoint)))
+}
+
 fn apply_lifecycle_result(
     state: &mut RuntimeState,
     result: std::result::Result<LifecycleOutcome, LifecycleError>,
@@ -404,8 +425,35 @@ mod tests {
                     address: Ipv4Addr::new(159, 75, 119, 124),
                     port: None,
                 },
+                DnsMapping {
+                    source: "wap.skmeg.com".into(),
+                    address: Ipv4Addr::new(159, 75, 119, 124),
+                    port: None,
+                },
             ]
         );
+    }
+
+    #[test]
+    fn starts_an_internal_wap_proxy_unless_the_gateway_is_overridden() {
+        let mappings = Vec::new();
+        let (service, endpoint) = start_wap_proxy(&mappings).unwrap();
+        let endpoint = endpoint.unwrap();
+        assert!(service.is_some());
+        assert_eq!(*endpoint.ip(), Ipv4Addr::LOCALHOST);
+        assert!(endpoint.port() > 0);
+        assert!(mappings.is_empty());
+
+        let override_mapping = DnsMapping {
+            source: WAP_PROXY_ADDRESS.to_string(),
+            address: Ipv4Addr::LOCALHOST,
+            port: Some(8080),
+        };
+        let mappings = vec![override_mapping.clone()];
+        let (service, endpoint) = start_wap_proxy(&mappings).unwrap();
+        assert!(service.is_none());
+        assert_eq!(endpoint, None);
+        assert_eq!(mappings, [override_mapping]);
     }
 
     #[test]

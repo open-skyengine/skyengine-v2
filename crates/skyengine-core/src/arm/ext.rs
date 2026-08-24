@@ -542,6 +542,7 @@ pub(crate) struct ExtRuntime {
     detached_guest_allocation_owners: BTreeMap<u32, u64>,
     detached_guest_allocation_cursor: u32,
     dns_mappings: Arc<[DnsMapping]>,
+    wap_proxy_endpoint: Option<SocketAddrV4>,
     pending_external_action_completions: VecDeque<PendingExternalActionCompletion>,
     device_date: DeviceDate,
     platform_memory_extensions: BTreeMap<u32, PlatformMemoryExtension>,
@@ -753,6 +754,7 @@ impl ExtRuntime {
             detached_guest_allocation_owners: BTreeMap::new(),
             detached_guest_allocation_cursor: DETACHED_GUEST_ALLOCATION_BASE.0,
             dns_mappings: Arc::from([]),
+            wap_proxy_endpoint: None,
             pending_external_action_completions: VecDeque::new(),
             device_date: DeviceDate::default(),
             platform_memory_extensions: BTreeMap::new(),
@@ -1054,6 +1056,10 @@ impl ExtRuntime {
 
     pub fn set_dns_mappings(&mut self, mappings: Arc<[DnsMapping]>) {
         self.dns_mappings = mappings;
+    }
+
+    pub(crate) fn set_wap_proxy_endpoint(&mut self, endpoint: Option<SocketAddrV4>) {
+        self.wap_proxy_endpoint = endpoint;
     }
 
     pub fn set_device_date(&mut self, device_date: DeviceDate) {

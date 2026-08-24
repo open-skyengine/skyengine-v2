@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::*;
+use crate::wap_proxy::WAP_PROXY_ADDRESS;
 
 const MAX_MR_SOCKETS: usize = 64;
 const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -265,7 +266,7 @@ impl MrHost {
         let ip = socket_ip(args.get(1))?;
         let port = u16::try_from(integer(args.get(2))?)
             .map_err(|_| crate::Error::MrFault("socket port is out of range".into()))?;
-        let route = route_mr_endpoint(&self.dns_mappings, ip, port);
+        let route = route_mr_endpoint(&self.dns_mappings, self.wap_proxy_endpoint, ip, port);
         let Some(socket) = self.mr_sockets.get_mut(&handle) else {
             return Ok(vec![Value::Number(5.0)]);
         };
@@ -407,16 +408,34 @@ impl MrHost {
     }
 }
 
-fn route_mr_endpoint(mappings: &[DnsMapping], ip: Ipv4Addr, port: u16) -> RoutedMrEndpoint {
+fn route_mr_endpoint(
+    mappings: &[DnsMapping],
+    wap_proxy_endpoint: Option<SocketAddrV4>,
+    ip: Ipv4Addr,
+    port: u16,
+) -> RoutedMrEndpoint {
     if let Some(mapping) = mappings.iter().find(|mapping| {
         mapping
             .source
             .parse::<Ipv4Addr>()
             .is_ok_and(|source| source == ip)
     }) {
+        let endpoint = SocketAddrV4::new(mapping.address, mapping.port.unwrap_or(port));
         return RoutedMrEndpoint {
-            endpoint: SocketAddrV4::new(mapping.address, mapping.port.unwrap_or(port)),
-            connect_port_address: mapping.port.map(|_| mapping.address),
+            endpoint,
+            connect_port_address: if Some(endpoint) == wap_proxy_endpoint {
+                None
+            } else {
+                mapping.port.map(|_| mapping.address)
+            },
+        };
+    }
+    if ip == WAP_PROXY_ADDRESS
+        && let Some(endpoint) = wap_proxy_endpoint
+    {
+        return RoutedMrEndpoint {
+            endpoint,
+            connect_port_address: None,
         };
     }
     if let Some(mapping) = mappings
@@ -584,7 +603,7 @@ mod tests {
             port: Some(13_230),
         };
         assert_eq!(
-            route_mr_endpoint(std::slice::from_ref(&fixed), source, 80),
+            route_mr_endpoint(std::slice::from_ref(&fixed), None, source, 80),
             RoutedMrEndpoint {
                 endpoint: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 13_230),
                 connect_port_address: Some(Ipv4Addr::LOCALHOST),
@@ -596,7 +615,7 @@ mod tests {
             ..fixed.clone()
         };
         assert_eq!(
-            route_mr_endpoint(&[without_port], source, 80).connect_port_address,
+            route_mr_endpoint(&[without_port], None, source, 80).connect_port_address,
             None
         );
 
@@ -604,9 +623,36 @@ mod tests {
             source: "proxy.test".into(),
             ..fixed
         };
-        let hostname_route = route_mr_endpoint(&[hostname_source], Ipv4Addr::LOCALHOST, 80);
+        let hostname_route = route_mr_endpoint(&[hostname_source], None, Ipv4Addr::LOCALHOST, 80);
         assert_eq!(hostname_route.endpoint.port(), 13_230);
         assert_eq!(hostname_route.connect_port_address, None);
+    }
+
+    #[test]
+    fn internal_wap_proxy_route_keeps_connect_requests_on_the_proxy() {
+        let source = Ipv4Addr::new(10, 0, 0, 172);
+        let proxy_endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 32_123);
+
+        assert_eq!(
+            route_mr_endpoint(&[], Some(proxy_endpoint), source, 80),
+            RoutedMrEndpoint {
+                endpoint: proxy_endpoint,
+                connect_port_address: None,
+            }
+        );
+
+        let explicit = DnsMapping {
+            source: source.to_string(),
+            address: Ipv4Addr::new(192, 0, 2, 10),
+            port: Some(8080),
+        };
+        assert_eq!(
+            route_mr_endpoint(&[explicit], Some(proxy_endpoint), source, 80),
+            RoutedMrEndpoint {
+                endpoint: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 8080),
+                connect_port_address: Some(Ipv4Addr::new(192, 0, 2, 10)),
+            }
+        );
     }
 
     #[test]
@@ -648,7 +694,7 @@ mod tests {
             address: Ipv4Addr::LOCALHOST,
             port: Some(initial_port),
         };
-        let route = route_mr_endpoint(&[mapping], source, 80);
+        let route = route_mr_endpoint(&[mapping], None, source, 80);
         let mut socket = mapped_socket(route);
         let request_line_end = request
             .windows(2)
@@ -689,7 +735,7 @@ mod tests {
             address: Ipv4Addr::LOCALHOST,
             port: Some(port),
         };
-        let route = route_mr_endpoint(&[mapping], source, 80);
+        let route = route_mr_endpoint(&[mapping], None, source, 80);
         let mut socket = mapped_socket(route);
 
         assert_eq!(socket.send(b"ping"), MrSocketSendResult::Accepted(4));
@@ -720,7 +766,7 @@ mod tests {
             address: Ipv4Addr::LOCALHOST,
             port: Some(initial_port),
         };
-        let route = route_mr_endpoint(&[mapping], source, 80);
+        let route = route_mr_endpoint(&[mapping], None, source, 80);
         let mut socket = mapped_socket(route);
         let request = format!("CONNECT ignored.test:{unavailable_port} HTTP/1.0\r\n\r\n");
 

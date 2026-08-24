@@ -403,7 +403,8 @@ fn print_help() {
          --work-dir is the device root; installed MRP files live in mythroad/.\n  \
          Relative font paths are resolved from --work-dir.\n  \
          DNS MAP is a semicolon-separated SOURCE->IPv4[:PORT] list.\n  \
-         DNS MAP maps rop.skymobiapp.com and spd.skymobiapp.com to 159.75.119.124 by default.\n  \
+         DNS MAP maps the default Skymobi hosts to 159.75.119.124.\n  \
+         Connections to 10.0.0.172 use the built-in WAP proxy unless explicitly mapped.\n  \
          Device date defaults to 2012-6-20 or SKYENGINE_DEVICE_DATE when set.\n  \
          Memory SIZE is one of 1M, 2M, 4M, 6M, 8M, or 16M.\n  \
          The default font is mythroad/system/gb16.uc2."

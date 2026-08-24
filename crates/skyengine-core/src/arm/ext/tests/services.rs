@@ -1315,6 +1315,32 @@ fn endpoint_mapping_can_redirect_an_ip_and_port() {
 }
 
 #[test]
+fn wap_gateway_routes_to_the_internal_proxy_unless_explicitly_mapped() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let proxy = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 32_123);
+    runtime.set_wap_proxy_endpoint(Some(proxy));
+
+    assert_eq!(
+        runtime.route_mapped_endpoint(u32::from_be_bytes([10, 0, 0, 172]), 80),
+        (
+            u32::from_be_bytes(Ipv4Addr::LOCALHOST.octets()),
+            u32::from(proxy.port()),
+        )
+    );
+
+    runtime.set_dns_mappings(Arc::from([DnsMapping {
+        source: "10.0.0.172".into(),
+        address: Ipv4Addr::new(192, 0, 2, 10),
+        port: Some(8080),
+    }]));
+    assert_eq!(
+        runtime.route_mapped_endpoint(u32::from_be_bytes([10, 0, 0, 172]), 80),
+        (u32::from_be_bytes([192, 0, 2, 10]), 8080)
+    );
+}
+
+#[test]
 fn native_stream_socket_connects_polls_and_transfers_on_loopback() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();

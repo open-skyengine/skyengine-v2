@@ -3,6 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
+    net::SocketAddrV4,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -98,6 +99,7 @@ pub(crate) struct MrHost {
     font: Arc<[u8]>,
     memory_limit: u32,
     dns_mappings: Arc<[DnsMapping]>,
+    wap_proxy_endpoint: Option<SocketAddrV4>,
     device_date: crate::DeviceDate,
     bitmaps: BTreeMap<i32, Bitmap>,
     directory_searches: BTreeMap<i32, DirectorySearch>,
@@ -127,6 +129,7 @@ pub(crate) struct MrHostConfig {
     pub memory_limit: u32,
     pub dns_mappings: Arc<[DnsMapping]>,
     pub device_date: crate::DeviceDate,
+    pub wap_proxy_endpoint: Option<SocketAddrV4>,
 }
 
 impl MrHost {
@@ -144,6 +147,7 @@ impl MrHost {
             font: config.font,
             memory_limit: config.memory_limit,
             dns_mappings: config.dns_mappings,
+            wap_proxy_endpoint: config.wap_proxy_endpoint,
             device_date: config.device_date,
             bitmaps: BTreeMap::new(),
             directory_searches: BTreeMap::new(),
@@ -1113,6 +1117,7 @@ impl MrHost {
             package.header().version,
         ))?;
         runtime.set_dns_mappings(self.dns_mappings.clone());
+        runtime.set_wap_proxy_endpoint(self.wap_proxy_endpoint);
         runtime.set_device_date(self.device_date);
         let (previous_package, previous_entry) = previous_application
             .map(|(package, entry)| (package.as_slice(), entry.as_slice()))

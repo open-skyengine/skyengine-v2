@@ -182,10 +182,8 @@ async function startTalkcatDownloadServer(): Promise<TalkcatDownloadServer> {
 }
 
 function downloadDnsMap(server: TalkcatDownloadServer): string {
-  return [
-    `10.0.0.172->127.0.0.1:${server.port}`,
-    `spd.skymobiapp.com->127.0.0.1:${server.port}`,
-  ].join(";");
+  // Leave 10.0.0.172 unmapped so this flow exercises the built-in WAP proxy.
+  return `spd.skymobiapp.com->127.0.0.1:${server.port}`;
 }
 
 function countColor(
