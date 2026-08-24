@@ -33,6 +33,17 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Releases
+
+GitHub Actions runs checks and builds Linux x86_64 and Windows x86_64 packages for every branch
+push. Publishing is limited to these refs:
+
+- Every push to `main` updates the `continuous` prerelease and its movable `continuous` tag.
+- Every pushed `v*` tag, such as `v0.1.0`, creates a versioned, non-prerelease GitHub Release.
+
+Each platform package contains the `skyengine` CLI, the C ABI dynamic library, the public header,
+the README, and a `VERSION` file. The release also includes `SHA256SUMS` for both archives.
+
 ## Flutter And C ABI
 
 `skyengine-ffi` exposes the runtime as a C-compatible library for Flutter and

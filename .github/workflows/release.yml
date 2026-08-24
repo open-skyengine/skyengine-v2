@@ -1,0 +1,252 @@
+name: CI and Release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Install SDL2
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libsdl2-dev
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('Cargo.lock') }}-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        env:
+          SDL_AUDIODRIVER: dummy
+          SDL_VIDEODRIVER: dummy
+        run: cargo test --workspace --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install JavaScript dependencies
+        run: |
+          npm install --global pnpm@10.34.4
+          pnpm install --frozen-lockfile
+
+      - name: Check TypeScript
+        run: pnpm exec tsc --noEmit
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            archive: skyengine-linux-x86_64.tar.gz
+          - platform: windows-x86_64
+            os: windows-latest
+            archive: skyengine-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}-
+
+      - name: Build release binaries
+        shell: bash
+        run: >-
+          cargo build --release --locked --workspace
+          --features sdl2/bundled,sdl2/static-link
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="skyengine-linux-x86_64"
+          mkdir -p "dist/${package}"
+          install -m 755 target/release/skyengine "dist/${package}/skyengine"
+          install -m 755 target/release/libskyengine.so "dist/${package}/libskyengine.so"
+          install -m 644 include/skyengine.h "dist/${package}/skyengine.h"
+          install -m 644 README.md "dist/${package}/README.md"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="continuous-${GITHUB_SHA:0:7}"
+          fi
+          printf '%s\n' "${version}" > "dist/${package}/VERSION"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "skyengine-windows-x86_64"
+          New-Item -ItemType Directory -Force "dist/$package" | Out-Null
+          Copy-Item "target/release/skyengine.exe" "dist/$package/skyengine.exe"
+          Copy-Item "target/release/skyengine.dll" "dist/$package/skyengine.dll"
+          Copy-Item "include/skyengine.h" "dist/$package/skyengine.h"
+          Copy-Item "README.md" "dist/$package/README.md"
+          if ($env:GITHUB_REF.StartsWith("refs/tags/")) {
+            $version = $env:GITHUB_REF_NAME
+          } else {
+            $version = "continuous-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          Set-Content -Path "dist/$package/VERSION" -Value $version
+          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum skyengine-* > SHA256SUMS
+
+      - name: Publish continuous release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/continuous" > /dev/null 2>&1; then
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/continuous" \
+              -f sha="${GITHUB_SHA}" \
+              -F force=true > /dev/null
+          else
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/continuous" \
+              -f sha="${GITHUB_SHA}" > /dev/null
+          fi
+
+          cat > release-notes.md <<EOF
+          Automated build from the latest \`main\` commit.
+
+          Commit: [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
+
+          This prerelease is updated in place whenever \`main\` is pushed. Use a \`v*\` release for a stable version.
+          EOF
+
+          if gh release view continuous --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release edit continuous \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Continuous build" \
+              --notes-file release-notes.md \
+              --prerelease
+            gh release upload continuous dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          else
+            gh release create continuous dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "Continuous build" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi
+
+      - name: Publish versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release upload "${tag}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+            gh release edit "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft=false \
+              --prerelease=false
+          else
+            gh release create "${tag}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "${tag}" \
+              --generate-notes
+          fi
