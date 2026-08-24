@@ -136,6 +136,7 @@ jobs:
           install -m 755 target/release/libskyengine.so "dist/${package}/libskyengine.so"
           install -m 644 include/skyengine.h "dist/${package}/skyengine.h"
           install -m 644 README.md "dist/${package}/README.md"
+          install -m 644 LICENSE "dist/${package}/LICENSE"
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             version="${GITHUB_REF_NAME}"
           else
@@ -155,6 +156,7 @@ jobs:
           Copy-Item "target/release/skyengine.dll" "dist/$package/skyengine.dll"
           Copy-Item "include/skyengine.h" "dist/$package/skyengine.h"
           Copy-Item "README.md" "dist/$package/README.md"
+          Copy-Item "LICENSE" "dist/$package/LICENSE"
           if ($env:GITHUB_REF.StartsWith("refs/tags/")) {
             $version = $env:GITHUB_REF_NAME
           } else {
