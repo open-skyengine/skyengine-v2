@@ -143,9 +143,14 @@ impl ExtRuntime {
                 cpu.set_register(0, destination.0);
             }
             15 => {
-                let len = self
-                    .read_c_string(GuestAddr(cpu.register(0)), 1024 * 1024)?
-                    .len();
+                // Native SDK modules represent a missing optional string as NULL and
+                // use the platform strlen result to branch into their fallback path.
+                let address = GuestAddr(cpu.register(0));
+                let len = if address.0 == 0 {
+                    0
+                } else {
+                    self.read_c_string(address, 1024 * 1024)?.len()
+                };
                 cpu.set_register(0, len as u32);
             }
             16 => {

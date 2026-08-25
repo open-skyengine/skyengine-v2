@@ -236,6 +236,18 @@ fn strncmp_compares_a_bounded_prefix_without_requiring_a_nul() {
 }
 
 #[test]
+fn platform_strlen_treats_a_null_optional_string_as_empty() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 0);
+
+    runtime.dispatch_libc(15, 0, &mut cpu).unwrap();
+
+    assert_eq!(cpu.register(0), 0);
+}
+
+#[test]
 fn transformed_bitmap_copy_normalizes_a_quarter_turn() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

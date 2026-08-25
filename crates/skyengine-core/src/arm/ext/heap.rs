@@ -173,18 +173,25 @@ impl ExtRuntime {
             self.guest_allocation_views.remove(&address.0);
             return Ok(());
         }
-        if let Some(block_len) =
-            self.nested_guest_suballocation_len(address, len, module, "free")?
-        {
+        if let Some(nested) = self.nested_guest_suballocation(address, len, module, "free")? {
             let heap = self.guest_heap_state()?;
             let (blocks, terminator, recovered_len) = self.read_free_blocks(heap)?;
-            return self.return_guest_heap_range(
+            self.return_guest_heap_range(
                 address,
-                block_len,
+                nested.block_len,
                 heap,
                 (blocks, terminator, recovered_len),
                 false,
-            );
+            )?;
+            if let Some((view_base, restored_len)) = nested.restored_view {
+                let view = self
+                    .guest_allocation_views
+                    .get_mut(&view_base)
+                    .expect("validated allocation view remains until nested free completes");
+                view.len = restored_len;
+                view.reclaimable_prefix_len = None;
+            }
+            return Ok(());
         }
         if self.reconcile_owned_guest_allocation_suffix(address, len, module)? {
             return Ok(());
@@ -281,13 +288,13 @@ impl ExtRuntime {
         Ok(true)
     }
 
-    fn nested_guest_suballocation_len(
+    fn nested_guest_suballocation(
         &self,
         address: GuestAddr,
         len: usize,
         module: usize,
         operation: &str,
-    ) -> Result<Option<u32>> {
+    ) -> Result<Option<NestedGuestSuballocation>> {
         if len == 0 {
             return Ok(None);
         }
@@ -328,18 +335,50 @@ impl ExtRuntime {
                 "{operation} references a nested allocation outside its active heap"
             )));
         }
-        if self.guest_allocation_views.iter().any(|(base, view)| {
-            ExecutableRange {
-                base: GuestAddr(*base),
-                len: view.len as usize,
+        let overlapping_views = self
+            .guest_allocation_views
+            .iter()
+            .filter(|(base, view)| {
+                ExecutableRange {
+                    base: GuestAddr(**base),
+                    len: view.len as usize,
+                }
+                .overlaps(requested)
+            })
+            .collect::<Vec<_>>();
+        let restored_view = match overlapping_views.as_slice() {
+            [] => None,
+            [(view_base, view)] => {
+                let Some(restored_len) = address.0.checked_sub(**view_base) else {
+                    return Err(Error::Abi(format!(
+                        "{operation} overlaps an active guest allocation view"
+                    )));
+                };
+                let view_end = view_base.checked_add(view.len);
+                let requested_end = requested.end();
+                let can_restore = view.backing_base == backing_base
+                    && view.owner_generation == caller
+                    && view.reclaimable_prefix_len == Some(restored_len)
+                    && view_end.is_some_and(|view_end| {
+                        requested_end.is_some_and(|requested_end| view_end <= requested_end)
+                    });
+                if !can_restore {
+                    return Err(Error::Abi(format!(
+                        "{operation} overlaps an active guest allocation view"
+                    )));
+                }
+                Some((**view_base, restored_len))
             }
-            .overlaps(requested)
-        }) {
-            return Err(Error::Abi(format!(
-                "{operation} overlaps an active guest allocation view"
-            )));
-        }
-        Ok(Some(block_len))
+            _ => {
+                return Err(Error::Abi(format!(
+                    "{operation} overlaps an active guest allocation view"
+                )));
+            }
+        };
+        Ok(Some(NestedGuestSuballocation {
+            block_len,
+            restored_view,
+        }))
     }
 
     pub(super) fn tracked_guest_allocation_len(&self, address: GuestAddr) -> Option<u32> {
@@ -891,6 +930,19 @@ impl ExtRuntime {
         len: u32,
         owner_generation: u64,
     ) {
+        let reclaimable_prefix_len = self
+            .guest_allocation_views
+            .get(&address.0)
+            .filter(|view| {
+                view.backing_base == backing.0 && view.owner_generation == owner_generation
+            })
+            .and_then(|view| match len.cmp(&view.len) {
+                std::cmp::Ordering::Greater => Some(view.len),
+                std::cmp::Ordering::Equal => view.reclaimable_prefix_len,
+                std::cmp::Ordering::Less => view
+                    .reclaimable_prefix_len
+                    .filter(|prefix_len| *prefix_len < len),
+            });
         let requested = ExecutableRange {
             base: address,
             len: len as usize,
@@ -909,6 +961,7 @@ impl ExtRuntime {
                 len,
                 backing_base: backing.0,
                 owner_generation,
+                reclaimable_prefix_len,
             },
         );
     }

@@ -524,6 +524,14 @@ struct GuestAllocationView {
     len: u32,
     backing_base: u32,
     owner_generation: u64,
+    // A same-address expansion may later be trimmed only from this exact old boundary.
+    reclaimable_prefix_len: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NestedGuestSuballocation {
+    block_len: u32,
+    restored_view: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

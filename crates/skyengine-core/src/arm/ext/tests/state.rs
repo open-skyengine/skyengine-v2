@@ -2170,6 +2170,7 @@ fn compact_output_view_is_removed_from_a_rebuilt_guest_free_list() {
             len: 0x80,
             backing_base: backing.0,
             owner_generation: runtime.modules[0].generation,
+            reclaimable_prefix_len: None,
         })
     );
 
@@ -2216,6 +2217,132 @@ fn compact_output_view_is_removed_from_a_rebuilt_guest_free_list() {
     assert!(!runtime.guest_allocations.contains_key(&backing.0));
     assert!(!runtime.guest_allocation_owners.contains_key(&backing.0));
     assert!(!runtime.nested_guest_heaps.contains_key(&backing.0));
+}
+
+#[test]
+fn expanded_compact_output_view_can_restore_its_previous_tail_boundary() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    load_test_module(&mut runtime);
+    let backing = runtime
+        .allocate_guest_block_for_module(0x300, 0)
+        .unwrap()
+        .unwrap();
+    let prepared = backing.checked_add(0x28).unwrap();
+    let owner_generation = runtime.modules[0].generation;
+
+    runtime
+        .claim_prepared_output_for_module(prepared, 0x80, 0)
+        .unwrap();
+    runtime
+        .claim_prepared_output_for_module(prepared, 0xc0, 0)
+        .unwrap();
+    assert_eq!(
+        runtime.guest_allocation_views.get(&prepared.0),
+        Some(&GuestAllocationView {
+            len: 0xc0,
+            backing_base: backing.0,
+            owner_generation,
+            reclaimable_prefix_len: Some(0x80),
+        })
+    );
+
+    let mut executable = ArmCpu::new();
+    executable.set_register(0, 0);
+    executable.set_register(1, 9);
+    executable.set_register(2, prepared.0);
+    executable.set_register(3, 0xc0);
+    runtime
+        .dispatch(131, 0, &mut executable, &mut StubServices)
+        .unwrap();
+    assert_eq!(
+        runtime.modules[0].dynamic_executable_ranges[0],
+        Some(ExecutableRange {
+            base: prepared,
+            len: 0xc0,
+        })
+    );
+
+    let free_start = prepared.checked_add(0x80).unwrap();
+    let heap_before = runtime.guest_heap_state().unwrap();
+    assert!(matches!(
+        runtime.free_guest_block_for_module(backing.checked_add(0x20).unwrap(), 0x100, 0),
+        Err(Error::Abi(message)) if message.contains("active guest allocation view")
+    ));
+    assert!(matches!(
+        runtime.free_guest_block_for_module(prepared.checked_add(0x88).unwrap(), 0x78, 0),
+        Err(Error::Abi(message)) if message.contains("active guest allocation view")
+    ));
+    assert!(matches!(
+        runtime.free_guest_block_for_module(free_start, 0x20, 0),
+        Err(Error::Abi(message)) if message.contains("active guest allocation view")
+    ));
+    assert!(matches!(
+        runtime.free_guest_block_for_module(free_start, 0x80, 1),
+        Err(Error::Abi(message)) if message.contains("another module")
+    ));
+    let heap_after_rejected_frees = runtime.guest_heap_state().unwrap();
+    assert_eq!(heap_after_rejected_frees.head, heap_before.head);
+    assert_eq!(heap_after_rejected_frees.free_left, heap_before.free_left);
+    assert!(runtime.memory.fetch_u32(free_start).is_ok());
+
+    runtime
+        .memory
+        .write_u32(data_slot_address(104), free_start.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(105), 0x80)
+        .unwrap();
+    runtime
+        .free_guest_block_for_module(free_start, 0x80, 0)
+        .unwrap();
+
+    assert_eq!(
+        runtime.guest_allocation_views.get(&prepared.0),
+        Some(&GuestAllocationView {
+            len: 0x80,
+            backing_base: backing.0,
+            owner_generation,
+            reclaimable_prefix_len: None,
+        })
+    );
+    assert_eq!(
+        runtime.modules[0].dynamic_executable_ranges[0],
+        Some(ExecutableRange {
+            base: prepared,
+            len: 0x80,
+        })
+    );
+    assert!(runtime.memory.fetch_u32(prepared).is_ok());
+    assert!(runtime.memory.fetch_u32(free_start).is_err());
+    assert_eq!(runtime.memory.read_u32(data_slot_address(104)).unwrap(), 0);
+    assert_eq!(runtime.memory.read_u32(data_slot_address(105)).unwrap(), 0);
+    assert_eq!(runtime.guest_allocations.get(&backing.0), Some(&0x300));
+    assert_eq!(
+        runtime.guest_allocation_owners.get(&backing.0),
+        Some(&owner_generation)
+    );
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [
+            FreeBlock {
+                offset: free_start.0 - heap.base,
+                len: 0x80,
+            },
+            FreeBlock {
+                offset: backing.0 + 0x300 - heap.base,
+                len: heap.span - (backing.0 + 0x300 - heap.base),
+            },
+        ]
+    );
+    assert_eq!(terminator, heap.span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(heap.free_left, heap_before.free_left + 0x80);
 }
 
 #[test]
@@ -2280,6 +2407,7 @@ fn compact_output_in_a_staged_platform_heap_reserves_and_tracks_its_view() {
             len: 0x40,
             backing_base: arena.0,
             owner_generation,
+            reclaimable_prefix_len: None,
         })
     );
     let heap = runtime.guest_heap_state().unwrap();
