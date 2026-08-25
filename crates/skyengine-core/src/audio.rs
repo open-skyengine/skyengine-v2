@@ -19,6 +19,12 @@ const MAX_AUDIO_FRAMES: usize = AUDIO_SAMPLE_RATE as usize * MAX_AUDIO_SECONDS;
 const MAX_SOURCE_SAMPLES: usize = 64 * 1024 * 1024;
 const MAX_MIDI_EVENTS: usize = 1_000_000;
 const MAX_MIDI_VOICES: usize = 128;
+const MIDI_ATTACK_FRAMES: usize = AUDIO_SAMPLE_RATE as usize / 200;
+const MIDI_RELEASE_FRAMES: usize = AUDIO_SAMPLE_RATE as usize / 20;
+const MIDI_PERCUSSION_RELEASE_FRAMES: usize = AUDIO_SAMPLE_RATE as usize / 100;
+const MIDI_TAIL_FRAMES: usize = AUDIO_SAMPLE_RATE as usize;
+const MIDI_MELODIC_GAIN: f32 = 0.13;
+const MIDI_PERCUSSION_GAIN: f32 = 0.28;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SoundType {
@@ -241,7 +247,10 @@ struct Voice {
     key: u8,
     velocity: f32,
     phase: f32,
+    age_frames: usize,
+    release_frame: Option<usize>,
     noise: u32,
+    filtered_noise: f32,
 }
 
 fn decode_midi(data: &[u8]) -> Result<Vec<i16>> {
@@ -334,20 +343,15 @@ fn decode_midi(data: &[u8]) -> Result<Vec<i16>> {
                     key,
                     velocity,
                 } => {
-                    voices.retain(|voice| voice.channel != channel || voice.key != key);
-                    if voices.len() == MAX_MIDI_VOICES {
-                        voices.remove(0);
-                    }
-                    voices.push(Voice {
-                        channel,
-                        key,
-                        velocity: f32::from(velocity) / 127.0,
-                        phase: 0.0,
-                        noise: 0x9e37_79b9 ^ (u32::from(channel) << 8) ^ u32::from(key),
-                    });
+                    start_midi_voice(&mut voices, channel, key, velocity);
                 }
                 MidiEvent::NoteOff { channel, key } => {
-                    voices.retain(|voice| voice.channel != channel || voice.key != key);
+                    for voice in voices
+                        .iter_mut()
+                        .filter(|voice| voice.channel == channel && voice.key == key)
+                    {
+                        voice.release_frame.get_or_insert(voice.age_frames);
+                    }
                 }
                 MidiEvent::Program { channel, program } => {
                     channels[usize::from(channel)].program = program;
@@ -359,7 +363,12 @@ fn decode_midi(data: &[u8]) -> Result<Vec<i16>> {
                 } => match controller {
                     7 => channels[usize::from(channel)].volume = f32::from(value) / 127.0,
                     10 => channels[usize::from(channel)].pan = f32::from(value) / 127.0,
-                    120 | 123 => voices.retain(|voice| voice.channel != channel),
+                    120 => voices.retain(|voice| voice.channel != channel),
+                    123 => {
+                        for voice in voices.iter_mut().filter(|voice| voice.channel == channel) {
+                            voice.release_frame.get_or_insert(voice.age_frames);
+                        }
+                    }
                     _ => {}
                 },
                 MidiEvent::PitchBend { channel, bend } => {
@@ -372,22 +381,65 @@ fn decode_midi(data: &[u8]) -> Result<Vec<i16>> {
         }
     }
 
-    // A short tail avoids cutting off files whose final event is note-on or metadata.
+    // Release unterminated melodic notes and let one-shot percussion finish naturally.
     if !voices.is_empty() {
-        render_midi_frames(
-            &mut samples,
-            AUDIO_SAMPLE_RATE as usize / 4,
-            &mut voices,
-            &channels,
-        )?;
+        for voice in voices.iter_mut().filter(|voice| voice.channel != 9) {
+            voice.release_frame.get_or_insert(voice.age_frames);
+        }
+        let tail_start = samples.len();
+        render_midi_frames(&mut samples, MIDI_TAIL_FRAMES, &mut voices, &channels)?;
+        while samples.len() > tail_start
+            && samples[samples.len() - AUDIO_CHANNELS..]
+                .iter()
+                .all(|sample| *sample == 0)
+        {
+            samples.truncate(samples.len() - AUDIO_CHANNELS);
+        }
     }
     Ok(samples)
+}
+
+fn start_midi_voice(voices: &mut Vec<Voice>, channel: u8, key: u8, velocity: u8) {
+    if channel == 9 {
+        voices.retain(|voice| voice.channel != channel || !percussion_chokes(key, voice.key));
+    } else {
+        for voice in voices
+            .iter_mut()
+            .filter(|voice| voice.channel == channel && voice.key == key)
+        {
+            voice.release_frame.get_or_insert(voice.age_frames);
+        }
+    }
+    if voices.len() == MAX_MIDI_VOICES {
+        voices.remove(0);
+    }
+    voices.push(Voice {
+        channel,
+        key,
+        velocity: f32::from(velocity) / 127.0,
+        phase: 0.0,
+        age_frames: 0,
+        release_frame: None,
+        noise: 0x9e37_79b9 ^ (u32::from(channel) << 8) ^ u32::from(key),
+        filtered_noise: 0.0,
+    });
+}
+
+fn percussion_chokes(trigger: u8, sounding: u8) -> bool {
+    trigger == sounding || (matches!(trigger, 42 | 44 | 46) && matches!(sounding, 42 | 44 | 46))
+}
+
+fn percussion_mix_gain(key: u8) -> f32 {
+    match key {
+        35 | 36 | 38 | 40 | 41 | 43 | 45 | 47 | 48 | 50 => 1.0,
+        _ => 0.5,
+    }
 }
 
 fn render_midi_frames(
     output: &mut Vec<i16>,
     frames: usize,
-    voices: &mut [Voice],
+    voices: &mut Vec<Voice>,
     channels: &[MidiChannel; 16],
 ) -> Result<()> {
     let current_frames = output.len() / AUDIO_CHANNELS;
@@ -402,30 +454,118 @@ fn render_midi_frames(
         let mut left = 0.0_f32;
         let mut right = 0.0_f32;
         for voice in voices.iter_mut() {
+            if voice_finished(voice) {
+                continue;
+            }
             let channel = channels[usize::from(voice.channel)];
             let sample = if voice.channel == 9 {
-                voice.noise ^= voice.noise << 13;
-                voice.noise ^= voice.noise >> 17;
-                voice.noise ^= voice.noise << 5;
-                (voice.noise as i32 as f32) / i32::MAX as f32 * 0.35
+                percussion_sample(voice)
             } else {
                 let note = f32::from(voice.key) + channel.pitch_bend;
                 let frequency = 440.0 * 2.0_f32.powf((note - 69.0) / 12.0);
                 voice.phase = (voice.phase + frequency / AUDIO_SAMPLE_RATE as f32).fract();
-                instrument_sample(channel.program, voice.phase)
+                instrument_sample(channel.program, voice.phase) * melodic_envelope(voice)
             };
-            let gain = voice.velocity * channel.volume * 0.14;
+            let voice_gain = if voice.channel == 9 {
+                MIDI_PERCUSSION_GAIN * percussion_mix_gain(voice.key)
+            } else {
+                MIDI_MELODIC_GAIN
+            };
+            let gain = voice.velocity * channel.volume * voice_gain;
             left += sample * gain * (1.0 - channel.pan).sqrt();
             right += sample * gain * channel.pan.sqrt();
+            voice.age_frames = voice.age_frames.saturating_add(1);
         }
         output.push(float_to_i16(left));
         output.push(float_to_i16(right));
     }
+    voices.retain(|voice| !voice_finished(voice));
     Ok(())
+}
+
+fn melodic_envelope(voice: &Voice) -> f32 {
+    let attack = (voice.age_frames + 1).min(MIDI_ATTACK_FRAMES) as f32 / MIDI_ATTACK_FRAMES as f32;
+    attack * release_envelope(voice, MIDI_RELEASE_FRAMES)
+}
+
+fn percussion_sample(voice: &mut Voice) -> f32 {
+    let duration = percussion_duration_frames(voice.key);
+    let progress = voice.age_frames as f32 / duration as f32;
+    let envelope =
+        (1.0 - progress).max(0.0).powi(2) * release_envelope(voice, MIDI_PERCUSSION_RELEASE_FRAMES);
+    let time = voice.age_frames as f32 / AUDIO_SAMPLE_RATE as f32;
+
+    voice.noise ^= voice.noise << 13;
+    voice.noise ^= voice.noise >> 17;
+    voice.noise ^= voice.noise << 5;
+    let white = voice.noise as i32 as f32 / i32::MAX as f32;
+    voice.filtered_noise = voice.filtered_noise * 0.82 + white * 0.18;
+    let bright_noise = white - voice.filtered_noise;
+    let body_noise = white * 0.35 + voice.filtered_noise * 0.65;
+
+    let sample = match voice.key {
+        35 | 36 => {
+            let frequency = 95.0 - progress * 50.0;
+            voice.phase = (voice.phase + frequency / AUDIO_SAMPLE_RATE as f32).fract();
+            (voice.phase * TAU).sin() * 0.9 + voice.filtered_noise * 0.1
+        }
+        38 | 40 => body_noise * 0.65 + (time * 180.0 * TAU).sin() * 0.35,
+        41 | 43 | 45 | 47 | 48 | 50 => {
+            let frequency = 210.0 * 2.0_f32.powf((f32::from(voice.key) - 47.0) / 12.0);
+            voice.phase = (voice.phase + frequency / AUDIO_SAMPLE_RATE as f32).fract();
+            (voice.phase * TAU).sin() * 0.75 + white * 0.25
+        }
+        42 | 44 | 46 => bright_noise * 0.55,
+        49 | 51 | 52 | 55 | 57 | 59 => bright_noise * 0.45 + body_noise * 0.15,
+        _ => body_noise * 0.7,
+    };
+    sample * envelope
+}
+
+fn percussion_duration_frames(key: u8) -> usize {
+    let milliseconds = match key {
+        35 | 36 => 260,
+        38 | 40 => 220,
+        42 | 44 => 80,
+        46 => 360,
+        49 | 51 | 52 | 55 | 57 | 59 => 900,
+        41 | 43 | 45 | 47 | 48 | 50 => 300,
+        _ => 180,
+    };
+    AUDIO_SAMPLE_RATE as usize * milliseconds / 1_000
+}
+
+fn voice_finished(voice: &Voice) -> bool {
+    if voice.channel == 9 {
+        voice.age_frames >= percussion_duration_frames(voice.key)
+            || release_finished(voice, MIDI_PERCUSSION_RELEASE_FRAMES)
+    } else {
+        release_finished(voice, MIDI_RELEASE_FRAMES)
+    }
+}
+
+fn release_envelope(voice: &Voice, frames: usize) -> f32 {
+    voice.release_frame.map_or(1.0, |release_frame| {
+        let elapsed = voice.age_frames.saturating_sub(release_frame);
+        1.0 - elapsed.min(frames) as f32 / frames as f32
+    })
+}
+
+fn release_finished(voice: &Voice, frames: usize) -> bool {
+    voice
+        .release_frame
+        .is_some_and(|release_frame| voice.age_frames.saturating_sub(release_frame) >= frames)
 }
 
 fn instrument_sample(program: u8, phase: f32) -> f32 {
     match program {
+        // Dota holds program 119 in long effect chords, so avoid the generic saw's wrap spike.
+        119 => {
+            (phase * TAU).sin() * 0.42
+                + (phase * TAU * 2.0).sin() * 0.28
+                + (phase * TAU * 3.0).sin() * 0.18
+                + (phase * TAU * 5.0).sin() * 0.12
+        }
         0..=31 => (phase * TAU).sin() * 0.85 + (phase * TAU * 2.0).sin() * 0.15,
         32..=63 => 1.0 - 4.0 * (phase - 0.5).abs(),
         64..=95 => {
@@ -584,12 +724,205 @@ mod tests {
     const SIMPLE_MIDI: &[u8] = b"MThd\0\0\0\x06\0\0\0\x01\0\x60\
 MTrk\0\0\0\x0c\0\x90\x45\x7f\x60\x80\x45\0\0\xff\x2f\0";
 
+    fn pcm_stats(samples: &[i16]) -> (f64, i32, f64) {
+        let rms = (samples
+            .iter()
+            .map(|sample| f64::from(*sample).powi(2))
+            .sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        let peak = samples
+            .iter()
+            .map(|sample| i32::from(*sample).abs())
+            .max()
+            .unwrap();
+        // One-frame difference energy exposes sustained broadband noise without a reference PCM.
+        let difference_rms = (samples[AUDIO_CHANNELS..]
+            .iter()
+            .zip(&samples[..samples.len() - AUDIO_CHANNELS])
+            .map(|(sample, previous)| (f64::from(*sample) - f64::from(*previous)).powi(2))
+            .sum::<f64>()
+            / (samples.len() - AUDIO_CHANNELS) as f64)
+            .sqrt();
+        (rms, peak, difference_rms / rms)
+    }
+
+    fn test_voice(channel: u8, key: u8) -> Voice {
+        Voice {
+            channel,
+            key,
+            velocity: 1.0,
+            phase: 0.0,
+            age_frames: 0,
+            release_frame: None,
+            noise: 0x9e37_79b9 ^ (u32::from(channel) << 8) ^ u32::from(key),
+            filtered_noise: 0.0,
+        }
+    }
+
     #[test]
     fn midi_decodes_to_non_silent_stereo_pcm() {
         let samples = decode_midi(SIMPLE_MIDI).unwrap();
         assert!(!samples.is_empty());
         assert_eq!(samples.len() % AUDIO_CHANNELS, 0);
         assert!(samples.iter().any(|sample| *sample != 0));
+    }
+
+    #[test]
+    fn percussion_without_note_off_is_a_finite_one_shot() {
+        let mut samples = Vec::new();
+        let mut voices = vec![test_voice(9, 49)];
+
+        render_midi_frames(
+            &mut samples,
+            AUDIO_SAMPLE_RATE as usize * 2,
+            &mut voices,
+            &[MidiChannel::default(); 16],
+        )
+        .unwrap();
+
+        let onset_len = AUDIO_SAMPLE_RATE as usize / 20 * AUDIO_CHANNELS;
+        let silent_tail = AUDIO_SAMPLE_RATE as usize / 2 * AUDIO_CHANNELS;
+        assert!(samples[..onset_len].iter().any(|sample| *sample != 0));
+        let onset_peak = samples[..onset_len]
+            .iter()
+            .map(|sample| i32::from(*sample).abs())
+            .max()
+            .unwrap();
+        assert!(
+            (1_000..=3_000).contains(&onset_peak),
+            "percussion onset peak {onset_peak} is outside the bounded mix range"
+        );
+        assert!(
+            samples[samples.len() - silent_tail..]
+                .iter()
+                .all(|sample| *sample == 0)
+        );
+        assert!(voices.is_empty());
+    }
+
+    #[test]
+    fn tonal_percussion_uses_the_restored_mix_level() {
+        let mut samples = Vec::new();
+        let mut voices = vec![test_voice(9, 36)];
+
+        render_midi_frames(
+            &mut samples,
+            AUDIO_SAMPLE_RATE as usize / 20,
+            &mut voices,
+            &[MidiChannel::default(); 16],
+        )
+        .unwrap();
+
+        let peak = samples
+            .iter()
+            .map(|sample| i32::from(*sample).abs())
+            .max()
+            .unwrap();
+        assert!(
+            (3_500..=6_000).contains(&peak),
+            "tonal percussion peak {peak} is outside the restored mix range"
+        );
+    }
+
+    #[test]
+    fn percussion_note_off_releases_promptly() {
+        let mut voice = test_voice(9, 49);
+        voice.release_frame = Some(0);
+        let mut voices = vec![voice];
+        let mut samples = Vec::new();
+
+        render_midi_frames(
+            &mut samples,
+            AUDIO_SAMPLE_RATE as usize / 10,
+            &mut voices,
+            &[MidiChannel::default(); 16],
+        )
+        .unwrap();
+
+        assert!(
+            samples[..MIDI_PERCUSSION_RELEASE_FRAMES * AUDIO_CHANNELS]
+                .iter()
+                .any(|sample| *sample != 0)
+        );
+        assert!(
+            samples[MIDI_PERCUSSION_RELEASE_FRAMES * AUDIO_CHANNELS..]
+                .iter()
+                .all(|sample| *sample == 0)
+        );
+        assert!(voices.is_empty());
+    }
+
+    #[test]
+    fn percussion_retrigger_chokes_the_previous_voice() {
+        let mut voices = vec![test_voice(9, 42), test_voice(9, 46)];
+        voices[0].age_frames = 100;
+        voices[1].age_frames = 200;
+
+        start_midi_voice(&mut voices, 9, 42, 100);
+
+        assert_eq!(voices.len(), 1);
+        assert_eq!(voices[0].key, 42);
+        assert_eq!(voices[0].age_frames, 0);
+    }
+
+    #[test]
+    fn dota_effect_timbre_has_no_sawtooth_wrap_spike() {
+        let steps = 1_024;
+        let mut previous = instrument_sample(119, 0.0);
+        let mut largest_jump = 0.0_f32;
+        for step in 1..=steps {
+            let phase = (step as f32 / steps as f32).fract();
+            let sample = instrument_sample(119, phase);
+            largest_jump = largest_jump.max((sample - previous).abs());
+            previous = sample;
+        }
+
+        assert!(
+            largest_jump < 0.05,
+            "DOTA effect timbre has a discontinuity of {largest_jump:.3}"
+        );
+    }
+
+    #[test]
+    fn dota_title_midi_has_bounded_level_and_noise() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/dota.mrp");
+        let package = crate::Package::open(fixture, crate::ResourceLimits::default()).unwrap();
+        let encoded = package.read_named(b"music_title.mid").unwrap();
+
+        let samples = decode_midi(&encoded).unwrap();
+        let (rms, peak, roughness) = pcm_stats(&samples);
+
+        assert!(
+            (2_000.0..=3_000.0).contains(&rms),
+            "DOTA title MIDI RMS {rms:.1} is outside the bounded mix range"
+        );
+        assert!(peak <= 12_000, "DOTA title MIDI peak {peak} is too loud");
+        assert!(
+            roughness <= 0.22,
+            "DOTA title MIDI roughness {roughness:.4} indicates excessive high-frequency noise"
+        );
+    }
+
+    #[test]
+    fn dota_gameplay_midi_has_bounded_level_and_noise() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/dota.mrp");
+        let package = crate::Package::open(fixture, crate::ResourceLimits::default()).unwrap();
+        let encoded = package.read_named(b"dkljngle.mid").unwrap();
+
+        let samples = decode_midi(&encoded).unwrap();
+        let (rms, peak, roughness) = pcm_stats(&samples);
+        assert!(
+            (2_500.0..=3_500.0).contains(&rms),
+            "DOTA gameplay MIDI RMS {rms:.1} is outside the bounded mix range"
+        );
+        assert!(peak <= 20_000, "DOTA gameplay MIDI peak {peak} is too loud");
+        assert!(
+            roughness <= 0.20,
+            "DOTA gameplay MIDI roughness {roughness:.4} indicates excessive high-frequency noise"
+        );
     }
 
     #[test]
