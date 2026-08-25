@@ -115,6 +115,9 @@ add_library(skyengine-shared SHARED
   "${CMAKE_CURRENT_SOURCE_DIR}/cmake/skyengine_stub.c"
 )
 add_dependencies(skyengine-shared skyengine-rust)
+set_property(TARGET skyengine-shared APPEND PROPERTY
+  LINK_DEPENDS "${SKYENGINE_RUST_STATIC}"
+)
 set_target_properties(skyengine-shared PROPERTIES OUTPUT_NAME skyengine)
 
 if(MSVC)
