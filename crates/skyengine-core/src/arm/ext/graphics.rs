@@ -471,16 +471,24 @@ impl ExtRuntime {
 
     pub(super) fn platform_text_viewer_pointer_action(
         &self,
+        handle: u32,
         x: i32,
         y: i32,
     ) -> Result<PlatformPointerAction> {
+        let Some(viewer) = self.text_viewers.get(&handle) else {
+            return Ok(PlatformPointerAction::None);
+        };
         let (width, height) = self.screen_dimensions()?;
         if x < 0 || y < 0 || x >= width || y >= height {
             return Ok(PlatformPointerAction::None);
         }
         let softkey_top = height.saturating_sub(26);
-        Ok(if y >= softkey_top && x >= width / 2 {
+        Ok(if y < softkey_top {
+            PlatformPointerAction::None
+        } else if x >= width / 2 {
             PlatformPointerAction::TextViewerReturn
+        } else if viewer.style == 1 {
+            PlatformPointerAction::TextViewerAccept
         } else {
             PlatformPointerAction::None
         })
@@ -712,7 +720,7 @@ impl ExtRuntime {
         style: u32,
         services: &mut dyn NativeServices,
     ) -> Result<u32> {
-        if style != 2 {
+        if !matches!(style, 1 | 2) {
             return Err(Error::Abi(format!(
                 "unsupported platform text-viewer style {style}"
             )));
@@ -753,6 +761,7 @@ impl ExtRuntime {
             handle,
             PlatformTextViewer {
                 previous_screen,
+                style,
                 title: title.to_vec(),
                 lines: Self::wrap_platform_text(text, width.saturating_sub(16)),
                 first_visible_line: 0,
@@ -807,11 +816,12 @@ impl ExtRuntime {
         handle: u32,
         services: &mut dyn NativeServices,
     ) -> Result<()> {
-        let (title, lines, first_visible_line) = {
+        let (style, title, lines, first_visible_line) = {
             let viewer = self.text_viewers.get(&handle).ok_or_else(|| {
                 Error::Abi(format!("missing platform text viewer handle {handle}"))
             })?;
             (
+                viewer.style,
                 viewer.title.clone(),
                 viewer.lines.clone(),
                 viewer.first_visible_line,
@@ -847,6 +857,9 @@ impl ExtRuntime {
             green,
         )?;
         self.draw_rectangle_to_screen(0, softkey_top, width, 1, green)?;
+        if style == 1 {
+            self.draw_text_to_screen(&[0x786e, 0x5b9a], 4, softkey_top + 5, green, 0, services)?;
+        }
         self.draw_text_to_screen(
             &[0x8fd4, 0x56de],
             width.saturating_sub(36),

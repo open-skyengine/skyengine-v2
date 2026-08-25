@@ -1042,6 +1042,73 @@ fn platform_menu_pointer_selects_the_hit_item_and_softkey_half() {
 }
 
 #[test]
+fn completed_menu_selection_detaches_the_menu_and_restores_guest_input() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.memory.write_u16(SCREEN_BASE, 0x1234).unwrap();
+    let handle = runtime
+        .create_platform_menu(vec![0x83dc, 0x5355], 1)
+        .unwrap();
+    runtime.menus.get_mut(&handle).unwrap().items = vec![Some(vec![0x5f00, 0x59cb])];
+    let mut services = StubServices;
+    runtime.show_platform_menu(handle, &mut services).unwrap();
+
+    assert_eq!(
+        runtime.route_key_event(20, true, &mut services).unwrap(),
+        Some((4, 0, 0))
+    );
+    assert_eq!(runtime.pending_platform_menu_selection, Some(handle));
+
+    runtime.finish_platform_event(&mut services).unwrap();
+
+    assert!(runtime.active_platform_ui.is_empty());
+    assert_eq!(runtime.pending_platform_menu_selection, None);
+    assert!(runtime.menus[&handle].modal_detached);
+    assert_eq!(runtime.memory.read_u16(SCREEN_BASE).unwrap(), 0x1234);
+    assert_eq!(
+        runtime
+            .route_pointer_event(105, 111, true, &mut services)
+            .unwrap(),
+        Some((2, 105, 111))
+    );
+    assert_eq!(
+        runtime
+            .route_pointer_event(105, 111, false, &mut services)
+            .unwrap(),
+        Some((3, 105, 111))
+    );
+
+    assert!(
+        runtime
+            .refresh_platform_menu(handle, &mut services)
+            .unwrap()
+    );
+    assert_eq!(runtime.active_platform_ui, [ActivePlatformUi::Menu(handle)]);
+    assert!(!runtime.menus[&handle].modal_detached);
+}
+
+#[test]
+fn completed_menu_selection_preserves_a_screen_drawn_by_the_guest_callback() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.memory.write_u16(SCREEN_BASE, 0x1234).unwrap();
+    let handle = runtime.create_platform_menu(Vec::new(), 1).unwrap();
+    runtime.menus.get_mut(&handle).unwrap().items = vec![Some(vec![0x5f00, 0x59cb])];
+    let mut services = StubServices;
+    runtime.show_platform_menu(handle, &mut services).unwrap();
+    assert_eq!(
+        runtime.route_key_event(20, true, &mut services).unwrap(),
+        Some((4, 0, 0))
+    );
+
+    runtime.memory.write_u16(SCREEN_BASE, 0xabcd).unwrap();
+    runtime.finish_platform_event(&mut services).unwrap();
+
+    assert!(runtime.active_platform_ui.is_empty());
+    assert_eq!(runtime.memory.read_u16(SCREEN_BASE).unwrap(), 0xabcd);
+}
+
+#[test]
 fn platform_menu_release_restores_nested_screens_and_invalidates_the_handle() {
     let mut runtime =
         ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -1235,6 +1302,14 @@ fn platform_text_viewer_reports_cancel_then_guest_release_restores_the_screen() 
     assert_eq!(cpu.register(0), 0);
     assert_eq!(runtime.memory.read_u16(SCREEN_BASE).unwrap(), 0);
     assert_eq!(
+        runtime.route_key_event(17, true, &mut services).unwrap(),
+        None
+    );
+    assert_eq!(
+        runtime.route_key_event(17, false, &mut services).unwrap(),
+        None
+    );
+    assert_eq!(
         runtime.route_key_event(18, true, &mut services).unwrap(),
         Some((6, 1, 0))
     );
@@ -1253,6 +1328,79 @@ fn platform_text_viewer_reports_cancel_then_guest_release_restores_the_screen() 
     cpu.set_register(0, handle);
     runtime.dispatch(73, 0, &mut cpu, &mut services).unwrap();
     assert_eq!(cpu.register(0), u32::MAX);
+}
+
+#[test]
+fn platform_text_viewer_accepts_verified_styles_and_rejects_unknown_styles() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let mut services = StubServices;
+
+    for style in [1, 2] {
+        let handle = runtime
+            .create_platform_text_viewer(&[], &[], style, &mut services)
+            .unwrap();
+        assert_eq!(
+            runtime.active_platform_ui,
+            [ActivePlatformUi::TextViewer(handle)]
+        );
+        assert!(
+            runtime
+                .release_platform_text_viewer(handle, &mut services)
+                .unwrap()
+        );
+    }
+
+    assert!(matches!(
+        runtime.create_platform_text_viewer(&[], &[], 3, &mut services),
+        Err(Error::Abi(message)) if message == "unsupported platform text-viewer style 3"
+    ));
+    assert!(runtime.text_viewers.is_empty());
+    assert!(runtime.active_platform_ui.is_empty());
+}
+
+#[test]
+fn platform_text_viewer_style_one_routes_confirm_and_return_actions() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let mut services = StubServices;
+    let handle = runtime
+        .create_platform_text_viewer(&[], &[], 1, &mut services)
+        .unwrap();
+
+    for code in [17, 20] {
+        assert_eq!(
+            runtime.route_key_event(code, true, &mut services).unwrap(),
+            Some((6, 0, 0))
+        );
+        assert_eq!(
+            runtime.route_key_event(code, false, &mut services).unwrap(),
+            None
+        );
+    }
+
+    runtime
+        .route_pointer_event(20, 306, true, &mut services)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .route_pointer_event(20, 306, false, &mut services)
+            .unwrap(),
+        Some((6, 0, 0))
+    );
+    runtime
+        .route_pointer_event(220, 306, true, &mut services)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .route_pointer_event(220, 306, false, &mut services)
+            .unwrap(),
+        Some((6, 1, 0))
+    );
+    assert_eq!(
+        runtime.active_platform_ui,
+        [ActivePlatformUi::TextViewer(handle)]
+    );
 }
 
 #[test]

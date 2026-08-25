@@ -292,14 +292,17 @@ impl Runtime {
                 if let Some((event, parameter0, parameter1)) =
                     self.vm.route_key_event(code, pressed)?
                 {
-                    self.vm.call_global(
+                    let result = self.vm.call_global(
                         b"dealevent",
                         vec![
                             Value::Number(f64::from(event)),
                             Value::Number(f64::from(parameter0)),
                             Value::Number(f64::from(parameter1)),
                         ],
-                    )?;
+                    );
+                    let finish_result = self.vm.finish_platform_event();
+                    result?;
+                    finish_result?;
                 }
                 self.apply_lifecycle_request()?;
             }
@@ -307,14 +310,17 @@ impl Runtime {
                 if let Some((event, parameter0, parameter1)) =
                     self.vm.route_pointer_event(x, y, pressed)?
                 {
-                    self.vm.call_global(
+                    let result = self.vm.call_global(
                         b"dealevent",
                         vec![
                             Value::Number(f64::from(event)),
                             Value::Number(f64::from(parameter0)),
                             Value::Number(f64::from(parameter1)),
                         ],
-                    )?;
+                    );
+                    let finish_result = self.vm.finish_platform_event();
+                    result?;
+                    finish_result?;
                 }
                 self.apply_lifecycle_request()?;
             }

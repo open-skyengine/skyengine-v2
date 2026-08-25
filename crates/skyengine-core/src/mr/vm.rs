@@ -229,8 +229,12 @@ impl MrVm {
         let event = self.host.route_key_event(code, pressed)?;
         if self.native_entry {
             if let Some((event, parameter0, parameter1)) = event {
-                self.host
-                    .dispatch_native_event(event, parameter0, parameter1)?;
+                let result = self
+                    .host
+                    .dispatch_native_event(event, parameter0, parameter1);
+                let finish_result = self.host.finish_platform_event();
+                result?;
+                finish_result?;
             }
             Ok(None)
         } else {
@@ -247,8 +251,12 @@ impl MrVm {
         let event = self.host.route_pointer_event(x, y, pressed)?;
         if self.native_entry {
             if let Some((event, parameter0, parameter1)) = event {
-                self.host
-                    .dispatch_native_event(event, parameter0, parameter1)?;
+                let result = self
+                    .host
+                    .dispatch_native_event(event, parameter0, parameter1);
+                let finish_result = self.host.finish_platform_event();
+                result?;
+                finish_result?;
             }
             Ok(None)
         } else {
@@ -284,6 +292,10 @@ impl MrVm {
 
     pub fn active_editor_text(&self) -> Option<String> {
         self.host.active_editor_text()
+    }
+
+    pub fn finish_platform_event(&mut self) -> Result<()> {
+        self.host.finish_platform_event()
     }
 
     fn run_frames(&mut self) -> Result<()> {

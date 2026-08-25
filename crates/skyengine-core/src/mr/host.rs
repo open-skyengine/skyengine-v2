@@ -576,6 +576,29 @@ impl MrHost {
             .and_then(ExtRuntime::active_editor_text)
     }
 
+    pub fn finish_platform_event(&mut self) -> Result<()> {
+        let Some(mut runtime) = self.ext_runtime.take() else {
+            return Ok(());
+        };
+        let result = {
+            let mut services = PackageServices {
+                package: self.package.clone(),
+                work_dir: self.work_dir.clone(),
+                directory_searches: &mut self.directory_searches,
+                next_directory_handle: &mut self.next_directory_handle,
+                files: &mut self.native_files,
+                next_file_handle: &mut self.next_native_file_handle,
+                font: &self.font,
+                framebuffer: &mut self.framebuffer,
+                display: self.display.as_mut(),
+                audio: self.audio.as_mut(),
+            };
+            runtime.finish_platform_event(&mut services)
+        };
+        self.ext_runtime = Some(runtime);
+        result
+    }
+
     pub fn dispatch_native_event(
         &mut self,
         event: i32,

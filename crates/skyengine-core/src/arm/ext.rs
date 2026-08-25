@@ -413,6 +413,7 @@ struct PlatformDialog {
 #[derive(Debug)]
 struct PlatformTextViewer {
     previous_screen: Vec<u8>,
+    style: u32,
     title: Vec<u16>,
     lines: Vec<Vec<u16>>,
     first_visible_line: usize,
@@ -456,6 +457,7 @@ enum PlatformPointerAction {
     MenuReturn,
     DialogAccept,
     DialogCancel,
+    TextViewerAccept,
     TextViewerReturn,
 }
 
@@ -1138,8 +1140,15 @@ impl ExtRuntime {
                     self.move_platform_text_viewer(handle, 1, services)?;
                     Ok(None)
                 }
-                // Text viewers report the same dialog result ABI. The guest
-                // releases the viewer through slot 73 after receiving cancel.
+                // Style 1 exposes both callbacks; style 2 is a read-only viewer.
+                17 | 20
+                    if self
+                        .text_viewers
+                        .get(&handle)
+                        .is_some_and(|viewer| viewer.style == 1) =>
+                {
+                    Ok(Some((6, 0, 0)))
+                }
                 16 | 18 => Ok(Some((6, 1, 0))),
                 _ => Ok(None),
             },
@@ -1204,8 +1213,8 @@ impl ExtRuntime {
                     action
                 }
                 ActivePlatformUi::Dialog(_) => self.platform_dialog_pointer_action(x, y)?,
-                ActivePlatformUi::TextViewer(_) => {
-                    self.platform_text_viewer_pointer_action(x, y)?
+                ActivePlatformUi::TextViewer(handle) => {
+                    self.platform_text_viewer_pointer_action(handle, x, y)?
                 }
                 ActivePlatformUi::Editor(_) => PlatformPointerAction::None,
             };
@@ -1225,7 +1234,9 @@ impl ExtRuntime {
         let released_action = match capture.ui {
             ActivePlatformUi::Menu(handle) => self.platform_menu_pointer_action(handle, x, y)?,
             ActivePlatformUi::Dialog(_) => self.platform_dialog_pointer_action(x, y)?,
-            ActivePlatformUi::TextViewer(_) => self.platform_text_viewer_pointer_action(x, y)?,
+            ActivePlatformUi::TextViewer(handle) => {
+                self.platform_text_viewer_pointer_action(handle, x, y)?
+            }
             ActivePlatformUi::Editor(_) => PlatformPointerAction::None,
         };
         if released_action != capture.action {
@@ -1241,6 +1252,7 @@ impl ExtRuntime {
             PlatformPointerAction::MenuReturn => Some((5, 0, 0)),
             PlatformPointerAction::DialogAccept => Some((6, 1, 0)),
             PlatformPointerAction::DialogCancel => Some((6, 0, 0)),
+            PlatformPointerAction::TextViewerAccept => Some((6, 0, 0)),
             PlatformPointerAction::TextViewerReturn => Some((6, 1, 0)),
             PlatformPointerAction::None => None,
         })
@@ -1248,6 +1260,43 @@ impl ExtRuntime {
 
     pub fn route_pointer_move(&self, x: i32, y: i32) -> Option<(i32, i32, i32)> {
         self.active_platform_ui.is_empty().then_some((12, x, y))
+    }
+
+    pub fn finish_platform_event(&mut self, services: &mut dyn NativeServices) -> Result<()> {
+        let Some(handle) = self.pending_platform_menu_selection.take() else {
+            return Ok(());
+        };
+        let ui = ActivePlatformUi::Menu(handle);
+        if self.active_platform_ui.last().copied() != Some(ui) {
+            return Ok(());
+        }
+        self.active_platform_ui.pop();
+        if self
+            .platform_pointer_capture
+            .is_some_and(|capture| capture.ui == ui)
+        {
+            self.platform_pointer_capture = None;
+        }
+        let screens = self.menus.get(&handle).and_then(|menu| {
+            Some((
+                menu.menu_screen.as_ref()?.clone(),
+                menu.previous_screen.as_ref()?.clone(),
+            ))
+        });
+        let restore_screen = if let Some((menu_screen, previous_screen)) = screens {
+            (self.memory.read(SCREEN_BASE, menu_screen.len())? == menu_screen)
+                .then_some(previous_screen)
+        } else {
+            None
+        };
+        if let Some(menu) = self.menus.get_mut(&handle) {
+            menu.modal_detached = menu.previous_screen.is_some();
+        }
+        if let Some(previous_screen) = restore_screen {
+            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.present_screen(services)?;
+        }
+        Ok(())
     }
 
     fn lifecycle_state(&self) -> Result<ExtLifecycleState> {
