@@ -31,6 +31,7 @@ struct EngineConfig {
     memory_limit: u32,
     device_date: DeviceDate,
     work_dir: PathBuf,
+    sound_font_path: Option<PathBuf>,
     dns_mappings: Vec<DnsMapping>,
     image_processing_mode: i32,
 }
@@ -44,6 +45,7 @@ impl Default for EngineConfig {
             memory_limit: DEFAULT_MEMORY_MB as u32 * 1024 * 1024,
             device_date: DeviceDate::default(),
             work_dir: PathBuf::from("."),
+            sound_font_path: None,
             dns_mappings: Vec::new(),
             image_processing_mode: 0,
         }
@@ -84,7 +86,12 @@ struct Shared {
 }
 
 impl Shared {
+    #[cfg(test)]
     fn new(width: u16, height: u16) -> Self {
+        Self::with_audio(width, height, AudioPlayer::default())
+    }
+
+    fn with_audio(width: u16, height: u16, audio: AudioPlayer) -> Self {
         Self {
             state: Mutex::new(SharedState {
                 events: VecDeque::new(),
@@ -100,7 +107,7 @@ impl Shared {
                 last_error: None,
             }),
             wake: Condvar::new(),
-            audio: AudioPlayer::default(),
+            audio,
         }
     }
 
@@ -415,7 +422,19 @@ fn worker_main(
 }
 
 fn spawn_worker(config: EngineConfig, app_path: PathBuf, entry: Vec<u8>) -> Result<Worker, String> {
-    let shared = Arc::new(Shared::new(config.width, config.height));
+    let audio = match &config.sound_font_path {
+        Some(path) => {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                config.work_dir.join(path)
+            };
+            AudioPlayer::with_sound_font_file(&path)
+                .map_err(|error| format!("failed to load SoundFont {}: {error}", path.display()))?
+        }
+        None => AudioPlayer::default(),
+    };
+    let shared = Arc::new(Shared::with_audio(config.width, config.height, audio));
     let thread_shared = shared.clone();
     let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
     let thread = thread::Builder::new()
@@ -571,6 +590,28 @@ pub unsafe extern "C" fn skyengine_api_set_work_dir(path: *const c_char) -> i32 
             return Err("work directory can only be set after init and before start".into());
         }
         engine.config.work_dir = PathBuf::from(path);
+        clear_last_error(&mut engine);
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `path` must point to a readable, NUL-terminated UTF-8 string for the
+/// duration of this call. Relative paths are resolved from the work directory.
+pub unsafe extern "C" fn skyengine_api_set_sound_font(path: *const c_char) -> i32 {
+    ffi_result(|| {
+        // SAFETY: This function's C contract requires a valid path string.
+        let path = unsafe { required_string(path, "SoundFont path") }?;
+        if path.is_empty() {
+            return Err("SoundFont path must not be empty".into());
+        }
+        let mut engine = lock(&ENGINE);
+        if !engine.config.initialized || engine.worker.is_some() {
+            return Err("SoundFont can only be set after init and before start".into());
+        }
+        engine.config.sound_font_path = Some(PathBuf::from(path));
         clear_last_error(&mut engine);
         Ok(0)
     })
@@ -1061,8 +1102,14 @@ mod tests {
         let work_dir = safe_c_string(&fixture_root.to_string_lossy());
         let app_path = safe_c_string("mythroad/dsm_gm.mrp");
         let entry = safe_c_string("start.mr");
+        let empty_sound_font = safe_c_string("");
 
         assert_eq!(skyengine_api_init(240, 320), 0);
+        // SAFETY: The test-owned C string lives for the duration of this call.
+        assert_eq!(
+            unsafe { skyengine_api_set_sound_font(empty_sound_font.as_ptr()) },
+            -1
+        );
         // SAFETY: The test-owned C strings live for the duration of each call.
         assert_eq!(unsafe { skyengine_api_set_work_dir(work_dir.as_ptr()) }, 0);
         // SAFETY: The test-owned C strings live for the duration of this call.

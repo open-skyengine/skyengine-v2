@@ -36,6 +36,15 @@ pub struct SdlDisplay {
 
 impl SdlDisplay {
     pub fn new(width: u16, height: u16, scale: u32) -> Result<Self> {
+        Self::with_audio_player(width, height, scale, AudioPlayer::default())
+    }
+
+    pub fn with_audio_player(
+        width: u16,
+        height: u16,
+        scale: u32,
+        audio: AudioPlayer,
+    ) -> Result<Self> {
         let sdl = sdl2::init().map_err(Error::Platform)?;
         let video = sdl.video().map_err(Error::Platform)?;
         let window = video
@@ -73,7 +82,6 @@ impl SdlDisplay {
             .set_logical_size(u32::from(width), u32::from(height))
             .map_err(|error| Error::Platform(error.to_string()))?;
         let events = sdl.event_pump().map_err(Error::Platform)?;
-        let audio = AudioPlayer::default();
         let audio_device = sdl
             .audio()
             .and_then(|subsystem| {

@@ -560,6 +560,11 @@ ABI dispatcher 依赖这些抽象，而不依赖 SDL2 或宿主原生句柄。�
 停止和 `0..5` 音量状态。解码后的音频长度、MP3 工作集、MIDI 事件数和同时发声数均
 有固定上限，畸形或超限资源不得造成无界分配。
 
+可输出宿主可注入一个不超过 128 MiB 的 SF2 GM bank。配置后由 `rustysynth` 负责 MIDI
+sequencing 与 SoundFont 合成；未配置时使用 core 内置的无采样兼容合成器。SF2 属于宿主
+资源而不是 MRP guest 文件，CLI 通过 `--sound-font`/`SKYENGINE_SOUNDFONT` 配置，C ABI
+通过 `skyengine_api_set_sound_font` 在启动前配置。
+
 SDL 后端由音频回调消费 PCM；Flutter/C ABI 后端通过
 `skyengine_api_audio_render_s16le` 拉取同一格式。应用替换、退出或显式停止时清除当前
 音轨。headless 后端注入 `SilentAudio`，接受已验证的 guest 请求但不解码、不播放，

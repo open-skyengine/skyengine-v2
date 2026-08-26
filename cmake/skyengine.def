@@ -4,6 +4,7 @@ EXPORTS
   skyengine_api_set_memory
   skyengine_api_set_device_date
   skyengine_api_set_work_dir
+  skyengine_api_set_sound_font
   skyengine_api_set_dns_map
   skyengine_api_start
   skyengine_api_destroy

@@ -79,6 +79,12 @@ rustup target add aarch64-linux-android armv7-linux-androideabi
 以保证 E2E 时序确定。振动和动作传感器符号保留 ABI 兼容性，但由于当前没有对应的宿主
 传感器或输出服务，它们会报告为未启用。
 
+桌面运行可用 `--sound-font FILE.sf2`（或 `SKYENGINE_SOUNDFONT`）选择 GM SoundFont，
+由 `rustysynth` 处理 MIDI 序列、乐器采样、鼓组、控制器和效果。未配置 SF2 时继续使用
+内置的无采样兼容合成器。C ABI 宿主可在 `skyengine_api_init` 之后、
+`skyengine_api_start` 之前调用 `skyengine_api_set_sound_font`；相对路径从 work directory
+解析。SoundFont 文件上限为 128 MiB。
+
 在没有窗口服务器的环境中测试 SDL 渲染器：
 
 ```bash

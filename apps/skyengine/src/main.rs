@@ -11,8 +11,8 @@ use std::{
 
 use serde_json::json;
 use skyengine_core::{
-    DeviceDate, DnsMapping, Framebuffer, Package, PlatformDisplay, ResourceLimits, Result, Runtime,
-    RuntimeConfig,
+    AudioPlayer, DeviceDate, DnsMapping, Framebuffer, Package, PlatformDisplay, ResourceLimits,
+    Result, Runtime, RuntimeConfig,
 };
 use skyengine_sdl::SdlDisplay;
 
@@ -91,6 +91,8 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     let entry = take_option(&mut args, "--entry")?.unwrap_or_else(|| "start.mr".into());
     let work_dir = take_option(&mut args, "--work-dir")?.unwrap_or_else(|| ".".into());
     let font = take_option(&mut args, "--font")?;
+    let sound_font =
+        take_option(&mut args, "--sound-font")?.or_else(|| env::var("SKYENGINE_SOUNDFONT").ok());
     let screen = take_option(&mut args, "--screen")?.unwrap_or_else(|| "240x320".into());
     let memory = take_option(&mut args, "--memory")?.unwrap_or_else(|| "1M".into());
     let dns_map = take_option(&mut args, "--dns-map")?;
@@ -140,7 +142,7 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
                 if e2e_sdl_preview_enabled(env::var_os("SDL_VIDEODRIVER").as_deref()) {
                     // Initialize SDL before binding the E2E socket so a failed preview
                     // does not leave a detached control-server thread behind.
-                    let preview = SdlDisplay::new(width, height, 2)?;
+                    let preview = create_sdl_display(width, height, sound_font.as_deref())?;
                     let audio = preview.audio_player();
                     let control = e2e::E2eDisplay::new(PathBuf::from(socket_path), width, height)?;
                     let display = Box::new(E2eSdlDisplay { control, preview });
@@ -167,13 +169,21 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
         }
     }
 
-    let display = SdlDisplay::new(width, height, 2)?;
+    let display = create_sdl_display(width, height, sound_font.as_deref())?;
     let audio = display.audio_player();
     match audio {
         Some(audio) => Runtime::load_with_audio(config, Box::new(display), Box::new(audio))?,
         None => Runtime::load(config, Box::new(display))?,
     }
     .run()
+}
+
+fn create_sdl_display(width: u16, height: u16, sound_font: Option<&str>) -> Result<SdlDisplay> {
+    let audio = match sound_font {
+        Some(path) => AudioPlayer::with_sound_font_file(path)?,
+        None => AudioPlayer::default(),
+    };
+    SdlDisplay::with_audio_player(width, height, 2, audio)
 }
 
 fn e2e_sdl_preview_enabled(video_driver: Option<&OsStr>) -> bool {
@@ -406,6 +416,7 @@ fn print_help() {
          Usage:\n  \
          skyengine inspect [--json] <app.mrp>\n  \
          skyengine run [--entry NAME] [--work-dir DIR] [--font FILE]\n  \
+                       [--sound-font FILE.sf2]\n  \
                        [--screen WIDTHxHEIGHT] [--memory SIZE] [--dns-map MAP]\n  \
                        [--device-date YYYY-M-D|host]\n  \
                        [--headless]\n  \
@@ -413,6 +424,7 @@ fn print_help() {
          skyengine [run options] <app.mrp>\n\n\
          --work-dir is the device root; installed MRP files live in mythroad/.\n  \
          Relative font paths are resolved from --work-dir.\n  \
+         --sound-font selects an SF2 GM bank; SKYENGINE_SOUNDFONT is the fallback.\n  \
          DNS MAP is a semicolon-separated SOURCE->IPv4[:PORT] list.\n  \
          DNS MAP maps the default Skymobi hosts to 159.75.119.124.\n  \
          Connections to 10.0.0.172 use the built-in WAP proxy unless explicitly mapped.\n  \

@@ -17,6 +17,8 @@ SKYENGINE_EXPORT int32_t skyengine_api_init(int32_t width, int32_t height);
 SKYENGINE_EXPORT int32_t skyengine_api_set_memory(int32_t memory_mb);
 SKYENGINE_EXPORT int32_t skyengine_api_set_device_date(const char *date);
 SKYENGINE_EXPORT int32_t skyengine_api_set_work_dir(const char *path);
+/* Sets an SF2 General MIDI bank before start. Relative paths use the work directory. */
+SKYENGINE_EXPORT int32_t skyengine_api_set_sound_font(const char *path);
 SKYENGINE_EXPORT int32_t skyengine_api_set_dns_map(const char *mappings);
 SKYENGINE_EXPORT int32_t skyengine_api_start(
     const char *mrp_path,
