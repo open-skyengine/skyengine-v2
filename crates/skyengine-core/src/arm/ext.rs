@@ -99,6 +99,7 @@ const MAX_PENDING_PLATFORM_MENU_RETURNS: usize = 1024;
 const MAX_PENDING_SMS_RESULTS: usize = 32;
 const MAX_GUEST_ALLOCATION_VIEWS: usize = 256;
 const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const NETWORK_FIRST_RECEIVE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PENDING_EXTERNAL_ACTIONS: usize = 32;
 const LEGACY_EXTERNAL_ACTION_KINDS: [u32; 1] = [2];
 
@@ -557,11 +558,19 @@ enum NativeSocketState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSocketReceiveMode {
+    BeforeSend,
+    WaitForFirstResponse,
+    Polling,
+}
+
 #[derive(Debug)]
 struct NativeSocket {
     state: NativeSocketState,
     endpoint: Option<SocketAddrV4>,
     pending_http_request: Option<Vec<u8>>,
+    receive_mode: NativeSocketReceiveMode,
 }
 
 #[derive(Debug)]

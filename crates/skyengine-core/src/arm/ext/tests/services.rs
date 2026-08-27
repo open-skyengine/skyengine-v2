@@ -1396,7 +1396,10 @@ fn native_stream_socket_connects_polls_and_transfers_on_loopback() {
         let mut request = [0_u8; 4];
         stream.read_exact(&mut request).unwrap();
         assert_eq!(&request, b"ping");
+        thread::sleep(Duration::from_millis(50));
         stream.write_all(b"pong").unwrap();
+        thread::sleep(Duration::from_millis(250));
+        stream.write_all(b"done").unwrap();
     });
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -1467,6 +1470,29 @@ fn native_stream_socket_connects_polls_and_transfers_on_loopback() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(runtime.memory.read(output, 4).unwrap(), b"pong");
+
+    let poll_started = Instant::now();
+    cpu.set_register(0, handle);
+    cpu.set_register(1, output.0);
+    cpu.set_register(2, 4);
+    runtime
+        .dispatch(87, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0) as i32, -1);
+    assert!(
+        poll_started.elapsed() < Duration::from_millis(100),
+        "receive stopped polling after the initial response"
+    );
+
+    thread::sleep(Duration::from_millis(300));
+    cpu.set_register(0, handle);
+    cpu.set_register(1, output.0);
+    cpu.set_register(2, 4);
+    runtime
+        .dispatch(87, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 4);
+    assert_eq!(runtime.memory.read(output, 4).unwrap(), b"done");
 
     cpu.set_register(0, handle);
     runtime
@@ -1660,6 +1686,27 @@ fn platform_motion_initialization_uses_the_silent_headless_provider() {
     assert!(matches!(
         runtime.dispatch(37, 0, &mut cpu, &mut StubServices),
         Err(Error::Abi(message)) if message.contains("command (4005, 1)")
+    ));
+}
+
+#[test]
+fn platform_talkcat_device_effect_accepts_only_the_observed_mode() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 1_211);
+    cpu.set_register(1, 3);
+
+    runtime
+        .dispatch(37, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 0);
+
+    cpu.set_register(0, 1_211);
+    cpu.set_register(1, 2);
+    assert!(matches!(
+        runtime.dispatch(37, 0, &mut cpu, &mut StubServices),
+        Err(Error::Abi(message)) if message.contains("command (1211, 2)")
     ));
 }
 

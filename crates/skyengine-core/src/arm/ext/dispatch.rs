@@ -217,6 +217,9 @@ impl ExtRuntime {
                 // Initialize the motion-event provider. The deterministic headless
                 // profile accepts registration but emits no sensor samples.
                 (1_206, 0) => cpu.set_register(0, 0),
+                // Optional device effect used by talkcat's fart action. The
+                // deterministic headless profile has no effect provider.
+                (1_211, 3) => cpu.set_register(0, 0),
                 // Query and configure the same deterministic motion provider.
                 // Mode 2 is the verified event-driven form used after startup.
                 (4_002, 0) | (4_005, 2) => cpu.set_register(0, 0),

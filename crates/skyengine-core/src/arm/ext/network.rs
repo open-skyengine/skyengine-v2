@@ -195,6 +195,7 @@ impl ExtRuntime {
                     state: NativeSocketState::Created,
                     endpoint: None,
                     pending_http_request: Some(Vec::new()),
+                    receive_mode: NativeSocketReceiveMode::BeforeSend,
                 });
                 return Ok(Some(handle));
             }
@@ -287,9 +288,29 @@ impl ExtRuntime {
             return None;
         };
         let mut bytes = vec![0; len];
-        let read = stream.read(&mut bytes).ok()?;
-        bytes.truncate(read);
-        Some(bytes)
+        let deadline = (socket.receive_mode == NativeSocketReceiveMode::WaitForFirstResponse)
+            .then(|| Instant::now() + NETWORK_FIRST_RECEIVE_TIMEOUT);
+        socket.receive_mode = NativeSocketReceiveMode::Polling;
+        loop {
+            match stream.read(&mut bytes) {
+                Ok(read) => {
+                    bytes.truncate(read);
+                    return Some(bytes);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if deadline.is_some_and(|deadline| Instant::now() < deadline) {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    return None;
+                }
+                Err(_) => {
+                    socket.state = NativeSocketState::Failed;
+                    return None;
+                }
+            }
+        }
     }
 
     pub(super) fn send_native_socket(&mut self, handle: i32, bytes: &[u8]) -> Option<usize> {
@@ -301,7 +322,13 @@ impl ExtRuntime {
             let NativeSocketState::Connected(stream) = &mut socket.state else {
                 return None;
             };
-            return stream.write(bytes).ok();
+            let written = stream.write(bytes).ok();
+            if written.is_some_and(|written| written != 0)
+                && socket.receive_mode == NativeSocketReceiveMode::BeforeSend
+            {
+                socket.receive_mode = NativeSocketReceiveMode::WaitForFirstResponse;
+            }
+            return written;
         }
 
         let pending = socket.pending_http_request.as_mut()?;
@@ -346,6 +373,9 @@ impl ExtRuntime {
                 socket.state = NativeSocketState::Failed;
                 return None;
             }
+            if socket.receive_mode == NativeSocketReceiveMode::BeforeSend {
+                socket.receive_mode = NativeSocketReceiveMode::WaitForFirstResponse;
+            }
             return Some(bytes.len());
         }
 
@@ -363,6 +393,9 @@ impl ExtRuntime {
                     SocketAddr::V6(_) => unreachable!(),
                 };
                 socket.state = NativeSocketState::Connected(stream);
+                if socket.receive_mode == NativeSocketReceiveMode::BeforeSend {
+                    socket.receive_mode = NativeSocketReceiveMode::WaitForFirstResponse;
+                }
             }
             Err(_) => {
                 socket.state = NativeSocketState::Failed;
