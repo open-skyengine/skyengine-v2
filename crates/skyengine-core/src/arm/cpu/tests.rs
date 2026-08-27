@@ -101,6 +101,44 @@ fn long_multiply_supports_signed_results_and_accumulation() {
 }
 
 #[test]
+fn signed_halfword_multiply_selects_each_half_and_accumulates() {
+    let mut memory = code_memory(&[
+        0xe160_0584, // smulbb r0, r4, r5
+        0xe161_05c4, // smulbt r1, r4, r5
+        0xe162_05a4, // smultb r2, r4, r5
+        0xe163_05e4, // smultt r3, r4, r5
+        0xe100_6584, // smlabb r0, r4, r5, r6
+    ]);
+    let mut cpu = ArmCpu::new();
+    cpu.set_pc(0x1000);
+    cpu.set_register(4, 0xfff9_fffd); // top = -7, bottom = -3
+    cpu.set_register(5, 0xfffe_0004); // top = -2, bottom = 4
+    cpu.set_register(6, 20);
+
+    for _ in 0..5 {
+        cpu.step(&mut memory).unwrap();
+    }
+
+    assert_eq!(cpu.register(0), 8);
+    assert_eq!(cpu.register(1), 6);
+    assert_eq!(cpu.register(2), (-28_i32) as u32);
+    assert_eq!(cpu.register(3), 14);
+}
+
+#[test]
+fn signed_halfword_multiply_executes_gms_icon_offset_instruction() {
+    let mut memory = code_memory(&[0xe160_008c]); // smulbb r0, r12, r0
+    let mut cpu = ArmCpu::new();
+    cpu.set_pc(0x1000);
+    cpu.set_register(0, 22);
+    cpu.set_register(12, 25);
+
+    cpu.step(&mut memory).unwrap();
+
+    assert_eq!(cpu.register(0), 550);
+}
+
+#[test]
 fn thumb_arithmetic_and_conditional_branch_follow_pipeline_pc() {
     let mut memory = thumb_code_memory(&[
         0x2001, // movs r0, #1

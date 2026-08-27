@@ -109,6 +109,12 @@ impl ArmCpu {
             self.set_pc(target);
             return Ok(());
         }
+        if instruction & 0x0ff0_0090 == 0x0100_0080 {
+            return self.signed_halfword_multiply(instruction, address, true);
+        }
+        if instruction & 0x0ff0_f090 == 0x0160_0080 {
+            return self.signed_halfword_multiply(instruction, address, false);
+        }
         if instruction & 0x0fc0_00f0 == 0x0000_0090 {
             return self.multiply(instruction, address);
         }
@@ -290,6 +296,32 @@ impl ArmCpu {
             self.negative = result & 0x8000_0000 != 0;
             self.zero = result == 0;
         }
+        Ok(())
+    }
+
+    fn signed_halfword_multiply(
+        &mut self,
+        instruction: u32,
+        address: u32,
+        accumulate: bool,
+    ) -> Result<()> {
+        let rd = ((instruction >> 16) & 0xf) as usize;
+        let rn = ((instruction >> 12) & 0xf) as usize;
+        let rs = ((instruction >> 8) & 0xf) as usize;
+        let rm = (instruction & 0xf) as usize;
+        if rd == 15 || rs == 15 || rm == 15 || (accumulate && rn == 15) {
+            return Err(Error::ArmFault(format!(
+                "signed halfword multiply uses PC at {address:#010x}"
+            )));
+        }
+        let first = signed_halfword(self.registers[rm], instruction & (1 << 5) != 0);
+        let second = signed_halfword(self.registers[rs], instruction & (1 << 6) != 0);
+        let product = i32::from(first).wrapping_mul(i32::from(second)) as u32;
+        self.registers[rd] = if accumulate {
+            product.wrapping_add(self.registers[rn])
+        } else {
+            product
+        };
         Ok(())
     }
 
@@ -1010,6 +1042,11 @@ fn add_with_carry(left: u32, right: u32, carry: bool) -> (u32, bool, bool) {
         unsigned > u64::from(u32::MAX),
         signed < i64::from(i32::MIN) || signed > i64::from(i32::MAX),
     )
+}
+
+fn signed_halfword(value: u32, top: bool) -> i16 {
+    let halfword = if top { value >> 16 } else { value };
+    halfword as u16 as i16
 }
 
 fn shift_immediate(value: u32, shift_type: u8, amount: u32, carry: bool) -> (u32, bool) {

@@ -16,6 +16,24 @@ function countMatchingPixels(
   return count;
 }
 
+function countDifferentPixels(
+  image: PpmImage,
+  left: { x: number; y: number },
+  right: { x: number; y: number },
+  width: number,
+  height: number,
+): number {
+  let count = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const leftPixel = image.pixel(left.x + x, left.y + y);
+      const rightPixel = image.pixel(right.x + x, right.y + y);
+      if (leftPixel.some((channel, index) => channel !== rightPixel[index])) count++;
+    }
+  }
+  return count;
+}
+
 const SMS_SUCCESS_TEXT_POINTS = [
   [42, 21],
   [83, 21],
@@ -86,13 +104,20 @@ describe("gms 短信付费", () => {
       await engine.key('RIGHT_SOFT', 1_000)
       await engine.delay(1_000);
       const afterSecondRight = await engine.screen("store-icon");
-      const goldIconPixels = countMatchingPixels(
-        afterSecondRight,
-        { x: 28, y: 42, width: 28, height: 28 },
-        pixel => pixel[0] === 216 && pixel[1] === 160 && pixel[2] === 88,
-      );
-      expect(goldIconPixels).toBeGreaterThan(50);
-      expect(afterSecondRight.pixel(36, 55)).toEqual([0, 0, 0]);
+      const itemIcons = [
+        { x: 32, y: 45 },
+        { x: 139, y: 45 },
+        { x: 32, y: 83 },
+      ] as const;
+      expect(
+        countDifferentPixels(afterSecondRight, itemIcons[0], itemIcons[1], 22, 22),
+      ).toBeGreaterThan(50);
+      expect(
+        countDifferentPixels(afterSecondRight, itemIcons[0], itemIcons[2], 22, 22),
+      ).toBeGreaterThan(50);
+      expect(
+        countDifferentPixels(afterSecondRight, itemIcons[1], itemIcons[2], 22, 22),
+      ).toBeGreaterThan(50);
       {   
         // 进入付费界面
         await engine.key('LEFT_SOFT', 1_000)
