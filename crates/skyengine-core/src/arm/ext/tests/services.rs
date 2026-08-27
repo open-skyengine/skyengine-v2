@@ -1690,6 +1690,13 @@ fn platform_audio_volume_accepts_supported_levels() {
 fn platform_sms_uses_a_bounded_headless_sink() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let mut register = ArmCpu::new();
+    register.set_register(0, runtime.modules[0].base.0 + 8);
+    register.set_register(1, 20);
+    runtime
+        .dispatch(25, 0, &mut register, &mut StubServices)
+        .unwrap();
     let number = runtime.allocate(9, 1).unwrap();
     let message = runtime.allocate(24, 1).unwrap();
     runtime.memory.write(number, b"10668001\0").unwrap();
@@ -1706,6 +1713,24 @@ fn platform_sms_uses_a_bounded_headless_sink() {
         .dispatch(59, 0, &mut cpu, &mut StubServices)
         .unwrap();
     assert_eq!(cpu.register(0), 0);
+    let completion = runtime.pending_sms_results.front().unwrap();
+    assert_eq!(completion.owner_generation, runtime.modules[0].generation);
+    let helper = runtime.modules[0].helper.unwrap();
+    assert_eq!(completion.helper.module, helper.module);
+    assert_eq!(completion.helper.address, helper.address);
+    assert_eq!(completion.result, 0);
+
+    assert!(
+        runtime
+            .dispatch_pending_platform_event(&mut StubServices)
+            .unwrap()
+    );
+    assert!(runtime.pending_sms_results.is_empty());
+    assert!(
+        !runtime
+            .dispatch_pending_platform_event(&mut StubServices)
+            .unwrap()
+    );
 
     cpu.set_register(0, number.0);
     cpu.set_register(1, message.0);
@@ -1714,6 +1739,7 @@ fn platform_sms_uses_a_bounded_headless_sink() {
         .dispatch(59, 0, &mut cpu, &mut StubServices)
         .unwrap();
     assert_eq!(cpu.register(0) as i32, -1);
+    assert!(runtime.pending_sms_results.is_empty());
 }
 
 #[test]

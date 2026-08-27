@@ -638,9 +638,22 @@ impl ExtRuntime {
                     return Ok(());
                 }
                 // Consume the bounded request without exposing a host messaging
-                // capability. The deterministic headless provider only reports
-                // acceptance so callers can exercise their local result path.
+                // capability. The deterministic headless provider reports both
+                // synchronous acceptance and an asynchronous successful result.
                 let _ = self.memory.read(message, message_len)?;
+                if let Some(context) = self.modules.get(module) {
+                    if self.pending_sms_results.len() >= MAX_PENDING_SMS_RESULTS {
+                        cpu.set_register(0, u32::MAX);
+                        return Ok(());
+                    }
+                    if let Some(helper) = context.helper {
+                        self.pending_sms_results.push_back(PendingSmsResult {
+                            owner_generation: context.generation,
+                            helper,
+                            result: 0,
+                        });
+                    }
+                }
                 cpu.set_register(0, 0);
             }
             61 => {

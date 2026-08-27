@@ -96,6 +96,7 @@ const MAX_PLATFORM_UI_HANDLES: usize = 64;
 const MAX_PLATFORM_MENU_ITEMS: usize = 1024;
 const MAX_PLATFORM_EDITOR_CODE_UNITS: usize = 4096;
 const MAX_PENDING_PLATFORM_MENU_RETURNS: usize = 1024;
+const MAX_PENDING_SMS_RESULTS: usize = 32;
 const MAX_GUEST_ALLOCATION_VIEWS: usize = 256;
 const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PENDING_EXTERNAL_ACTIONS: usize = 32;
@@ -390,6 +391,13 @@ struct PendingExternalActionCompletion {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PendingSmsResult {
+    owner_generation: u64,
+    helper: GuestFunction,
+    result: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ModuleLoadSnapshot {
     active_helper: Option<GuestFunction>,
     detached_guest_allocation_cursor: u32,
@@ -588,6 +596,7 @@ pub(crate) struct ExtRuntime {
     active_platform_ui: Vec<ActivePlatformUi>,
     pending_platform_menu_selection: Option<u32>,
     pending_platform_menu_returns: usize,
+    pending_sms_results: VecDeque<PendingSmsResult>,
     next_ui_handle: u32,
     suppressed_ui_key_releases: BTreeSet<i32>,
     platform_pointer_capture: Option<PlatformPointerCapture>,
@@ -800,6 +809,7 @@ impl ExtRuntime {
             active_platform_ui: Vec::new(),
             pending_platform_menu_selection: None,
             pending_platform_menu_returns: 0,
+            pending_sms_results: VecDeque::new(),
             next_ui_handle: 1,
             suppressed_ui_key_releases: BTreeSet::new(),
             platform_pointer_capture: None,
@@ -922,6 +932,16 @@ impl ExtRuntime {
         let helper = self
             .active_helper
             .ok_or_else(|| Error::Abi("no EXT helper is registered".into()))?;
+        self.call_helper(helper, code, input, services)
+    }
+
+    fn call_helper(
+        &mut self,
+        helper: GuestFunction,
+        code: i32,
+        input: &[u8],
+        services: &mut dyn NativeServices,
+    ) -> Result<(i32, Vec<u8>)> {
         let input_address = if input.is_empty() {
             GuestAddr(0)
         } else {
@@ -1333,6 +1353,21 @@ impl ExtRuntime {
         &mut self,
         services: &mut dyn NativeServices,
     ) -> Result<bool> {
+        if let Some(completion) = self.pending_sms_results.pop_front() {
+            if !self
+                .modules
+                .get(completion.helper.module)
+                .is_some_and(|module| module.generation == completion.owner_generation)
+                || !self.guest_function_is_executable(completion.helper)
+            {
+                return Ok(true);
+            }
+            let mut event = [0_u8; 12];
+            event[..4].copy_from_slice(&9_i32.to_le_bytes());
+            event[4..8].copy_from_slice(&completion.result.to_le_bytes());
+            self.call_helper(completion.helper, 1, &event, services)?;
+            return Ok(true);
+        }
         if self.pending_platform_menu_returns == 0 {
             return Ok(false);
         }
@@ -1483,6 +1518,10 @@ impl ExtRuntime {
         let mut pending = std::mem::take(&mut self.pending_external_action_completions);
         pending.retain(|completion| self.guest_function_is_executable(completion.callback));
         self.pending_external_action_completions = pending;
+        let mut pending_sms_results = std::mem::take(&mut self.pending_sms_results);
+        pending_sms_results
+            .retain(|completion| self.guest_function_is_executable(completion.helper));
+        self.pending_sms_results = pending_sms_results;
         Ok(())
     }
 
@@ -1510,6 +1549,8 @@ impl ExtRuntime {
 
         self.modules[module_index].helper = None;
         self.pending_external_action_completions
+            .retain(|completion| completion.owner_generation != generation);
+        self.pending_sms_results
             .retain(|completion| completion.owner_generation != generation);
         self.native_windows
             .retain(|_, owner_generation| *owner_generation != generation);

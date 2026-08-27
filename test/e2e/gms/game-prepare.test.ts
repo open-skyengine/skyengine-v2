@@ -16,7 +16,14 @@ function countMatchingPixels(
   return count;
 }
 
-describe("gms 付费慢测试", () => {
+const SMS_SUCCESS_TEXT_POINTS = [
+  [42, 21],
+  [83, 21],
+  [34, 24],
+  [99, 24],
+] as const;
+
+describe("gms 短信付费", () => {
   let engine: SkyEngineE2e | undefined;
   let ws: SkyEngineWorkspace | undefined;
 
@@ -27,7 +34,7 @@ describe("gms 付费慢测试", () => {
     ws = undefined;
   });
 
-  it("付费慢测试", async () => {
+  it("确认购买后立即完成付费", async () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
     // 删除后，继续游戏会进入下载netpay插件界面。
@@ -99,9 +106,14 @@ describe("gms 付费慢测试", () => {
       {   
         // 确定付费,成功
         await engine.key('LEFT_SOFT', 1_000)
-        await engine.delay(1_000);
-        const screen = await engine.screen("pay-end");
-        // rgb(232, 64, 8)
+        const screen = await engine.waitForScreen(
+          candidate => SMS_SUCCESS_TEXT_POINTS.every(([x, y]) => {
+            const [red, green, blue] = candidate.pixel(x, y);
+            return red === 248 && green === 252 && blue === 248;
+          }),
+          { name: "pay-success", timeoutMs: 2_000, intervalMs: 50 },
+        );
+        // 成功提示仍保留底部的返回操作栏。
         expect(screen.pixel(25, 305)).toEqual([232, 64, 8]);
       }
     }
