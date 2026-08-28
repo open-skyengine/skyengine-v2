@@ -1708,6 +1708,19 @@ impl ExtRuntime {
             let next = self.memory.read_u32(address)?;
             let len = self.memory.read_u32(address.checked_add(4)?)?;
             if next == 0 && len == 0 {
+                // A legacy allocator can zero a withdrawn payload header without
+                // advancing the head. Preserve successors that still match our snapshot.
+                if let Some((recovered, terminator, counter_correction)) =
+                    self.recover_withdrawn_legacy_payload_head(heap, &blocks, offset)
+                {
+                    recovered_len =
+                        recovered_len
+                            .checked_add(counter_correction)
+                            .ok_or_else(|| {
+                                Error::Abi("recovered guest free-byte count overflow".into())
+                            })?;
+                    return Ok((recovered, terminator, recovered_len));
+                }
                 return self.finish_free_block_read(heap, blocks, offset, recovered_len);
             }
             let block_end = offset
@@ -1828,6 +1841,75 @@ impl ExtRuntime {
         let expected_free_left = snapshot.free_left.checked_add(usable_len)?;
         let counter_correction = heap.free_left.checked_sub(expected_free_left)?;
         Some((recovered, counter_correction))
+    }
+
+    fn recover_withdrawn_legacy_payload_head(
+        &self,
+        heap: GuestHeapState,
+        preceding: &[FreeBlock],
+        zeroed_offset: u32,
+    ) -> Option<(Vec<FreeBlock>, u32, u32)> {
+        if !preceding.is_empty() {
+            return None;
+        }
+        let snapshot = self.guest_heap_snapshot.as_ref()?;
+        if snapshot.base != heap.base
+            || snapshot.span != heap.span
+            || snapshot.head != heap.head
+            || snapshot.blocks.first()?.offset != zeroed_offset
+        {
+            return None;
+        }
+
+        let payload = snapshot.blocks[0];
+        let backing_len = payload.len.checked_add(4)?;
+        let withdrawn_len = snapshot.free_left.checked_sub(heap.free_left)?;
+        if withdrawn_len != payload.len && withdrawn_len != backing_len {
+            return None;
+        }
+
+        let mut recovered = snapshot.blocks.get(1..)?.to_vec();
+        if recovered.is_empty() {
+            return None;
+        }
+        for (index, block) in recovered.iter().enumerate() {
+            let address = GuestAddr(heap.base.checked_add(block.offset)?);
+            let expected_next = recovered
+                .get(index + 1)
+                .map_or(snapshot.terminator, |next| next.offset);
+            if self.memory.read_u32(address).ok()? != expected_next
+                || self.memory.read_u32(address.checked_add(4).ok()?).ok()? != block.len
+            {
+                return None;
+            }
+        }
+
+        let recovered_total = recovered
+            .iter()
+            .try_fold(0_u32, |total, block| total.checked_add(block.len))?;
+        let counter_correction = match heap.free_left.cmp(&recovered_total) {
+            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
+                let correction = heap.free_left - recovered_total;
+                if correction > payload.len {
+                    return None;
+                }
+                correction
+            }
+            std::cmp::Ordering::Less => {
+                let alignment_slop = recovered_total - heap.free_left;
+                if alignment_slop >= HEAP_ALIGNMENT {
+                    return None;
+                }
+                let tail = recovered.last_mut()?;
+                tail.len = tail.len.checked_sub(alignment_slop)?;
+                if tail.len < FREE_BLOCK_HEADER_LEN {
+                    return None;
+                }
+                0
+            }
+        };
+        validate_free_block_ranges(&recovered, heap.span).ok()?;
+        Some((recovered, snapshot.terminator, counter_correction))
     }
 
     fn recover_corrupted_free_header(

@@ -565,6 +565,222 @@ fn guest_allocator_recovers_a_legacy_header_backed_payload_free() {
 }
 
 #[test]
+fn guest_allocator_preserves_non_overlapping_guest_counter_staging() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let backing_len = 0x38;
+    let backing = runtime
+        .allocate_guest_block(backing_len as usize)
+        .unwrap()
+        .unwrap();
+    let _first_guard = runtime.allocate_guest_block(0x10).unwrap().unwrap();
+    let tiny = runtime.allocate_guest_block(8).unwrap().unwrap();
+    let _second_guard = runtime.allocate_guest_block(0x10).unwrap().unwrap();
+    runtime.free_guest_block(tiny, 8).unwrap();
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let snapshot_free_left = heap.free_left;
+    let payload_offset = backing.0 - heap.base + 4;
+    let tiny_offset = tiny.0 - heap.base;
+    let tail_offset = tiny_offset + 0x18;
+    runtime.memory.write_u32(tiny, payload_offset).unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + payload_offset), tail_offset)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + payload_offset + 4), backing_len)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(111), snapshot_free_left + backing_len * 2)
+        .unwrap();
+
+    let small = runtime.allocate_guest_block(1).unwrap().unwrap();
+
+    assert_eq!(small, tiny);
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [
+            FreeBlock {
+                offset: payload_offset,
+                len: backing_len,
+            },
+            FreeBlock {
+                offset: tail_offset,
+                len: heap.span - tail_offset,
+            },
+        ]
+    );
+    assert_eq!(terminator, heap.span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(heap.free_left, snapshot_free_left + backing_len * 2 - 8);
+}
+
+#[test]
+fn guest_allocator_preserves_an_untracked_doubled_free_counter() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let heap = runtime.guest_heap_state().unwrap();
+    let added_offset = 0x200;
+    let added_len = 0x80;
+    let tiny_offset = 0x1000;
+    let tail_offset = 0x2000;
+    let tail_len = heap.span - tail_offset;
+    runtime
+        .write_free_blocks(
+            heap,
+            &[
+                FreeBlock {
+                    offset: tiny_offset,
+                    len: 8,
+                },
+                FreeBlock {
+                    offset: tail_offset,
+                    len: tail_len,
+                },
+            ],
+            heap.span,
+            8 + tail_len,
+        )
+        .unwrap();
+    let snapshot_free_left = runtime.guest_heap_state().unwrap().free_left;
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + tiny_offset), added_offset)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + added_offset), tail_offset)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + added_offset + 4), added_len)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(111), snapshot_free_left + added_len * 2)
+        .unwrap();
+
+    let small = runtime.allocate_guest_block(1).unwrap().unwrap();
+
+    assert_eq!(small, GuestAddr(heap.base + tiny_offset));
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [
+            FreeBlock {
+                offset: added_offset,
+                len: added_len,
+            },
+            FreeBlock {
+                offset: tail_offset,
+                len: tail_len,
+            },
+        ]
+    );
+    assert_eq!(terminator, heap.span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(heap.free_left, snapshot_free_left + added_len * 2 - 8);
+}
+
+#[test]
+fn guest_allocator_recovers_the_tail_after_a_legacy_payload_is_withdrawn() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let span = DEFAULT_HEAP_LEN as u32;
+    let allocation_len = 0x38;
+    let payload_offset = 4;
+    let tiny_offset = allocation_len;
+    let tail_offset = allocation_len + 0x10;
+    let heap = runtime.guest_heap_state().unwrap();
+    runtime
+        .write_free_blocks(
+            heap,
+            &[
+                FreeBlock {
+                    offset: 0,
+                    len: allocation_len + 8,
+                },
+                FreeBlock {
+                    offset: tail_offset,
+                    len: span - tail_offset,
+                },
+            ],
+            span,
+            span - 8,
+        )
+        .unwrap();
+
+    let backing = runtime.allocate_guest_block(0x36).unwrap().unwrap();
+    let snapshot_free_left = runtime.guest_heap_state().unwrap().free_left;
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + tiny_offset), payload_offset)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + payload_offset), tail_offset)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddr(heap.base + payload_offset + 4), allocation_len)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            data_slot_address(111),
+            snapshot_free_left + allocation_len * 2,
+        )
+        .unwrap();
+
+    let small = runtime.allocate_guest_block(1).unwrap().unwrap();
+    let heap = runtime.guest_heap_state().unwrap();
+    let reconciled_free_left = heap.free_left;
+    runtime.guest_allocations.remove(&backing.0);
+    runtime
+        .memory
+        .write(GuestAddr(heap.base + payload_offset), &[0; 8])
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            data_slot_address(111),
+            reconciled_free_left - (allocation_len - 4),
+        )
+        .unwrap();
+
+    runtime.free_guest_block(small, 8).unwrap();
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [
+            FreeBlock {
+                offset: tiny_offset,
+                len: 8,
+            },
+            FreeBlock {
+                offset: tail_offset,
+                len: span - tail_offset,
+            },
+        ]
+    );
+    assert_eq!(terminator, span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(
+        heap.free_left,
+        reconciled_free_left - (allocation_len - 4) + 8
+    );
+    assert!(!runtime.guest_allocations.contains_key(&backing.0));
+}
+
+#[test]
 fn freeing_a_legacy_wrapper_restores_its_truncated_tail_across_repeated_reuse() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

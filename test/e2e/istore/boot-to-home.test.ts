@@ -1,6 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFile } from "node:fs/promises";
+import { afterEach, describe, expect, it } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
-import fs from "fs";
+
+const ISTORE_OFFLINE_DNS_MAP = [
+  "rop.skymobiapp.com->127.0.0.1",
+  "spd.skymobiapp.com->127.0.0.1",
+  "wap.skmeg.com->127.0.0.1",
+].join(";");
 
 describe("istore 进入主界面", () => {
   let engine: SkyEngineE2e | undefined;
@@ -13,29 +19,52 @@ describe("istore 进入主界面", () => {
     ws = undefined;
   });
 
-  it("应用正常启动", async () => {
+  it("确认网络错误后可以打开分类页", async () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
-    
-    // istore
-    engine = await SkyEngineE2e.start("test/fixtures/sky_istore.mrp", { workDir: ws.dir, memory: '2M' });
+    engine = await SkyEngineE2e.start("test/fixtures/sky_istore.mrp", {
+      workDir: ws.dir,
+      memory: "2M",
+      dnsMap: ISTORE_OFFLINE_DNS_MAP,
+    });
 
-    {
-      await vi.waitFor(async () => {
-        if (!engine) throw new Error("skyengine 未初始化");
-        // 无网络提示
-        const screen = await engine.screen("home");
-        // rgb(112, 152, 208)
-        expect(screen.pixel(123, 78)).toEqual([112, 152, 208]);
-        // rgb(216, 220, 216)
-        expect(screen.pixel(143, 162)).toEqual([216, 220, 216]);
-        // rgb(168, 208, 80)
-        expect(screen.pixel(121, 205)).toEqual([168, 208, 80]);
-      }, {
-        timeout: 30_000,
-        interval: 1000
-      })
-    }
-  });
-  
+    await engine.waitForScreen(screen =>
+      screen.pixel(123, 78).toString() === "112,152,208"
+      && screen.pixel(143, 162).toString() === "216,220,216"
+      && screen.pixel(121, 205).toString() === "168,208,80", {
+        name: "network-error",
+        timeoutMs: 30_000,
+        intervalMs: 1_000,
+      });
+
+    await engine.click(120, 215, 5_000);
+    const home = await engine.waitForScreen(screen =>
+      screen.pixel(23, 291).toString() === "144,144,144"
+      && screen.pixel(70, 291).toString() === "72,76,72", {
+        name: "home",
+        timeoutMs: 30_000,
+        intervalMs: 500,
+      });
+
+    await engine.delay(1_000);
+    await engine.click(72, 305, 5_000);
+    const category = await engine.waitForScreen(screen =>
+      screen.pixel(70, 291).toString() === "32,32,32"
+      && screen.pixel(23, 291).toString() === "72,76,72"
+      && screen.pixel(116, 128).toString() === "216,220,216", {
+        name: "category",
+        timeoutMs: 90_000,
+        intervalMs: 500,
+      });
+
+    const nav = { x: 0, y: 288, width: 96, height: 32 };
+    expect(home.diffPixelCount(category, nav)).toBeGreaterThan(2_000);
+    expect(await engine.waitForExit(1_000)).toBe(false);
+
+    await engine.stop();
+    const stderr = await readFile(engine.stderrPath, "utf8");
+    expect(stderr).not.toMatch(
+      /ARM fault|ABI error|unmapped|no memory|guest heap exhausted|panicked at/i,
+    );
+  }, 150_000);
 });
