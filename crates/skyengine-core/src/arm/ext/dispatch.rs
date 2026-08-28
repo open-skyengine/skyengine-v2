@@ -371,8 +371,8 @@ impl ExtRuntime {
                     };
                     cpu.set_register(0, if succeeded { 0 } else { u32::MAX });
                 }
-                // Parameterless state transition paired with the verified MP3 sink.
-                // The caller requires zero to continue after a successful 2023 request.
+                // Starts the file-backed player prepared by 2023. Playback already
+                // begins in the host adapter, so this transition must preserve it.
                 2_043
                     if cpu.register(1) == 0
                         && cpu.register(2) == 0
@@ -383,7 +383,6 @@ impl ExtRuntime {
                             .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
                             == 0 =>
                 {
-                    services.stop_sound()?;
                     cpu.set_register(0, 0)
                 }
                 // Parameterless multimedia-state query. Local callers consistently

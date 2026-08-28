@@ -130,6 +130,10 @@ impl NativeServices for StubServices {
         Ok(())
     }
 
+    fn sound_is_active(&self) -> bool {
+        STUB_SOUND.with(|sound| sound.borrow().is_some())
+    }
+
     fn find_start(&mut self, _directory: &[u8]) -> Result<Option<(i32, Vec<u8>)>> {
         Ok(Some((7, b"entry.dat".to_vec())))
     }
