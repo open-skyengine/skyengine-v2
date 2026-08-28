@@ -217,9 +217,9 @@ impl ExtRuntime {
                 // Initialize the motion-event provider. The deterministic headless
                 // profile accepts registration but emits no sensor samples.
                 (1_206, 0) => cpu.set_register(0, 0),
-                // Optional device effect used by talkcat's fart action. The
-                // deterministic headless profile has no effect provider.
-                (1_211, 3) => cpu.set_register(0, 0),
+                // Optional device effects used by talkcat's downloaded belly and
+                // fart actions. The deterministic headless profile has no provider.
+                (1_211, 2 | 3) => cpu.set_register(0, 0),
                 // Query and configure the same deterministic motion provider.
                 // Mode 2 is the verified event-driven form used after startup.
                 (4_002, 0) | (4_005, 2) => cpu.set_register(0, 0),
@@ -383,6 +383,23 @@ impl ExtRuntime {
                             .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
                             == 0 =>
                 {
+                    cpu.set_register(0, 0)
+                }
+                // Stops and releases the file-backed multimedia player. Talkcat
+                // issues both transitions before starting its face interaction.
+                // The host has no separate prepared-player handle, so both
+                // transitions idempotently clear the active sink.
+                2_073 | 2_083
+                    if cpu.register(1) == 0
+                        && cpu.register(2) == 0
+                        && cpu.register(3) == 0
+                        && self.memory.read_u32(GuestAddr(cpu.register(13)))? == 0
+                        && self
+                            .memory
+                            .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
+                            == 0 =>
+                {
+                    services.stop_sound()?;
                     cpu.set_register(0, 0)
                 }
                 // Parameterless multimedia-state query. Local callers consistently

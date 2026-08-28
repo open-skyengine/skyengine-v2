@@ -47,6 +47,80 @@ describe("talkcat 进入游戏", () => {
       expect(boot.pixel(221, 279)).toEqual([64, 64, 64]);
     }, { timeout: 90_000, interval: 1_000 });
   });
+  it("点击猫脸后进入互动并保持运行", async () => {
+    ws = await SkyEngineWorkspace.create();
+    rmSync(ws.path("mythroad/talkcat"), { force: true, recursive: true });
+    engine = await SkyEngineE2e.start("test/fixtures/talkcat.mrp", { workDir: ws.dir });
+
+    const before = await engine.waitForScreen(screen =>
+      screen.pixel(27, 273).every((channel, index) => channel === [232, 236, 232][index])
+      && screen.pixel(216, 27).every((channel, index) => channel === [0, 12, 16][index])
+      && screen.pixel(221, 279).every((channel, index) => channel === [64, 64, 64][index]), {
+        name: "cat-face-before",
+        timeoutMs: 90_000,
+        intervalMs: 1_000,
+      });
+
+    await engine.click(120, 95, 5_000);
+    const after = await engine.screen("cat-face-after");
+    expect(before.diffPixelCount(after)).toBeGreaterThan(1_000);
+    await engine.delay(2_000);
+    expect(await engine.waitForExit(100)).toBe(false);
+    const runtimeLog = readFileSync(engine.stderrPath, "utf-8");
+    expect(runtimeLog).not.toMatch(/ARM fault|ABI error|panicked at|Invalid memory (?:read|write)/);
+  });
+  it("点击肚子下载安装资源后保持运行", async () => {
+    ws = await SkyEngineWorkspace.create();
+    rmSync(ws.path("mythroad/talkcat"), { force: true, recursive: true });
+    engine = await SkyEngineE2e.start("test/fixtures/talkcat.mrp", {
+      workDir: ws.dir,
+      dnsMap: TALKCAT_DOWNLOAD_DNS_MAP,
+    });
+
+    const main = await engine.waitForScreen(screen =>
+      screen.pixel(27, 273).every((channel, index) => channel === [232, 236, 232][index])
+      && screen.pixel(216, 27).every((channel, index) => channel === [0, 12, 16][index])
+      && screen.pixel(221, 279).every((channel, index) => channel === [64, 64, 64][index]), {
+        name: "belly-main",
+        timeoutMs: 90_000,
+        intervalMs: 1_000,
+      });
+
+    await engine.click(120, 250, 1_000);
+    const bellyReaction = await engine.screen("belly-reaction");
+    expect(main.diffPixelCount(bellyReaction)).toBeGreaterThan(1_000);
+    const downloadConfirm = await engine.waitForScreen(screen =>
+      countColor(screen, [32, 64, 120], { x: 50, y: 270, width: 140, height: 24 }) > 120, {
+        name: "belly-download-confirm",
+        timeoutMs: 30_000,
+        intervalMs: 250,
+      });
+
+    await engine.key("LEFT_SOFT", { waitForDraw: false });
+    const postDownload = await engine.waitForScreen(screen =>
+      downloadConfirm.diffPixelCount(screen) > 0
+      && countColor(screen, [32, 64, 120], { x: 50, y: 270, width: 140, height: 24 }) > 120, {
+        name: "belly-post-download",
+        timeoutMs: 90_000,
+        intervalMs: 1_000,
+      });
+
+    await engine.key("LEFT_SOFT", { waitForDraw: false });
+    await engine.delay(5_000);
+    expect(await engine.waitForExit(100)).toBe(false);
+    const installed = await engine.screen("belly-installed");
+    expect(postDownload.diffPixelCount(installed)).toBeGreaterThan(10_000);
+    expect(statSync(ws.path("mythroad/talkcat/998106.mrp")).size).toBe(256_373);
+    const bellyDir = ws.path("mythroad/talkcat/sto");
+    expect(readdirSync(bellyDir)).toHaveLength(22);
+    for (let frame = 1; frame <= 20; frame++) {
+      expect(statSync(`${bellyDir}/${frame}`).size).toBe(138_720);
+    }
+    expect(statSync(`${bellyDir}/ssto1.mp3`).size).toBe(2_592);
+    expect(statSync(`${bellyDir}/ssto2.mp3`).size).toBe(2_376);
+    const runtimeLog = readFileSync(engine.stderrPath, "utf-8");
+    expect(runtimeLog).not.toMatch(/ARM fault|ABI error|panicked at|Invalid memory (?:read|write)/);
+  });
   it("关于帮助按钮可重复打开且保持运行", async () => {
     ws = await SkyEngineWorkspace.create();
     rmSync(ws.path("mythroad/talkcat"), { force: true, recursive: true });

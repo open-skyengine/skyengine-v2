@@ -412,6 +412,76 @@ fn platform_command_2043_preserves_playback_and_whitelists_only_the_parameterles
     }
 }
 
+fn assert_platform_player_stop_command(command: u32) {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let stack = runtime.allocate(8, 4).unwrap();
+    runtime.memory.write(stack, &[0; 8]).unwrap();
+    let sound = runtime.allocate(4, 1).unwrap();
+    runtime.memory.write(sound, b"ID3!").unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 2);
+    cpu.set_register(1, sound.0);
+    cpu.set_register(2, 4);
+    runtime
+        .dispatch(57, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert!(STUB_SOUND.with(|active| active.borrow().is_some()));
+
+    cpu.set_register(0, command);
+    cpu.set_register(1, 0);
+    cpu.set_register(2, 0);
+    cpu.set_register(3, 0);
+    cpu.set_register(13, stack.0);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 0);
+    assert!(STUB_SOUND.with(|active| active.borrow().is_none()));
+
+    cpu.set_register(0, 2_093);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 1_003);
+
+    for register in 1..=3 {
+        cpu.set_register(0, command);
+        cpu.set_register(register, 1);
+        assert!(matches!(
+            runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
+            Err(Error::Abi(message)) if message.contains(&format!("command {command}"))
+        ));
+        cpu.set_register(register, 0);
+    }
+
+    for offset in [0, 4] {
+        runtime
+            .memory
+            .write_u32(stack.checked_add(offset).unwrap(), 1)
+            .unwrap();
+        cpu.set_register(0, command);
+        assert!(matches!(
+            runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
+            Err(Error::Abi(message)) if message.contains(&format!("command {command}"))
+        ));
+        runtime
+            .memory
+            .write_u32(stack.checked_add(offset).unwrap(), 0)
+            .unwrap();
+    }
+}
+
+#[test]
+fn platform_command_2073_stops_playback_and_whitelists_only_the_parameterless_form() {
+    assert_platform_player_stop_command(2_073);
+}
+
+#[test]
+fn platform_command_2083_releases_playback_and_whitelists_only_the_parameterless_form() {
+    assert_platform_player_stop_command(2_083);
+}
+
 #[test]
 fn platform_command_2093_whitelists_only_the_parameterless_idle_query() {
     let mut runtime =
@@ -1714,24 +1784,28 @@ fn platform_motion_initialization_uses_the_silent_headless_provider() {
 }
 
 #[test]
-fn platform_talkcat_device_effect_accepts_only_the_observed_mode() {
+fn platform_talkcat_device_effect_accepts_only_the_observed_modes() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let mut cpu = ArmCpu::new();
-    cpu.set_register(0, 1_211);
-    cpu.set_register(1, 3);
 
-    runtime
-        .dispatch(37, 0, &mut cpu, &mut StubServices)
-        .unwrap();
-    assert_eq!(cpu.register(0), 0);
+    for mode in [2, 3] {
+        cpu.set_register(0, 1_211);
+        cpu.set_register(1, mode);
+        runtime
+            .dispatch(37, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0, "mode {mode}");
+    }
 
-    cpu.set_register(0, 1_211);
-    cpu.set_register(1, 2);
-    assert!(matches!(
-        runtime.dispatch(37, 0, &mut cpu, &mut StubServices),
-        Err(Error::Abi(message)) if message.contains("command (1211, 2)")
-    ));
+    for mode in [0, 1, 4] {
+        cpu.set_register(0, 1_211);
+        cpu.set_register(1, mode);
+        assert!(matches!(
+            runtime.dispatch(37, 0, &mut cpu, &mut StubServices),
+            Err(Error::Abi(message)) if message.contains(&format!("command (1211, {mode})"))
+        ));
+    }
 }
 
 #[test]
