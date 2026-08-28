@@ -50,6 +50,39 @@ fn guest_allocator_reuses_and_merges_freed_blocks() {
 }
 
 #[test]
+fn guest_allocator_returns_none_when_the_free_counter_cannot_cover_a_block() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let heap = runtime.guest_heap_state().unwrap();
+    runtime
+        .write_free_blocks(
+            heap,
+            &[FreeBlock {
+                offset: 0,
+                len: heap.span,
+            }],
+            heap.span,
+            8,
+        )
+        .unwrap();
+
+    assert_eq!(runtime.allocate_guest_block(16).unwrap(), None);
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [FreeBlock {
+            offset: 0,
+            len: heap.span,
+        }]
+    );
+    assert_eq!(terminator, heap.span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(heap.free_left, 8);
+}
+
+#[test]
 fn internal_guest_heap_allocations_can_be_freed_by_the_guest() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -423,6 +456,232 @@ fn explicit_free_length_cannot_hide_a_partial_free_list_overlap() {
 
     assert!(matches!(error, Error::Abi(message) if message.contains("overlaps free block")));
     assert!(runtime.guest_allocations.contains_key(&output.0));
+}
+
+#[test]
+fn guest_allocator_recovers_a_legacy_header_backed_payload_free() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let span = DEFAULT_HEAP_LEN as u32;
+    let allocation_len = 0x38;
+    let successor_offset = allocation_len + 0x10;
+    let heap = runtime.guest_heap_state().unwrap();
+    runtime
+        .write_free_blocks(
+            heap,
+            &[
+                FreeBlock {
+                    offset: 0,
+                    len: allocation_len + 8,
+                },
+                FreeBlock {
+                    offset: successor_offset,
+                    len: span - successor_offset,
+                },
+            ],
+            span,
+            span - 8,
+        )
+        .unwrap();
+
+    let backing = runtime.allocate_guest_block(0x36).unwrap().unwrap();
+    assert_eq!(backing, HEAP_BASE);
+    let snapshot_free_left = runtime.guest_heap_state().unwrap().free_left;
+    let old_head = allocation_len;
+    let payload_offset = 4;
+
+    // The guest wrapper returns backing+4 and later links that payload into its
+    // private free-list using the complete aligned backing length.
+    runtime
+        .memory
+        .write_u32(HEAP_BASE.checked_add(old_head).unwrap(), payload_offset)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            HEAP_BASE.checked_add(payload_offset).unwrap(),
+            successor_offset,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            HEAP_BASE.checked_add(payload_offset + 4).unwrap(),
+            allocation_len,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            data_slot_address(111),
+            snapshot_free_left + allocation_len * 2,
+        )
+        .unwrap();
+
+    let small = runtime.allocate_guest_block(1).unwrap().unwrap();
+
+    assert_eq!(small, HEAP_BASE.checked_add(old_head).unwrap());
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [
+            FreeBlock {
+                offset: payload_offset,
+                len: allocation_len - 4,
+            },
+            FreeBlock {
+                offset: successor_offset,
+                len: span - successor_offset,
+            },
+        ]
+    );
+    assert_eq!(terminator, span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(heap.free_left, snapshot_free_left + allocation_len - 4 - 8);
+    assert!(runtime.guest_allocations.contains_key(&backing.0));
+
+    runtime.free_guest_block(backing, 0x36).unwrap();
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [
+            FreeBlock {
+                offset: 0,
+                len: allocation_len,
+            },
+            FreeBlock {
+                offset: successor_offset,
+                len: span - successor_offset,
+            },
+        ]
+    );
+    assert_eq!(terminator, span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(heap.free_left, snapshot_free_left + allocation_len - 8);
+    assert!(!runtime.guest_allocations.contains_key(&backing.0));
+}
+
+#[test]
+fn freeing_a_legacy_wrapper_restores_its_truncated_tail_across_repeated_reuse() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let payload_len = 0x36_u32;
+    let wrapper_len = payload_len + 4;
+    let block_len = heap::aligned_heap_len(wrapper_len as usize).unwrap();
+    let initial_free_left = runtime.guest_heap_state().unwrap().free_left;
+    let mut backing = runtime
+        .allocate_guest_block_for_module(wrapper_len as usize, 0)
+        .unwrap()
+        .unwrap();
+    for _ in 0..4 {
+        runtime.memory.write_u32(backing, payload_len).unwrap();
+
+        let heap = runtime.guest_heap_state().unwrap();
+        let backing_offset = backing.0 - heap.base;
+        let successor_offset = backing_offset + block_len;
+        runtime
+            .memory
+            .write_u32(
+                GuestAddr(heap.base).checked_add(successor_offset).unwrap(),
+                heap.span,
+            )
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(
+                GuestAddr(heap.base)
+                    .checked_add(successor_offset + 4)
+                    .unwrap(),
+                16,
+            )
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(data_slot_address(111), heap.free_left - 4)
+            .unwrap();
+
+        runtime
+            .free_guest_block_for_module(backing, wrapper_len as usize, 0)
+            .unwrap();
+
+        let heap = runtime.guest_heap_state().unwrap();
+        let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+        assert_eq!(
+            blocks,
+            [FreeBlock {
+                offset: backing_offset,
+                len: heap.span - backing_offset,
+            }]
+        );
+        assert_eq!(terminator, heap.span);
+        assert_eq!(recovered_len, 0);
+        assert_eq!(heap.free_left, initial_free_left);
+
+        let reused = runtime
+            .allocate_guest_block_for_module(wrapper_len as usize, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused, backing);
+        backing = reused;
+    }
+}
+
+#[test]
+fn freeing_a_legacy_wrapper_does_not_restore_an_accounted_tail_allocation() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let payload_len = 0x36_u32;
+    let wrapper_len = payload_len + 4;
+    let block_len = heap::aligned_heap_len(wrapper_len as usize).unwrap();
+    let backing = runtime
+        .allocate_guest_block_for_module(wrapper_len as usize, 0)
+        .unwrap()
+        .unwrap();
+    runtime.memory.write_u32(backing, payload_len).unwrap();
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let backing_offset = backing.0 - heap.base;
+    let successor_offset = backing_offset + block_len;
+    runtime
+        .memory
+        .write_u32(
+            GuestAddr(heap.base).checked_add(successor_offset).unwrap(),
+            heap.span,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            GuestAddr(heap.base)
+                .checked_add(successor_offset + 4)
+                .unwrap(),
+            16,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(111), 16)
+        .unwrap();
+
+    runtime
+        .free_guest_block_for_module(backing, wrapper_len as usize, 0)
+        .unwrap();
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, _, _) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [FreeBlock {
+            offset: backing_offset,
+            len: block_len + 16,
+        }]
+    );
+    assert_eq!(heap.free_left, block_len + 16);
 }
 
 #[test]
@@ -1864,6 +2123,74 @@ fn compact_ram_package_writes_into_four_and_eight_byte_aligned_wrappers() {
             .dispatch(131, 0, &mut cpu, &mut StubServices)
             .unwrap();
     }
+}
+
+#[test]
+fn compact_ram_package_writes_into_a_legacy_prefix_length_wrapper() {
+    let expected = b"MRPGCMAPguest module";
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(expected).unwrap();
+    let stored = encoder.finish().unwrap();
+    let mut image = vec![0_u8; 24 + stored.len()];
+    let image_len = image.len() as u32;
+    image[..4].copy_from_slice(b"MRPG");
+    image[4..8].copy_from_slice(&4_u32.to_le_bytes());
+    image[8..12].copy_from_slice(&image_len.to_le_bytes());
+    image[12..16].copy_from_slice(&4_u32.to_le_bytes());
+    image[16..20].copy_from_slice(b"abc\0");
+    image[20..24].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+    image[24..].copy_from_slice(&stored);
+
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let backing = runtime
+        .allocate_guest_block_for_module(expected.len() + 4, 0)
+        .unwrap()
+        .unwrap();
+    let prepared = backing.checked_add(4).unwrap();
+    runtime
+        .memory
+        .write_u32(backing, expected.len() as u32)
+        .unwrap();
+
+    let package = runtime.allocate(image.len(), 8).unwrap();
+    runtime.memory.write(package, &image).unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(104), package.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(data_slot_address(105), image.len() as u32)
+        .unwrap();
+    let name = runtime.allocate(4, 1).unwrap();
+    runtime.memory.write(name, b"abc\0").unwrap();
+    let output_len = runtime.allocate(4, 4).unwrap();
+    let mut cpu = ArmCpu::new();
+
+    cpu.set_register(0, name.0);
+    cpu.set_register(1, output_len.0);
+    runtime
+        .dispatch(125, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), prepared.0);
+    assert_eq!(
+        runtime.memory.read_u32(output_len).unwrap(),
+        expected.len() as u32
+    );
+    assert_eq!(
+        runtime.memory.read(prepared, expected.len()).unwrap(),
+        expected
+    );
+    assert!(runtime.guest_allocations.contains_key(&backing.0));
+    assert!(!runtime.guest_allocation_views.contains_key(&prepared.0));
+
+    runtime
+        .free_guest_block_for_module(backing, expected.len() + 4, 0)
+        .unwrap();
+    assert!(!runtime.guest_allocations.contains_key(&backing.0));
 }
 
 #[test]

@@ -1153,6 +1153,12 @@ impl ExtRuntime {
         let output_len = u32::try_from(output_len)
             .map_err(|_| Error::Abi("compact RAM MRP output length exceeds u32".into()))?;
         let aligned_len = heap::aligned_heap_len(output_len as usize)?;
+        let wrapper_block_len = heap::aligned_heap_len(
+            output_len
+                .checked_add(4)
+                .ok_or_else(|| Error::Abi("compact RAM wrapper length overflow".into()))?
+                as usize,
+        )?;
         let heap_end = HEAP_BASE.0 + self.heap_len as u32;
         let mut candidates = Vec::new();
         for descriptor_len_address in (HEAP_BASE.0 + 4..heap_end).step_by(4) {
@@ -1183,6 +1189,34 @@ impl ExtRuntime {
                 module,
             )?;
             if claimable {
+                candidates.push(candidate);
+            }
+        }
+        // The legacy cfunction malloc wrapper asks the platform allocator for
+        // `payload_len + 4`, stores payload_len at the backing address, and
+        // returns backing + 4. Match that payload view directly. The backing
+        // allocation remains the object freed by the corresponding wrapper.
+        for (&base, &block_len) in &self.guest_allocations {
+            if block_len != wrapper_block_len
+                || self.memory.read_u32(GuestAddr(base))? != output_len
+            {
+                continue;
+            }
+            let Some(candidate) = base.checked_add(4).map(GuestAddr) else {
+                continue;
+            };
+            if self
+                .memory
+                .check_range(candidate, output_len as usize, Permissions::READ_WRITE)
+                .is_err()
+            {
+                continue;
+            }
+            if self.prepared_output_candidate_is_claimable_by_module(
+                candidate,
+                aligned_len,
+                module,
+            )? {
                 candidates.push(candidate);
             }
         }

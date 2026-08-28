@@ -480,6 +480,13 @@ impl ExtRuntime {
             .map(|module| module.generation)
             .ok_or_else(|| Error::Abi(format!("compact RAM output for missing module {module}")))?;
 
+        if self
+            .legacy_wrapper_backing(address, block_len, owner_generation)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+
         let mtk_window = ExecutableRange {
             base: MTK_NATIVE_EXTENSION_BASE,
             len: MTK_NATIVE_EXTENSION_LEN,
@@ -648,6 +655,15 @@ impl ExtRuntime {
             .get(module)
             .map(|module| module.generation)
             .ok_or_else(|| Error::Abi(format!("compact RAM output for missing module {module}")))?;
+
+        if self
+            .legacy_wrapper_backing(address, block_len, owner_generation)?
+            .is_some()
+        {
+            // The wrapper frees its original backing address, so do not replace
+            // its allocation tracking with an interior payload view.
+            return Ok(());
+        }
 
         let mtk_window = ExecutableRange {
             base: MTK_NATIVE_EXTENSION_BASE,
@@ -885,6 +901,51 @@ impl ExtRuntime {
         self.track_guest_heap_allocation(address, reclaim_len, Some(owner_generation))
     }
 
+    fn legacy_wrapper_backing(
+        &self,
+        address: GuestAddr,
+        block_len: u32,
+        owner_generation: u64,
+    ) -> Result<Option<GuestAddr>> {
+        let Some(base) = address.0.checked_sub(4) else {
+            return Ok(None);
+        };
+        let Some(&backing_len) = self.guest_allocations.get(&base) else {
+            return Ok(None);
+        };
+        match self.guest_allocation_owners.get(&base).copied() {
+            Some(owner) if owner != owner_generation => {
+                return Err(Error::Abi(
+                    "compact RAM output belongs to another module".into(),
+                ));
+            }
+            Some(_) => {}
+            None => return Ok(None),
+        }
+
+        let payload_len = self.memory.read_u32(GuestAddr(base))?;
+        let Some(wrapper_len) = payload_len.checked_add(4) else {
+            return Ok(None);
+        };
+        let Ok(payload_block_len) = aligned_heap_len(payload_len as usize) else {
+            return Ok(None);
+        };
+        let Ok(expected_backing_len) = aligned_heap_len(wrapper_len as usize) else {
+            return Ok(None);
+        };
+        if payload_block_len != block_len || expected_backing_len != backing_len {
+            return Ok(None);
+        }
+        let backing_end = base
+            .checked_add(backing_len)
+            .ok_or_else(|| Error::Abi("compact RAM wrapper range overflow".into()))?;
+        let payload_end = address
+            .0
+            .checked_add(payload_len)
+            .ok_or_else(|| Error::Abi("compact RAM wrapper payload overflow".into()))?;
+        Ok((payload_end <= backing_end).then_some(GuestAddr(base)))
+    }
+
     fn validate_guest_allocation_view(
         &self,
         address: GuestAddr,
@@ -1059,17 +1120,18 @@ impl ExtRuntime {
         let reclaim_len = consumed
             .checked_sub(discarded_prefix)
             .ok_or_else(|| Error::Abi("guest reclaimable allocation length underflow".into()))?;
-        let free_left = heap
+        let free_left_after_recovery = heap
             .free_left
             .checked_sub(recovered_len)
-            .and_then(|free_left| free_left.checked_sub(consumed))
             .ok_or_else(|| {
                 Error::Abi(format!(
-                    "guest free-byte count {:#x} is smaller than allocation cost {:#x}",
-                    heap.free_left,
-                    recovered_len.saturating_add(consumed),
+                    "guest free-byte count {:#x} is smaller than recovery correction {recovered_len:#x}",
+                    heap.free_left
                 ))
             })?;
+        let Some(free_left) = free_left_after_recovery.checked_sub(consumed) else {
+            return Ok(None);
+        };
         blocks.splice(index..=index, replacement);
         self.write_free_blocks(heap, &blocks, terminator, free_left)?;
         let address = GuestAddr(heap.base.wrapping_add(start));
@@ -1152,7 +1214,7 @@ impl ExtRuntime {
         if heap_base == 0 && heap_end == 0 {
             return Ok(());
         }
-        let heap = self.guest_heap_state()?;
+        let mut heap = self.guest_heap_state()?;
         let Some(offset) = address.0.checked_sub(heap.base) else {
             if let Some(tracked_len) = self.guest_allocations.get(&address.0).copied() {
                 self.revoke_executable_ranges_in(ExecutableRange {
@@ -1185,7 +1247,65 @@ impl ExtRuntime {
         }
         let tracked_len = self.guest_allocations.get(&address.0).copied();
         let explicit_len = (len != 0).then(|| aligned_heap_len(len));
-        let (blocks, terminator, recovered_len) = self.read_free_blocks(heap)?;
+        let (mut blocks, terminator, recovered_len) = self.read_free_blocks(heap)?;
+        if let Some(tracked_len) = tracked_len
+            && explicit_len.as_ref().is_none_or(|explicit_len| {
+                explicit_len
+                    .as_ref()
+                    .is_ok_and(|explicit_len| *explicit_len == tracked_len)
+            })
+        {
+            if let Some(restored_free_left) = self.restore_truncated_legacy_wrapper_tail(
+                address,
+                len,
+                tracked_len,
+                heap,
+                &mut blocks,
+                terminator,
+            )? {
+                heap.free_left = restored_free_left;
+            }
+            let tracked_end = offset
+                .checked_add(tracked_len)
+                .ok_or_else(|| Error::Abi("tracked guest allocation end overflow".into()))?;
+            let payload_offset = offset.checked_add(4);
+            let returned_payload = payload_offset.and_then(|payload_offset| {
+                blocks.iter().position(|block| {
+                    let block_end = block.offset.checked_add(block.len);
+                    block.offset == payload_offset
+                        && block_end.is_some_and(|block_end| block_end >= tracked_end)
+                })
+            });
+            if let Some(index) = returned_payload {
+                // The payload view recovered by read_free_blocks leaves only the
+                // legacy wrapper's four-byte length header allocated. A later
+                // platform free of the backing block releases that prefix by
+                // extending the already-free payload range backwards.
+                blocks[index].offset = offset;
+                blocks[index].len = blocks[index]
+                    .len
+                    .checked_add(4)
+                    .ok_or_else(|| Error::Abi("guest free-block length overflow".into()))?;
+                validate_free_block_ranges(&blocks, heap.span)?;
+                let free_left = heap
+                    .free_left
+                    .checked_sub(recovered_len)
+                    .and_then(|free_left| free_left.checked_add(4))
+                    .ok_or_else(|| Error::Abi("guest free-byte count overflow".into()))?;
+                self.revoke_executable_ranges_in(ExecutableRange {
+                    base: address,
+                    len: tracked_len as usize,
+                })?;
+                self.clear_freed_ram_package(address, tracked_len as usize)?;
+                self.write_free_blocks(heap, &blocks, terminator, free_left)?;
+                self.guest_allocations.remove(&address.0);
+                self.guest_allocation_owners.remove(&address.0);
+                self.guest_allocation_views
+                    .retain(|_, view| view.backing_base != address.0);
+                self.nested_guest_heaps.remove(&address.0);
+                return Ok(());
+            }
+        }
         let block_len = match tracked_len {
             Some(block_len)
                 if free_candidate_is_available(offset, block_len, heap.span, &blocks) =>
@@ -1232,6 +1352,83 @@ impl ExtRuntime {
             .retain(|_, view| view.backing_base != address.0);
         self.nested_guest_heaps.remove(&address.0);
         Ok(())
+    }
+
+    fn restore_truncated_legacy_wrapper_tail(
+        &self,
+        address: GuestAddr,
+        explicit_len: usize,
+        tracked_len: u32,
+        heap: GuestHeapState,
+        blocks: &mut [FreeBlock],
+        terminator: u32,
+    ) -> Result<Option<u32>> {
+        let payload_len = self.memory.read_u32(address)?;
+        let Some(wrapper_len) = payload_len.checked_add(4) else {
+            return Ok(None);
+        };
+        if usize::try_from(wrapper_len).ok() != Some(explicit_len)
+            || aligned_heap_len(wrapper_len as usize).ok() != Some(tracked_len)
+            || blocks.len() != 1
+            || terminator != heap.span
+        {
+            return Ok(None);
+        }
+
+        let Some(offset) = address.0.checked_sub(heap.base) else {
+            return Ok(None);
+        };
+        let Some(successor_offset) = offset.checked_add(tracked_len) else {
+            return Ok(None);
+        };
+        let block = &mut blocks[0];
+        if block.offset != successor_offset {
+            return Ok(None);
+        }
+        let Some(full_tail_len) = heap.span.checked_sub(successor_offset) else {
+            return Ok(None);
+        };
+        let Some(unaccounted_len) = full_tail_len.checked_sub(heap.free_left) else {
+            return Ok(None);
+        };
+        // The wrapper can leave a tiny but valid successor header while its
+        // counter still accounts for the complete tail. Restore only that sole
+        // tail block, allowing at most the allocator's alignment slop.
+        if block.len >= full_tail_len || unaccounted_len >= HEAP_ALIGNMENT {
+            return Ok(None);
+        }
+
+        let restored = ExecutableRange {
+            base: GuestAddr(heap.base + successor_offset),
+            len: full_tail_len as usize,
+        };
+        if self.guest_allocations.iter().any(|(base, len)| {
+            *base != address.0
+                && ExecutableRange {
+                    base: GuestAddr(*base),
+                    len: *len as usize,
+                }
+                .overlaps(restored)
+        }) || self.guest_allocation_views.iter().any(|(base, view)| {
+            ExecutableRange {
+                base: GuestAddr(*base),
+                len: view.len as usize,
+            }
+            .overlaps(restored)
+        }) {
+            return Ok(None);
+        }
+        if self
+            .memory
+            .check_range(restored.base, restored.len, Permissions::READ_WRITE)
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        block.len = full_tail_len;
+        validate_free_block_ranges(blocks, heap.span)?;
+        Ok(Some(full_tail_len))
     }
 
     fn return_guest_heap_range(
@@ -1491,8 +1688,7 @@ impl ExtRuntime {
         let mut recovered_len = 0_u32;
         loop {
             if offset == heap.span {
-                validate_free_block_ranges(&blocks, heap.span)?;
-                return Ok((blocks, offset, recovered_len));
+                return self.finish_free_block_read(heap, blocks, offset, recovered_len);
             }
             let header_end = offset
                 .checked_add(FREE_BLOCK_HEADER_LEN)
@@ -1512,8 +1708,7 @@ impl ExtRuntime {
             let next = self.memory.read_u32(address)?;
             let len = self.memory.read_u32(address.checked_add(4)?)?;
             if next == 0 && len == 0 {
-                validate_free_block_ranges(&blocks, heap.span)?;
-                return Ok((blocks, offset, recovered_len));
+                return self.finish_free_block_read(heap, blocks, offset, recovered_len);
             }
             let block_end = offset
                 .checked_add(len)
@@ -1552,6 +1747,87 @@ impl ExtRuntime {
             blocks.push(FreeBlock { offset, len });
             offset = next;
         }
+    }
+
+    fn finish_free_block_read(
+        &self,
+        heap: GuestHeapState,
+        mut blocks: Vec<FreeBlock>,
+        terminator: u32,
+        mut recovered_len: u32,
+    ) -> Result<(Vec<FreeBlock>, u32, u32)> {
+        if let Err(error) = validate_free_block_ranges(&blocks, heap.span) {
+            let Some((recovered, counter_correction)) =
+                self.recover_guest_allocation_header_overlap(heap, &blocks, terminator)
+            else {
+                return Err(error);
+            };
+            blocks = recovered;
+            recovered_len = recovered_len
+                .checked_add(counter_correction)
+                .ok_or_else(|| Error::Abi("recovered guest free-byte count overflow".into()))?;
+            validate_free_block_ranges(&blocks, heap.span)?;
+        }
+        Ok((blocks, terminator, recovered_len))
+    }
+
+    fn recover_guest_allocation_header_overlap(
+        &self,
+        heap: GuestHeapState,
+        blocks: &[FreeBlock],
+        terminator: u32,
+    ) -> Option<(Vec<FreeBlock>, u32)> {
+        let snapshot = self.guest_heap_snapshot.as_ref()?;
+        if snapshot.base != heap.base
+            || snapshot.span != heap.span
+            || snapshot.head != heap.head
+            || snapshot.terminator != terminator
+            || blocks.len() != snapshot.blocks.len().checked_add(1)?
+            || !snapshot.blocks.iter().all(|block| blocks.contains(block))
+        {
+            return None;
+        }
+
+        let mut added = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| !snapshot.blocks.contains(block));
+        let (added_index, added_block) = added.next()?;
+        if added.next().is_some() {
+            return None;
+        }
+
+        // Some legacy wrappers allocate size+4, store the payload length in the
+        // first word, and return base+4. Their private free-list can later recycle
+        // that payload address with the complete host allocation length. Accept
+        // only that tracked shape and keep the four-byte wrapper header reserved.
+        let backing_offset = added_block.offset.checked_sub(4)?;
+        let backing = heap.base.checked_add(backing_offset)?;
+        if self.guest_allocations.get(&backing) != Some(&added_block.len) {
+            return None;
+        }
+        let usable_len = added_block.len.checked_sub(4)?;
+        if usable_len < FREE_BLOCK_HEADER_LEN {
+            return None;
+        }
+        let successor_offset = added_block.offset.checked_add(usable_len)?;
+        if !snapshot
+            .blocks
+            .iter()
+            .any(|block| block.offset == successor_offset)
+        {
+            return None;
+        }
+
+        let mut recovered = blocks.to_vec();
+        recovered[added_index].len = usable_len;
+        validate_free_block_ranges(&recovered, heap.span).ok()?;
+
+        // Preserve any staged difference in the guest counter, but remove the
+        // duplicate increment observed when this header-backed block is returned.
+        let expected_free_left = snapshot.free_left.checked_add(usable_len)?;
+        let counter_correction = heap.free_left.checked_sub(expected_free_left)?;
+        Some((recovered, counter_correction))
     }
 
     fn recover_corrupted_free_header(

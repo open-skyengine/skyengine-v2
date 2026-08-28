@@ -47,6 +47,82 @@ describe("talkcat 进入游戏", () => {
       expect(boot.pixel(221, 279)).toEqual([64, 64, 64]);
     }, { timeout: 90_000, interval: 1_000 });
   });
+  it("关于帮助按钮可重复打开且保持运行", async () => {
+    ws = await SkyEngineWorkspace.create();
+    rmSync(ws.path("mythroad/talkcat"), { force: true, recursive: true });
+    engine = await SkyEngineE2e.start("test/fixtures/talkcat.mrp", { workDir: ws.dir });
+
+    const main = await engine.waitForScreen(screen =>
+      screen.pixel(27, 273).every((channel, index) => channel === [232, 236, 232][index])
+      && screen.pixel(216, 27).every((channel, index) => channel === [0, 12, 16][index])
+      && screen.pixel(221, 279).every((channel, index) => channel === [64, 64, 64][index]), {
+        name: "about-help-main",
+        timeoutMs: 90_000,
+        intervalMs: 1_000,
+      });
+
+    const clickAndCapture = async (x: number, y: number, name: string): Promise<PpmImage> => {
+      const accepted = await engine!.command(`CLICK ${x} ${y}`);
+      const acceptedDraw = /^OK click draw_count (\d+)$/.exec(accepted);
+      if (!acceptedDraw) throw new Error(`Unexpected CLICK response: ${accepted}`);
+      const drawn = await engine!.command(`WAIT_DRAW ${acceptedDraw[1]} 30000`, 35_000);
+      const helpDraw = /^OK draw_count (\d+)$/.exec(drawn);
+      if (!helpDraw) throw new Error(`Unexpected WAIT_DRAW response: ${drawn}`);
+      return engine!.screenDraw(Number(helpDraw[1]), name);
+    };
+
+    const expectHelpScreen = (help: PpmImage, previous: PpmImage): void => {
+      expect(previous.diffPixelCount(help)).toBeGreaterThan(60_000);
+      expect(help.pixel(50, 15)).toEqual([248, 252, 248]);
+      expect(help.pixel(75, 15)).toEqual([248, 252, 248]);
+      expect(
+        countColor(help, [248, 252, 248], { x: 10, y: 5, width: 200, height: 305 }),
+      ).toBeGreaterThan(2_000);
+    };
+
+    const help = await clickAndCapture(20, 66, "about-help");
+    expectHelpScreen(help, main);
+
+    await engine.delay(1_000);
+    const returnClick = await engine.command("CLICK 20 66");
+    expect(returnClick).toMatch(/^OK click draw_count \d+$/);
+    const returned = await engine.waitForScreen(screen =>
+      screen.pixel(27, 273).every((channel, index) => channel === [232, 236, 232][index])
+      && screen.pixel(216, 27).every((channel, index) => channel === [0, 12, 16][index])
+      && screen.pixel(221, 279).every((channel, index) => channel === [64, 64, 64][index]), {
+        name: "about-help-returned",
+        timeoutMs: 5_000,
+        intervalMs: 100,
+      });
+    expect(help.diffPixelCount(returned)).toBeGreaterThan(60_000);
+    expect(returned.pixel(27, 273)).toEqual([232, 236, 232]);
+    expect(returned.pixel(216, 27)).toEqual([0, 12, 16]);
+    expect(returned.pixel(221, 279)).toEqual([64, 64, 64]);
+
+    await engine.delay(1_000);
+    const reopenedHelp = await clickAndCapture(20, 66, "about-help-reopened");
+    expectHelpScreen(reopenedHelp, returned);
+
+    await engine.delay(1_000);
+    const secondReturnClick = await engine.command("CLICK 20 66");
+    expect(secondReturnClick).toMatch(/^OK click draw_count \d+$/);
+    const returnedAgain = await engine.waitForScreen(screen =>
+      screen.pixel(27, 273).every((channel, index) => channel === [232, 236, 232][index])
+      && screen.pixel(216, 27).every((channel, index) => channel === [0, 12, 16][index])
+      && screen.pixel(221, 279).every((channel, index) => channel === [64, 64, 64][index]), {
+        name: "about-help-returned-second",
+        timeoutMs: 5_000,
+        intervalMs: 100,
+      });
+    expect(reopenedHelp.diffPixelCount(returnedAgain)).toBeGreaterThan(60_000);
+
+    await engine.delay(1_000);
+    const thirdHelp = await clickAndCapture(20, 66, "about-help-third");
+    expectHelpScreen(thirdHelp, returnedAgain);
+    expect(await engine.waitForExit(100)).toBe(false);
+    const runtimeLog = readFileSync(engine.stderrPath, "utf-8");
+    expect(runtimeLog).not.toMatch(/ARM fault|ABI error|panicked at|Invalid memory (?:read|write)/);
+  });
   it("从159服务器下载喝水资源包后保持运行", async () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
