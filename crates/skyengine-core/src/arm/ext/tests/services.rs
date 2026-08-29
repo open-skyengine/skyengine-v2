@@ -689,6 +689,25 @@ fn datetime_uses_the_configured_device_date() {
 }
 
 #[test]
+fn datetime_writes_the_configured_time_of_day() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.set_device_date(DeviceDate::with_time_of_day(2000, 2, 29, 23, 59, 59).unwrap());
+    let output = runtime.allocate(8, 2).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, output.0);
+
+    runtime
+        .dispatch(34, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(
+        runtime.memory.read(output, 8).unwrap(),
+        [0xd0, 0x07, 2, 29, 23, 59, 59, 2]
+    );
+}
+
+#[test]
 fn guest_character_bitmap_uses_lsb_first_bytes() {
     let mut runtime =
         ExtRuntime::new(16, 16, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

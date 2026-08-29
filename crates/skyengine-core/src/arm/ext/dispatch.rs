@@ -155,17 +155,18 @@ impl ExtRuntime {
             }
             34 => {
                 let output = GuestAddr(cpu.register(0));
-                self.memory.write_u16(output, self.device_date.year)?;
+                let device_datetime = self.current_device_datetime();
+                self.memory.write_u16(output, device_datetime.year)?;
                 self.memory.write(
                     output.checked_add(2)?,
                     // month, day, hour, minute, second, weekday (Sunday = 0)
                     &[
-                        self.device_date.month,
-                        self.device_date.day,
-                        0,
-                        0,
-                        0,
-                        self.device_date.weekday(),
+                        device_datetime.month,
+                        device_datetime.day,
+                        device_datetime.hour,
+                        device_datetime.minute,
+                        device_datetime.second,
+                        device_datetime.weekday(),
                     ],
                 )?;
                 cpu.set_register(0, 0);

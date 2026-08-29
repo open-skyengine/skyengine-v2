@@ -43,7 +43,7 @@ impl Default for EngineConfig {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             memory_limit: DEFAULT_MEMORY_MB as u32 * 1024 * 1024,
-            device_date: DeviceDate::default(),
+            device_date: DeviceDate::host_now(),
             work_dir: PathBuf::from("."),
             sound_font_path: None,
             dns_mappings: Vec::new(),
@@ -269,7 +269,7 @@ unsafe fn optional_string(pointer: *const c_char, name: &str) -> Result<Option<S
 
 fn parse_device_date(value: &str) -> Result<DeviceDate, String> {
     if value == "host" {
-        return Ok(DeviceDate::host_today());
+        return Ok(DeviceDate::host_now());
     }
     let invalid = || format!("invalid device date {value:?}; expected YYYY-M-D or host");
     let mut parts = value.split('-');

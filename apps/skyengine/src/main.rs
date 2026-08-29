@@ -117,9 +117,10 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     config.screen_height = height;
     config.memory_limit = memory_limit;
     apply_dns_map_option(&mut config, dns_map.as_deref())?;
-    if let Some(device_date) = device_date {
-        config.device_date = parse_device_date(&device_date)?;
-    }
+    config.device_date = match device_date {
+        Some(device_date) => parse_device_date(&device_date)?,
+        None => DeviceDate::host_now(),
+    };
 
     if headless {
         let mut runtime = Runtime::load(config, Box::new(HeadlessDisplay))?;
@@ -340,7 +341,7 @@ fn apply_dns_map_option(config: &mut RuntimeConfig, value: Option<&str>) -> Resu
 
 fn parse_device_date(value: &str) -> Result<DeviceDate> {
     if value == "host" {
-        return Ok(DeviceDate::host_today());
+        return Ok(DeviceDate::host_now());
     }
     let invalid = || {
         skyengine_core::Error::Config(format!(
@@ -428,7 +429,7 @@ fn print_help() {
          DNS MAP is a semicolon-separated SOURCE->IPv4[:PORT] list.\n  \
          DNS MAP maps the default Skymobi hosts to 159.75.119.124.\n  \
          Connections to 10.0.0.172 use the built-in WAP proxy unless explicitly mapped.\n  \
-         Device date defaults to 2012-6-20 or SKYENGINE_DEVICE_DATE when set.\n  \
+         Device date and time default to the host clock; SKYENGINE_DEVICE_DATE starts at midnight.\n  \
          Memory SIZE is one of 1M, 2M, 4M, 6M, 8M, or 16M.\n  \
          The default font is mythroad/system/gb16.uc2."
     );

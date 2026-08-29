@@ -3,7 +3,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -39,6 +39,9 @@ pub struct DeviceDate {
     pub year: u16,
     pub month: u8,
     pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
 }
 
 impl DeviceDate {
@@ -46,6 +49,9 @@ impl DeviceDate {
         year: 2012,
         month: 6,
         day: 20,
+        hour: 0,
+        minute: 0,
+        second: 0,
     };
 
     pub fn new(year: u16, month: u8, day: u8) -> Option<Self> {
@@ -56,18 +62,82 @@ impl DeviceDate {
             2 => 28,
             _ => return None,
         };
-        (year != 0 && day != 0 && day <= max_day).then_some(Self { year, month, day })
+        (year != 0 && day != 0 && day <= max_day).then_some(Self {
+            year,
+            month,
+            day,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        })
+    }
+
+    pub fn with_time_of_day(
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Option<Self> {
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        let mut value = Self::new(year, month, day)?;
+        value.hour = hour;
+        value.minute = minute;
+        value.second = second;
+        Some(value)
     }
 
     pub fn host_today() -> Self {
-        let days = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => (duration.as_secs() / 86_400) as i64,
-            Err(error) => -((error.duration().as_secs() / 86_400) as i64),
+        let mut value = Self::host_now();
+        value.hour = 0;
+        value.minute = 0;
+        value.second = 0;
+        value
+    }
+
+    pub fn host_now() -> Self {
+        if let Some(value) = host_local_datetime() {
+            return value;
+        }
+        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs() as i64,
+            Err(error) => -((error.duration().as_secs()) as i64),
         };
-        civil_date_from_unix_days(days)
+        Self::from_unix_timestamp(timestamp).unwrap_or(Self::BASELINE)
+    }
+
+    pub fn from_unix_timestamp(timestamp: i64) -> Option<Self> {
+        let days = timestamp.div_euclid(86_400);
+        let seconds_of_day = timestamp.rem_euclid(86_400);
+        let mut value = civil_date_from_unix_days(days);
+        value.hour = (seconds_of_day / 3_600) as u8;
+        value.minute = ((seconds_of_day % 3_600) / 60) as u8;
+        value.second = (seconds_of_day % 60) as u8;
+        Some(value)
+    }
+
+    pub(crate) fn advance(self, elapsed: Duration) -> Self {
+        let timestamp = self
+            .unix_timestamp()
+            .saturating_add(i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
+        Self::from_unix_timestamp(timestamp).unwrap_or(Self::BASELINE)
     }
 
     pub(crate) fn weekday(self) -> u8 {
+        (self.unix_days() + 4).rem_euclid(7) as u8
+    }
+
+    fn unix_timestamp(self) -> i64 {
+        self.unix_days() * 86_400
+            + i64::from(self.hour) * 3_600
+            + i64::from(self.minute) * 60
+            + i64::from(self.second)
+    }
+
+    fn unix_days(self) -> i64 {
         let mut year = i64::from(self.year);
         let month = i64::from(self.month);
         let day = i64::from(self.day);
@@ -77,9 +147,92 @@ impl DeviceDate {
         let shifted_month = month + if month > 2 { -3 } else { 9 };
         let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
         let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-        let unix_days = era * 146_097 + day_of_era - 719_468;
-        (unix_days + 4).rem_euclid(7) as u8
+        era * 146_097 + day_of_era - 719_468
     }
+}
+
+#[cfg(unix)]
+fn host_local_datetime() -> Option<DeviceDate> {
+    use std::{
+        ffi::{c_char, c_int, c_long},
+        mem::MaybeUninit,
+        ptr,
+    };
+
+    #[repr(C)]
+    struct LocalTime {
+        second: c_int,
+        minute: c_int,
+        hour: c_int,
+        day: c_int,
+        month_from_zero: c_int,
+        year_from_1900: c_int,
+        _weekday: c_int,
+        _year_day: c_int,
+        _daylight_saving: c_int,
+        _utc_offset: c_long,
+        _zone: *const c_char,
+    }
+
+    unsafe extern "C" {
+        fn time(timer: *mut c_long) -> c_long;
+        fn localtime_r(timer: *const c_long, result: *mut LocalTime) -> *mut LocalTime;
+    }
+
+    let timestamp = unsafe { time(ptr::null_mut()) };
+    let mut local = MaybeUninit::<LocalTime>::uninit();
+    if unsafe { localtime_r(&timestamp, local.as_mut_ptr()) }.is_null() {
+        return None;
+    }
+    let local = unsafe { local.assume_init() };
+    DeviceDate::with_time_of_day(
+        u16::try_from(local.year_from_1900.checked_add(1900)?).ok()?,
+        u8::try_from(local.month_from_zero.checked_add(1)?).ok()?,
+        u8::try_from(local.day).ok()?,
+        u8::try_from(local.hour).ok()?,
+        u8::try_from(local.minute).ok()?,
+        u8::try_from(local.second).ok()?,
+    )
+}
+
+#[cfg(windows)]
+fn host_local_datetime() -> Option<DeviceDate> {
+    use std::mem::MaybeUninit;
+
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        _weekday: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        _milliseconds: u16,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetLocalTime"]
+        fn get_local_time(system_time: *mut SystemTime);
+    }
+
+    let mut local = MaybeUninit::<SystemTime>::uninit();
+    unsafe { get_local_time(local.as_mut_ptr()) };
+    let local = unsafe { local.assume_init() };
+    DeviceDate::with_time_of_day(
+        local.year,
+        u8::try_from(local.month).ok()?,
+        u8::try_from(local.day).ok()?,
+        u8::try_from(local.hour).ok()?,
+        u8::try_from(local.minute).ok()?,
+        u8::try_from(local.second).ok()?,
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn host_local_datetime() -> Option<DeviceDate> {
+    None
 }
 
 impl Default for DeviceDate {
@@ -108,6 +261,9 @@ fn civil_date_from_unix_days(days: i64) -> DeviceDate {
         year: year as u16,
         month: month as u8,
         day: day as u8,
+        hour: 0,
+        minute: 0,
+        second: 0,
     }
 }
 
@@ -576,6 +732,23 @@ mod tests {
         assert_eq!(
             civil_date_from_unix_days(15_492),
             DeviceDate::new(2012, 6, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn device_dates_convert_and_advance_with_time_of_day() {
+        let datetime = DeviceDate::with_time_of_day(2012, 6, 20, 23, 59, 59).unwrap();
+        assert_eq!(
+            datetime.advance(Duration::from_secs(2)),
+            DeviceDate::with_time_of_day(2012, 6, 21, 0, 0, 1).unwrap()
+        );
+        assert_eq!(
+            DeviceDate::from_unix_timestamp(0),
+            DeviceDate::with_time_of_day(1970, 1, 1, 0, 0, 0)
+        );
+        assert_eq!(
+            DeviceDate::from_unix_timestamp(86_399),
+            DeviceDate::with_time_of_day(1970, 1, 1, 23, 59, 59)
         );
     }
 

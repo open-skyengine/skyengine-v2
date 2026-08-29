@@ -102,6 +102,7 @@ pub(crate) struct MrHost {
     dns_mappings: Arc<[DnsMapping]>,
     wap_proxy_endpoint: Option<SocketAddrV4>,
     device_date: crate::DeviceDate,
+    device_clock_origin: Instant,
     bitmaps: BTreeMap<i32, Bitmap>,
     directory_searches: BTreeMap<i32, DirectorySearch>,
     next_directory_handle: i32,
@@ -152,6 +153,7 @@ impl MrHost {
             dns_mappings: config.dns_mappings,
             wap_proxy_endpoint: config.wap_proxy_endpoint,
             device_date: config.device_date,
+            device_clock_origin: Instant::now(),
             bitmaps: BTreeMap::new(),
             directory_searches: BTreeMap::new(),
             next_directory_handle: 1,
@@ -1160,7 +1162,7 @@ impl MrHost {
         ))?;
         runtime.set_dns_mappings(self.dns_mappings.clone());
         runtime.set_wap_proxy_endpoint(self.wap_proxy_endpoint);
-        runtime.set_device_date(self.device_date);
+        runtime.set_device_date(self.device_date.advance(self.device_clock_origin.elapsed()));
         let (previous_package, previous_entry) = previous_application
             .map(|(package, entry)| (package.as_slice(), entry.as_slice()))
             .unwrap_or((&[], &[]));

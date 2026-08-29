@@ -592,6 +592,7 @@ pub(crate) struct ExtRuntime {
     wap_proxy_endpoint: Option<SocketAddrV4>,
     pending_external_action_completions: VecDeque<PendingExternalActionCompletion>,
     device_date: DeviceDate,
+    device_clock_origin: Instant,
     platform_memory_extensions: BTreeMap<u32, PlatformMemoryExtension>,
     platform_memory_cursor: u32,
     mtk_native_extension_owner: Option<u64>,
@@ -805,6 +806,7 @@ impl ExtRuntime {
             wap_proxy_endpoint: None,
             pending_external_action_completions: VecDeque::new(),
             device_date: DeviceDate::default(),
+            device_clock_origin: Instant::now(),
             platform_memory_extensions: BTreeMap::new(),
             platform_memory_cursor: PLATFORM_MEMORY_BASE.0,
             mtk_native_extension_owner: None,
@@ -1123,6 +1125,11 @@ impl ExtRuntime {
 
     pub fn set_device_date(&mut self, device_date: DeviceDate) {
         self.device_date = device_date;
+        self.device_clock_origin = Instant::now();
+    }
+
+    fn current_device_datetime(&self) -> DeviceDate {
+        self.device_date.advance(self.device_clock_origin.elapsed())
     }
 
     pub fn route_key_event(
