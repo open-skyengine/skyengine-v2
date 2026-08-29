@@ -67,6 +67,7 @@ enum NativeFile {
 enum ExtHelperInput<'a> {
     Buffer(&'a [u8]),
     Arguments([u32; 2]),
+    Motion([i32; 3]),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -578,6 +579,12 @@ impl MrHost {
             .and_then(ExtRuntime::active_editor_text)
     }
 
+    pub fn motion_active(&self) -> bool {
+        self.ext_runtime
+            .as_ref()
+            .is_some_and(ExtRuntime::motion_active)
+    }
+
     pub fn finish_platform_event(&mut self) -> Result<()> {
         let Some(mut runtime) = self.ext_runtime.take() else {
             return Ok(());
@@ -612,6 +619,11 @@ impl MrHost {
         input[4..8].copy_from_slice(&parameter0.to_le_bytes());
         input[8..12].copy_from_slice(&parameter1.to_le_bytes());
         self.call_ext_helper(1, ExtHelperInput::Buffer(&input))?;
+        Ok(())
+    }
+
+    pub fn dispatch_native_motion(&mut self, x: i32, y: i32, z: i32) -> Result<()> {
+        self.call_ext_helper(1, ExtHelperInput::Motion([x, y, z]))?;
         Ok(())
     }
 
@@ -1207,6 +1219,9 @@ impl MrHost {
                 }
                 ExtHelperInput::Arguments(arguments) => {
                     runtime.call_active_helper_raw(code, arguments, &mut services)
+                }
+                ExtHelperInput::Motion([x, y, z]) => {
+                    runtime.call_active_motion_event(x, y, z, &mut services)
                 }
             }
         };

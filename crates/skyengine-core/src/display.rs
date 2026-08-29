@@ -6,6 +6,7 @@ pub enum DisplayEvent {
     Key { code: i32, pressed: bool },
     Pointer { x: i32, y: i32, pressed: bool },
     PointerMove { x: i32, y: i32 },
+    Motion { x: i32, y: i32, z: i32 },
     TextInput { text: String },
 }
 

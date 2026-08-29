@@ -92,6 +92,10 @@ impl MrVm {
         self.host.display.as_mut()
     }
 
+    pub fn motion_active(&self) -> bool {
+        self.host.motion_active()
+    }
+
     pub(crate) fn stop_audio(&mut self) {
         self.host.stop_audio();
     }
@@ -274,6 +278,17 @@ impl MrVm {
             Ok(None)
         } else {
             Ok(event)
+        }
+    }
+
+    pub fn route_motion(&mut self, x: i32, y: i32, z: i32) -> Result<Option<(i32, i32, i32)>> {
+        if self.host.motion_active() {
+            self.host.dispatch_native_motion(x, y, z)?;
+            Ok(None)
+        } else if self.native_entry {
+            Ok(None)
+        } else {
+            Ok(Some((18, x, y)))
         }
     }
 

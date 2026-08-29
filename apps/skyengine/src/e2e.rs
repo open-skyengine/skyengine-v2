@@ -421,6 +421,19 @@ fn handle_command(
             .map_err(|_| "pointer_accept_timeout".to_string())?;
         return Ok(format!("OK click draw_count {draw_count}"));
     }
+    if let Some(arguments) = command.strip_prefix("MOTION ") {
+        let mut arguments = arguments.split_whitespace();
+        let x = parse_i32(arguments.next(), "motion_x")?;
+        let y = parse_i32(arguments.next(), "motion_y")?;
+        let z = parse_i32(arguments.next(), "motion_z")?;
+        if arguments.next().is_some() {
+            return Err("invalid_motion".into());
+        }
+        sender
+            .send(ControlMessage::Event(DisplayEvent::Motion { x, y, z }))
+            .map_err(|_| "runtime_exited".to_string())?;
+        return Ok("OK motion".into());
+    }
     if command == "QUIT" {
         sender
             .send(ControlMessage::Event(DisplayEvent::Quit))

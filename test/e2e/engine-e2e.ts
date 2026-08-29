@@ -235,6 +235,10 @@ export class SkyEngineE2e {
     if (previous != null) await this.waitDrawAfter(previous, options.timeoutMs);
   }
 
+  async motion(x: number, y: number, z: number): Promise<void> {
+    await this.command(`MOTION ${x} ${y} ${z}`);
+  }
+
   async screen(name = "screen"): Promise<PpmImage> {
     const ppmPath = path.join(this.tmpDir, `${name}.ppm`);
     await this.command(`SCREEN ${ppmPath}`);

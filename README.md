@@ -76,8 +76,9 @@ rustup target add aarch64-linux-android armv7-linux-androideabi
 会被解码为 44.1 kHz、双声道、交错排列的 S16LE PCM。原生宿主通过
 `skyengine_api_audio_render_s16le` 拉取音频帧，并通过 `skyengine_api_audio_is_active`
 判断播放是否仍在进行。SDL 前端会自动打开匹配格式的播放设备；无头运行使用静默音频后端，
-以保证 E2E 时序确定。振动和动作传感器符号保留 ABI 兼容性，但由于当前没有对应的宿主
-传感器或输出服务，它们会报告为未启用。
+以保证 E2E 时序确定。Flutter 宿主可轮询 `skyengine_api_motion_active`；返回 `1` 时通过
+`skyengine_api_motion` 投递有符号三轴倾斜样本。运行时按 motion 事件 ABI 把三轴结构传给
+native MRP。振动输出仍未接入宿主服务，`skyengine_api_take_shake` 保留为兼容接口。
 
 桌面运行可用 `--sound-font FILE.sf2`（或 `SKYENGINE_SOUNDFONT`）选择 GM SoundFont，
 由 `rustysynth` 处理 MIDI 序列、乐器采样、鼓组、控制器和效果。未配置 SF2 时继续使用

@@ -383,6 +383,10 @@ impl Runtime {
         self.vm.active_editor_text()
     }
 
+    pub fn motion_active(&self) -> bool {
+        self.state == RuntimeState::Running && self.vm.motion_active()
+    }
+
     pub fn start(&mut self) -> Result<()> {
         if self.state != RuntimeState::Loaded {
             return Err(Error::MrFault(format!(
@@ -482,6 +486,19 @@ impl Runtime {
             }
             DisplayEvent::PointerMove { x, y } if self.state == RuntimeState::Running => {
                 if let Some((event, parameter0, parameter1)) = self.vm.route_pointer_move(x, y)? {
+                    self.vm.call_global(
+                        b"dealevent",
+                        vec![
+                            Value::Number(f64::from(event)),
+                            Value::Number(f64::from(parameter0)),
+                            Value::Number(f64::from(parameter1)),
+                        ],
+                    )?;
+                }
+                self.apply_lifecycle_request()?;
+            }
+            DisplayEvent::Motion { x, y, z } if self.state == RuntimeState::Running => {
+                if let Some((event, parameter0, parameter1)) = self.vm.route_motion(x, y, z)? {
                     self.vm.call_global(
                         b"dealevent",
                         vec![

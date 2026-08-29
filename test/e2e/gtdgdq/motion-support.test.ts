@@ -2,6 +2,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
 import fs from "fs";
 
+function paddleX(screen: Awaited<ReturnType<SkyEngineE2e["screen"]>>): number | undefined {
+  const positions: number[] = [];
+  for (let y = 260; y < 300; y += 1) {
+    for (let x = 0; x < screen.width; x += 1) {
+      const pixel = screen.pixel(x, y);
+      if (pixel[0] === 24 && pixel[1] === 120 && pixel[2] === 248) positions.push(x);
+    }
+  }
+  if (positions.length === 0) return undefined;
+  return positions.reduce((sum, x) => sum + x, 0) / positions.length;
+}
+
 describe("gtdgdq", () => {
   let engine: SkyEngineE2e | undefined;
   let ws: SkyEngineWorkspace | undefined;
@@ -49,6 +61,38 @@ describe("gtdgdq", () => {
         // rgb(248, 248, 240)
         expect(screen.uniqueColorCount()).toEqual(2);
       })
+      await engine.key('LEFT_SOFT', 1_000);
+      await engine.key('DOWN', 1_000);
+      await engine.key('LEFT_SOFT', 1_000);
+      await engine.waitForPixel(120, 160, [152, 40, 176], {
+        name: "level-one-prompt",
+        timeoutMs: 10_000,
+        intervalMs: 250,
+      });
+      await engine.key('SELECT', 1_000);
+      const before = await engine.waitForScreen(
+        screen => screen.pixel(120, 160).join(",") !== "152,40,176",
+        { name: "game-before-motion", timeoutMs: 10_000 }
+      );
+      await engine.delay(250);
+      const neutral = await engine.screen("game-neutral");
+      const beforeX = paddleX(before);
+      const neutralX = paddleX(neutral);
+      expect(beforeX).toBeDefined();
+      expect(neutralX).toBeDefined();
+      expect(neutralX).toBe(beforeX);
+      for (let sample = 0; sample < 5; sample += 1) {
+        await engine.motion(100, 0, 0);
+        await engine.delay(50);
+      }
+      const after = await engine.waitForScreen(
+        screen => {
+          const x = paddleX(screen);
+          return x !== undefined && neutralX !== undefined && Math.abs(x - neutralX) > 5;
+        },
+        { name: "game-after-motion", timeoutMs: 2_000, intervalMs: 50 }
+      );
+      expect(Math.abs(paddleX(after)! - neutralX!)).toBeGreaterThan(5);
     }
   });
   

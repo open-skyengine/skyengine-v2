@@ -616,6 +616,7 @@ pub(crate) struct ExtRuntime {
     native_extension_profile: NativeExtensionProfile,
     clock_origin: Instant,
     timer_deadline: Option<Instant>,
+    motion_active: bool,
 }
 
 impl ExtRuntime {
@@ -830,6 +831,7 @@ impl ExtRuntime {
             native_extension_profile: NativeExtensionProfile::Baseline,
             clock_origin: Instant::now(),
             timer_deadline: None,
+            motion_active: false,
         })
     }
 
@@ -979,6 +981,38 @@ impl ExtRuntime {
             .active_helper
             .ok_or_else(|| Error::Abi("no EXT helper is registered".into()))?;
         self.call_active_helper_arguments(helper, code, arguments[0], arguments[1], services)
+    }
+
+    pub fn call_active_motion_event(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        services: &mut dyn NativeServices,
+    ) -> Result<(i32, Vec<u8>)> {
+        let helper = self
+            .active_helper
+            .ok_or_else(|| Error::Abi("no EXT helper is registered".into()))?;
+        let input_address = self.allocate(24, HEAP_ALIGNMENT)?;
+        let sample_address = input_address.checked_add(12)?;
+        let mut input = [0_u8; 24];
+        input[0..4].copy_from_slice(&18_i32.to_le_bytes());
+        input[8..12].copy_from_slice(&sample_address.0.to_le_bytes());
+        input[12..16].copy_from_slice(&x.to_le_bytes());
+        input[16..20].copy_from_slice(&y.to_le_bytes());
+        input[20..24].copy_from_slice(&z.to_le_bytes());
+        self.memory.write(input_address, &input)?;
+        let result = self.call_active_helper_arguments(helper, 1, input_address.0, 12, services);
+        let free_result = self.free_guest_block(input_address, input.len());
+        match (result, free_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    pub fn motion_active(&self) -> bool {
+        self.motion_active
     }
 
     fn call_active_helper_arguments(

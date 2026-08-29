@@ -103,6 +103,7 @@ impl Shared {
                 running: false,
                 paused: false,
                 stop_requested: false,
+                motion_active: false,
                 edit_text: None,
                 last_error: None,
             }),
@@ -117,6 +118,19 @@ impl Shared {
             return Err("SkyEngine runtime is not running".into());
         }
         state.events.push_back(event);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn push_motion(&self, x: i32, y: i32, z: i32) -> Result<(), String> {
+        let mut state = lock(&self.state);
+        if !state.running || state.stop_requested {
+            return Err("SkyEngine runtime is not running".into());
+        }
+        if state.paused || !state.motion_active {
+            return Err("SkyEngine motion input is not active".into());
+        }
+        state.events.push_back(DisplayEvent::Motion { x, y, z });
         self.wake.notify_one();
         Ok(())
     }
@@ -141,6 +155,7 @@ struct SharedState {
     running: bool,
     paused: bool,
     stop_requested: bool,
+    motion_active: bool,
     edit_text: Option<String>,
     last_error: Option<String>,
 }
@@ -373,6 +388,7 @@ fn worker_main(
             runtime.state(),
             RuntimeState::Running | RuntimeState::Paused
         );
+        state.motion_active = runtime.motion_active();
         state.edit_text = runtime.active_editor_text();
     }
     let _ = startup.send(Ok(()));
@@ -402,6 +418,7 @@ fn worker_main(
         }
         {
             let mut state = lock(&shared.state);
+            state.motion_active = runtime.motion_active();
             state.edit_text = runtime.active_editor_text();
         }
         if !matches!(
@@ -417,6 +434,7 @@ fn worker_main(
     let mut state = lock(&shared.state);
     state.running = false;
     state.paused = false;
+    state.motion_active = false;
     state.edit_text = None;
     shared.wake.notify_all();
 }
@@ -1001,13 +1019,23 @@ pub extern "C" fn skyengine_api_cancel_edit() -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn skyengine_api_motion(_x: i32, _y: i32, _z: i32) -> i32 {
-    -1
+pub extern "C" fn skyengine_api_motion(x: i32, y: i32, z: i32) -> i32 {
+    ffi_result(|| {
+        let shared = current_shared()?;
+        shared.push_motion(x, y, z)?;
+        Ok(0)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn skyengine_api_motion_active() -> i32 {
-    -1
+    catch_unwind(AssertUnwindSafe(|| {
+        lock(&ENGINE).worker.as_ref().map_or(0, |worker| {
+            let state = lock(&worker.shared.state);
+            i32::from(state.running && !state.paused && state.motion_active)
+        })
+    }))
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
@@ -1036,6 +1064,9 @@ pub extern "C" fn skyengine_api_last_error() -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_ENGINE: Mutex<()> = Mutex::new(());
 
     struct EngineGuard;
 
@@ -1093,7 +1124,27 @@ mod tests {
     }
 
     #[test]
+    fn flutter_motion_input_requires_subscription_and_preserves_all_axes() {
+        let shared = Shared::new(2, 3);
+        lock(&shared.state).running = true;
+
+        assert!(shared.push_motion(12, -34, 56).is_err());
+        lock(&shared.state).motion_active = true;
+        shared.push_motion(12, -34, 56).unwrap();
+
+        assert_eq!(
+            lock(&shared.state).events.pop_front(),
+            Some(DisplayEvent::Motion {
+                x: 12,
+                y: -34,
+                z: 56,
+            })
+        );
+    }
+
+    #[test]
     fn c_api_runs_a_real_package_and_publishes_its_first_frame() {
+        let _serial = lock(&TEST_ENGINE);
         let _guard = EngineGuard;
         let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/fixtures")
@@ -1132,5 +1183,69 @@ mod tests {
         assert_eq!(skyengine_api_get_screen_height(), 320);
         assert!(!skyengine_api_get_screen_buffer().is_null());
         assert!(!skyengine_api_get_screen_rgba_buffer().is_null());
+    }
+
+    #[test]
+    fn c_api_reports_and_delivers_motion_for_a_real_package() {
+        let _serial = lock(&TEST_ENGINE);
+        let _guard = EngineGuard;
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures")
+            .canonicalize()
+            .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let work_dir = std::env::temp_dir().join(format!(
+            "skyengine-ffi-motion-{}-{nonce}",
+            std::process::id()
+        ));
+        let font_dir = work_dir.join("mythroad/system");
+        std::fs::create_dir_all(&font_dir).unwrap();
+        std::fs::copy(
+            fixture_root.join("mythroad/system/gb16.uc2"),
+            font_dir.join("gb16.uc2"),
+        )
+        .unwrap();
+        let work_dir_string = safe_c_string(&work_dir.to_string_lossy());
+        let app_path = safe_c_string(&fixture_root.join("gtdgdq.mrp").to_string_lossy());
+        let entry = safe_c_string("start.mr");
+
+        assert_eq!(skyengine_api_init(240, 320), 0);
+        // SAFETY: The test-owned C strings live for the duration of each call.
+        assert_eq!(
+            unsafe { skyengine_api_set_work_dir(work_dir_string.as_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { skyengine_api_start(app_path.as_ptr(), entry.as_ptr(), ptr::null()) },
+            0,
+            "{}",
+            unsafe { CStr::from_ptr(skyengine_api_last_error()) }.to_string_lossy()
+        );
+
+        assert_eq!(skyengine_api_motion_active(), 0);
+        for code in [18, 20, 17] {
+            assert_eq!(skyengine_api_event(0, code, 0), 0);
+            assert_eq!(skyengine_api_event(1, code, 0), 0);
+            thread::sleep(Duration::from_millis(100));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while skyengine_api_motion_active() == 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(skyengine_api_motion_active(), 1);
+        assert_eq!(skyengine_api_pause(), 0);
+        assert_eq!(skyengine_api_motion_active(), 0);
+        assert_eq!(skyengine_api_motion(8, 0, 0), -1);
+        assert_eq!(skyengine_api_resume(), 0);
+        assert_eq!(skyengine_api_motion_active(), 1);
+        assert_eq!(skyengine_api_motion(8, 0, 0), 0);
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(skyengine_api_is_running(), 1);
+        skyengine_api_destroy();
+        std::fs::remove_dir_all(work_dir).unwrap();
     }
 }

@@ -215,15 +215,22 @@ impl ExtRuntime {
                 (1_214, mode) if mode <= 1 => cpu.set_register(0, 0),
                 // Network request compatibility version used by message.ext.
                 (1_205, 0) => cpu.set_register(0, 1_001),
-                // Initialize the motion-event provider. The deterministic headless
-                // profile accepts registration but emits no sensor samples.
-                (1_206, 0) => cpu.set_register(0, 0),
+                // Initialize the motion-event provider. Samples remain disabled until
+                // the guest selects the verified event-driven mode below.
+                (1_206, 0) => {
+                    self.motion_active = false;
+                    cpu.set_register(0, 0);
+                }
                 // Optional device effects used by talkcat's downloaded belly and
                 // fart actions. The deterministic headless profile has no provider.
                 (1_211, 2 | 3) => cpu.set_register(0, 0),
                 // Query and configure the same deterministic motion provider.
                 // Mode 2 is the verified event-driven form used after startup.
-                (4_002, 0) | (4_005, 2) => cpu.set_register(0, 0),
+                (4_002, 0) => cpu.set_register(0, 0),
+                (4_005, 2) => {
+                    self.motion_active = true;
+                    cpu.set_register(0, 0);
+                }
                 // Native audio wrappers use a five-step multimedia volume.
                 (1_302, volume) if volume <= 5 => {
                     services.set_sound_volume(volume as u8)?;

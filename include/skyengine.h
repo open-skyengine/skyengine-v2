@@ -60,7 +60,9 @@ SKYENGINE_EXPORT const char *skyengine_api_get_edit_text(void);
 SKYENGINE_EXPORT int32_t skyengine_api_set_edit_text(const char *text);
 SKYENGINE_EXPORT int32_t skyengine_api_cancel_edit(void);
 
+/* Queues one signed three-axis motion sample when the guest has enabled motion events. */
 SKYENGINE_EXPORT int32_t skyengine_api_motion(int32_t x, int32_t y, int32_t z);
+/* Returns 1 while the running guest requests motion samples, otherwise 0. */
 SKYENGINE_EXPORT int32_t skyengine_api_motion_active(void);
 SKYENGINE_EXPORT int32_t skyengine_api_take_shake(void);
 

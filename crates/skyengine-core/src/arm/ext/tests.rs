@@ -32,6 +32,58 @@ fn load_test_module(runtime: &mut ExtRuntime) {
         .unwrap();
 }
 
+fn motion_capture_module() -> (Vec<u8>, GuestAddr) {
+    const MODULE_BASE: u32 = 0x1000_0000;
+    const TRAP_BASE: u32 = 0xff00_0000;
+    let helper = MODULE_BASE + 40;
+    let captured_axes = GuestAddr(MODULE_BASE + 88);
+    let instructions = [
+        0xe92d_4000, // entry: push {lr}
+        0xe59f_000c, // ldr r0, [pc, #12] (helper)
+        0xe3a0_1014, // mov r1, #20
+        0xe59f_c008, // ldr ip, [pc, #8] (slot 25)
+        0xe12f_ff3c, // blx ip
+        0xe8bd_8000, // pop {pc}
+        helper,
+        TRAP_BASE + 25 * 4,
+        0xe351_0001, // helper: cmp r1, #1
+        0x112f_ff1e, // bxne lr
+        0xe592_1000, // ldr r1, [r2] (event)
+        0xe351_0012, // cmp r1, #18
+        0x112f_ff1e, // bxne lr
+        0xe592_3008, // ldr r3, [r2, #8] (motion sample pointer)
+        0xe893_0007, // ldm r3, {r0, r1, r2}
+        0xe59f_3008, // ldr r3, [pc, #8] (capture address)
+        0xe883_0007, // stm r3, {r0, r1, r2}
+        0xe3a0_0000, // mov r0, #0
+        0xe12f_ff1e, // bx lr
+        captured_axes.0,
+    ];
+    let mut image = b"MRPGCMAP".to_vec();
+    image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
+    image.extend_from_slice(&[0; 12]);
+    (image, captured_axes)
+}
+
+#[test]
+fn motion_events_pass_a_guest_pointer_to_all_three_signed_axes() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let (module, captured_axes) = motion_capture_module();
+    runtime
+        .load_and_call_entry(&module, 0, &mut StubServices)
+        .unwrap();
+
+    runtime
+        .call_active_motion_event(12, -34, 56, &mut StubServices)
+        .unwrap();
+
+    let axes = runtime.memory.read(captured_axes, 12).unwrap();
+    assert_eq!(i32::from_le_bytes(axes[0..4].try_into().unwrap()), 12);
+    assert_eq!(i32::from_le_bytes(axes[4..8].try_into().unwrap()), -34);
+    assert_eq!(i32::from_le_bytes(axes[8..12].try_into().unwrap()), 56);
+}
+
 #[test]
 fn semihosting_exit_unwinds_the_guest_call_and_requests_runtime_exit() {
     let mut image = b"MRPGCMAP".to_vec();

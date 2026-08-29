@@ -1777,6 +1777,7 @@ fn platform_motion_initialization_uses_the_silent_headless_provider() {
         .unwrap();
 
     assert_eq!(cpu.register(0), 0);
+    assert!(!runtime.motion_active());
 
     cpu.set_register(0, 1_206);
     cpu.set_register(1, 1);
@@ -1793,6 +1794,7 @@ fn platform_motion_initialization_uses_the_silent_headless_provider() {
             .unwrap();
         assert_eq!(cpu.register(0), 0, "command {command}, argument {argument}");
     }
+    assert!(runtime.motion_active());
 
     cpu.set_register(0, 4_005);
     cpu.set_register(1, 1);
