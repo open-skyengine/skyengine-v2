@@ -1203,16 +1203,15 @@ impl ExtRuntime {
         // and pass the second word as mr_readFile's output-length pointer. A
         // returned page can leave an older pair intact, so prefer the pair tied
         // to this call before falling back to the heap-wide compatibility scan.
-        if let Some(preferred_descriptor) = output_len_pointer.0.checked_sub(4).map(GuestAddr) {
-            if let Some(candidate) =
+        if let Some(preferred_descriptor) = output_len_pointer.0.checked_sub(4).map(GuestAddr)
+            && let Some(candidate) =
                 descriptor_matches
                     .iter()
                     .find_map(|(descriptor, candidate)| {
                         (*descriptor == preferred_descriptor).then_some(*candidate)
                     })
-            {
-                return Ok(Some(candidate));
-            }
+        {
+            return Ok(Some(candidate));
         }
         // This legacy reader keeps the prepared-buffer pointer immediately after
         // the output-length word in the current call's argument record.

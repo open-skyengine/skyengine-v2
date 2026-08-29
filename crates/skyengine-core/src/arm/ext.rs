@@ -1370,10 +1370,10 @@ impl ExtRuntime {
         services: &mut dyn NativeServices,
     ) -> Result<bool> {
         if let Some(completion) = self.pending_sms_results.pop_front() {
-            if !self
+            if self
                 .modules
                 .get(completion.helper.module)
-                .is_some_and(|module| module.generation == completion.owner_generation)
+                .is_none_or(|module| module.generation != completion.owner_generation)
                 || !self.guest_function_is_executable(completion.helper)
             {
                 return Ok(true);
@@ -1401,10 +1401,10 @@ impl ExtRuntime {
         let Some(completion) = self.pending_external_action_completions.pop_front() else {
             return Ok(false);
         };
-        if !self
+        if self
             .modules
             .get(completion.callback.module)
-            .is_some_and(|module| module.generation == completion.owner_generation)
+            .is_none_or(|module| module.generation != completion.owner_generation)
         {
             return Ok(true);
         }

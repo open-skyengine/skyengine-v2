@@ -298,8 +298,8 @@ impl Parser {
         }
         let mut statements = Vec::new();
         self.separators();
-        while !matches!(self.peek(), TokenKind::Eof)
-            && !(stop_at_end && matches!(self.peek(), TokenKind::Else | TokenKind::End))
+        while !(matches!(self.peek(), TokenKind::Eof)
+            || stop_at_end && matches!(self.peek(), TokenKind::Else | TokenKind::End))
         {
             statements.push(self.statement(depth)?);
             self.separators();
