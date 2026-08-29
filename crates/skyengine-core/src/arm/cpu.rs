@@ -2,6 +2,8 @@ use crate::{Error, Result};
 
 use super::{GuestAddr, GuestMemory};
 
+const LEGACY_NULL_DATA_LEN: u32 = 8;
+
 #[derive(Clone, Debug)]
 pub struct ArmCpu {
     registers: [u32; 16],
@@ -11,6 +13,7 @@ pub struct ArmCpu {
     overflow: bool,
     thumb: bool,
     semihosting_exit_reason: Option<u32>,
+    legacy_null_signed_halfword_loads: bool,
 }
 
 impl Default for ArmCpu {
@@ -29,6 +32,7 @@ impl ArmCpu {
             overflow: false,
             thumb: false,
             semihosting_exit_reason: None,
+            legacy_null_signed_halfword_loads: false,
         }
     }
 
@@ -59,6 +63,10 @@ impl ArmCpu {
 
     pub(crate) fn take_semihosting_exit_reason(&mut self) -> Option<u32> {
         self.semihosting_exit_reason.take()
+    }
+
+    pub(crate) fn allow_legacy_null_signed_halfword_loads(&mut self) {
+        self.legacy_null_signed_halfword_loads = true;
     }
 
     pub fn cpsr(&self) -> u32 {
@@ -457,7 +465,7 @@ impl ArmCpu {
             let value = match operation {
                 1 => u32::from(memory.read_u16(GuestAddr(transfer_address))?),
                 2 => i32::from(memory.read_u8(GuestAddr(transfer_address))? as i8) as u32,
-                3 => i32::from(memory.read_u16(GuestAddr(transfer_address))? as i16) as u32,
+                3 => self.read_signed_halfword(memory, GuestAddr(transfer_address))?,
                 _ => return Err(self.unsupported_arm(instruction, address)),
             };
             if rd == 15 {
@@ -804,7 +812,7 @@ impl ArmCpu {
             4 => self.registers[destination] = memory.read_u32(address)?,
             5 => self.registers[destination] = u32::from(memory.read_u16(address)?),
             6 => self.registers[destination] = u32::from(memory.read_u8(address)?),
-            7 => self.registers[destination] = i32::from(memory.read_u16(address)? as i16) as u32,
+            7 => self.registers[destination] = self.read_signed_halfword(memory, address)?,
             _ => unreachable!(),
         }
         Ok(())
@@ -959,6 +967,19 @@ impl ArmCpu {
         } else {
             self.registers[index]
         }
+    }
+
+    fn read_signed_halfword(&self, memory: &GuestMemory, address: GuestAddr) -> Result<u32> {
+        let is_legacy_null_data = self.legacy_null_signed_halfword_loads
+            && address
+                .0
+                .checked_add(2)
+                .is_some_and(|end| end <= LEGACY_NULL_DATA_LEN)
+            && !memory.is_mapped(address, 2);
+        if is_legacy_null_data {
+            return Ok(0);
+        }
+        Ok(i32::from(memory.read_u16(address)? as i16) as u32)
     }
 
     fn write_thumb_register(&mut self, index: usize, value: u32) {

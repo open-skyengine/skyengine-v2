@@ -193,6 +193,10 @@ impl GuestMemory {
         self.segments(address, len, permissions).map(|_| ())
     }
 
+    pub(crate) fn is_mapped(&self, address: GuestAddr, len: usize) -> bool {
+        self.segments(address, len, Permissions(0)).is_ok()
+    }
+
     pub fn add_permissions(
         &mut self,
         address: GuestAddr,

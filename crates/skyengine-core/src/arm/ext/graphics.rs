@@ -1214,6 +1214,16 @@ impl ExtRuntime {
                 return Ok(Some(candidate));
             }
         }
+        // This legacy reader keeps the prepared-buffer pointer immediately after
+        // the output-length word in the current call's argument record.
+        if output_len_pointer.0 != 0
+            && let Some(candidate) = self.prepared_output_from_current_argument_record(
+                output_len_pointer,
+                &descriptor_candidates,
+            )?
+        {
+            return Ok(Some(candidate));
+        }
         match descriptor_candidates.as_slice() {
             [candidate] => return Ok(Some(*candidate)),
             [] => {}
@@ -1263,6 +1273,26 @@ impl ExtRuntime {
                 "compact RAM MRP output has ambiguous prepared buffers: {wrapper_candidates:?}"
             ))),
         }
+    }
+
+    fn prepared_output_from_current_argument_record(
+        &self,
+        output_len_pointer: GuestAddr,
+        candidates: &[GuestAddr],
+    ) -> Result<Option<GuestAddr>> {
+        let Some(address) = output_len_pointer.0.checked_add(4).map(GuestAddr) else {
+            return Ok(None);
+        };
+        if address.0 & 3 != 0
+            || self
+                .memory
+                .check_range(address, 4, Permissions::READ)
+                .is_err()
+        {
+            return Ok(None);
+        }
+        let value = GuestAddr(self.memory.read_u32(address)?);
+        Ok(candidates.contains(&value).then_some(value))
     }
 
     pub(super) fn draw_bitmap_region_to_screen(

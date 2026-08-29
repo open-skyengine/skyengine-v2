@@ -160,6 +160,60 @@ fn thumb_arithmetic_and_conditional_branch_follow_pipeline_pc() {
 }
 
 #[test]
+fn legacy_null_signed_halfword_loads_are_narrow_and_opt_in() {
+    let instructions = [
+        0x5e40, // ldrsh r0, [r0, r1]
+        0x2102, // movs r1, #2
+        0x5e40, // ldrsh r0, [r0, r1]
+        0x2104, // movs r1, #4
+        0x5e40, // ldrsh r0, [r0, r1]
+    ];
+    let mut strict_memory = thumb_code_memory(&instructions);
+    let mut strict_cpu = ArmCpu::new();
+    strict_cpu.set_pc(0x1001);
+    assert!(matches!(
+        strict_cpu.step(&mut strict_memory),
+        Err(Error::ArmFault(message)) if message.contains("unmapped guest access")
+    ));
+
+    let mut legacy_memory = thumb_code_memory(&instructions);
+    let mut legacy_cpu = ArmCpu::new();
+    legacy_cpu.allow_legacy_null_signed_halfword_loads();
+    legacy_cpu.set_pc(0x1001);
+    for _ in 0..instructions.len() {
+        legacy_cpu.step(&mut legacy_memory).unwrap();
+    }
+    assert_eq!(legacy_cpu.register(0), 0);
+
+    let mut out_of_range_memory = thumb_code_memory(&[0x5e40]);
+    let mut out_of_range_cpu = ArmCpu::new();
+    out_of_range_cpu.allow_legacy_null_signed_halfword_loads();
+    out_of_range_cpu.set_pc(0x1001);
+    out_of_range_cpu.set_register(1, 7);
+    assert!(matches!(
+        out_of_range_cpu.step(&mut out_of_range_memory),
+        Err(Error::ArmFault(message)) if message.contains("unmapped guest access")
+    ));
+
+    let mut protected_memory = thumb_code_memory(&[0x5e40]);
+    protected_memory
+        .map(
+            GuestAddr(0),
+            LEGACY_NULL_DATA_LEN as usize,
+            Permissions::EXECUTE,
+            "protected low data",
+        )
+        .unwrap();
+    let mut protected_cpu = ArmCpu::new();
+    protected_cpu.allow_legacy_null_signed_halfword_loads();
+    protected_cpu.set_pc(0x1001);
+    assert!(matches!(
+        protected_cpu.step(&mut protected_memory),
+        Err(Error::ArmFault(message)) if message.contains("permission fault")
+    ));
+}
+
+#[test]
 fn thumb_semihosting_character_write_validates_its_input() {
     let mut memory = thumb_code_memory(&[0xdfab, 0xdfab, 0xdf00]);
     memory

@@ -1810,6 +1810,7 @@ impl ExtRuntime {
         }
         let static_base_r9 = module.static_base_r9;
         let mut cpu = ArmCpu::new();
+        cpu.allow_legacy_null_signed_halfword_loads();
         for (index, value) in registers.into_iter().enumerate() {
             cpu.set_register(index, value);
         }

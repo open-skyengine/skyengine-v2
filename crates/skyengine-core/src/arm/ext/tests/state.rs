@@ -24,6 +24,16 @@ fn legacy_keypad_registers_default_to_idle_and_track_key_events() {
 }
 
 #[test]
+fn ext_runtime_keeps_null_memory_unmapped_for_host_accesses() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+
+    assert!(runtime.memory.read_u16(GuestAddr(0)).is_err());
+    assert!(runtime.memory.write_u16(GuestAddr(0), 1).is_err());
+    assert!(runtime.memory.fetch_u16(GuestAddr(0)).is_err());
+}
+
+#[test]
 fn guest_allocator_reuses_and_merges_freed_blocks() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
@@ -2537,6 +2547,144 @@ fn compact_ram_package_uses_the_current_length_pointer_to_disambiguate_descripto
                 output_len as usize,
                 0,
                 current_length_pointer,
+            )
+            .unwrap(),
+        Some(current_output)
+    );
+}
+
+#[test]
+fn compact_ram_package_only_uses_the_current_argument_record_pointer_slot() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let output_len = 0x30_u32;
+
+    let stale_output = runtime
+        .allocate_guest_block_for_module(output_len as usize, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(stale_output.checked_add(4).unwrap(), output_len)
+        .unwrap();
+    let stale_descriptor = runtime.allocate(8, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(stale_descriptor, stale_output.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(stale_descriptor.checked_add(4).unwrap(), output_len)
+        .unwrap();
+
+    let current_output = runtime
+        .allocate_guest_block_for_module(output_len as usize, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(current_output.checked_add(4).unwrap(), output_len)
+        .unwrap();
+    let current_descriptor = runtime.allocate(8, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(current_descriptor, current_output.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(current_descriptor.checked_add(4).unwrap(), output_len)
+        .unwrap();
+
+    runtime.allocate(512, 4).unwrap();
+    let output_len_pointer = runtime.allocate(44, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(output_len_pointer, output_len)
+        .unwrap();
+
+    let package = runtime.allocate(24, 8).unwrap();
+    let mut compact_header = [0_u8; 24];
+    compact_header[..4].copy_from_slice(b"MRPG");
+    compact_header[4..8].copy_from_slice(&4_u32.to_le_bytes());
+    compact_header[12..16].copy_from_slice(&4_u32.to_le_bytes());
+    runtime.memory.write(package, &compact_header).unwrap();
+
+    assert!(matches!(
+        runtime.compact_ram_output_target(
+            package,
+            compact_header.len(),
+            output_len as usize,
+            0,
+            GuestAddr(0),
+        ),
+        Err(Error::Abi(message)) if message.contains("ambiguous prepared buffers")
+    ));
+
+    let unsupported_slot = output_len_pointer.checked_add(8).unwrap();
+    runtime
+        .memory
+        .write_u32(unsupported_slot, current_output.0)
+        .unwrap();
+    assert!(matches!(
+        runtime.compact_ram_output_target(
+            package,
+            compact_header.len(),
+            output_len as usize,
+            0,
+            output_len_pointer,
+        ),
+        Err(Error::Abi(message)) if message.contains("ambiguous prepared buffers")
+    ));
+    runtime.memory.write_u32(unsupported_slot, 0).unwrap();
+
+    let adjacent_slot = output_len_pointer.checked_add(4).unwrap();
+    runtime
+        .memory
+        .write_u32(adjacent_slot, current_output.0)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .compact_ram_output_target(
+                package,
+                compact_header.len(),
+                output_len as usize,
+                0,
+                output_len_pointer,
+            )
+            .unwrap(),
+        Some(current_output)
+    );
+    runtime.memory.write_u32(adjacent_slot, 0).unwrap();
+
+    let trailing_slot = output_len_pointer.checked_add(40).unwrap();
+    runtime
+        .memory
+        .write_u32(trailing_slot, current_output.0)
+        .unwrap();
+    assert!(matches!(
+        runtime.compact_ram_output_target(
+            package,
+            compact_header.len(),
+            output_len as usize,
+            0,
+            output_len_pointer,
+        ),
+        Err(Error::Abi(message)) if message.contains("ambiguous prepared buffers")
+    ));
+
+    runtime
+        .memory
+        .write_u32(adjacent_slot, current_output.0)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .compact_ram_output_target(
+                package,
+                compact_header.len(),
+                output_len as usize,
+                0,
+                output_len_pointer,
             )
             .unwrap(),
         Some(current_output)
