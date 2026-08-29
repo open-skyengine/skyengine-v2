@@ -1160,7 +1160,7 @@ impl ExtRuntime {
                 as usize,
         )?;
         let heap_end = HEAP_BASE.0 + self.heap_len as u32;
-        let mut candidates = Vec::new();
+        let mut descriptor_candidates = Vec::new();
         for descriptor_len_address in (HEAP_BASE.0 + 4..heap_end).step_by(4) {
             let recorded_len = self.memory.read_u32(GuestAddr(descriptor_len_address))?;
             if recorded_len != aligned_len {
@@ -1189,13 +1189,27 @@ impl ExtRuntime {
                 module,
             )?;
             if claimable {
-                candidates.push(candidate);
+                descriptor_candidates.push(candidate);
             }
         }
+        descriptor_candidates.sort_unstable();
+        descriptor_candidates.dedup();
+        match descriptor_candidates.as_slice() {
+            [candidate] => return Ok(Some(*candidate)),
+            [] => {}
+            _ => {
+                return Err(Error::Abi(format!(
+                    "compact RAM MRP output has ambiguous prepared buffers: {descriptor_candidates:?}"
+                )));
+            }
+        }
+
         // The legacy cfunction malloc wrapper asks the platform allocator for
         // `payload_len + 4`, stores payload_len at the backing address, and
         // returns backing + 4. Match that payload view directly. The backing
-        // allocation remains the object freed by the corresponding wrapper.
+        // allocation remains the object freed by the corresponding wrapper. This
+        // is only a fallback when the guest did not leave an explicit descriptor.
+        let mut wrapper_candidates = Vec::new();
         for (&base, &block_len) in &self.guest_allocations {
             if block_len != wrapper_block_len
                 || self.memory.read_u32(GuestAddr(base))? != output_len
@@ -1217,16 +1231,16 @@ impl ExtRuntime {
                 aligned_len,
                 module,
             )? {
-                candidates.push(candidate);
+                wrapper_candidates.push(candidate);
             }
         }
-        candidates.sort_unstable();
-        candidates.dedup();
-        match candidates.as_slice() {
+        wrapper_candidates.sort_unstable();
+        wrapper_candidates.dedup();
+        match wrapper_candidates.as_slice() {
             [] => Ok(None),
             [candidate] => Ok(Some(*candidate)),
             _ => Err(Error::Abi(format!(
-                "compact RAM MRP output has ambiguous prepared buffers: {candidates:?}"
+                "compact RAM MRP output has ambiguous prepared buffers: {wrapper_candidates:?}"
             ))),
         }
     }

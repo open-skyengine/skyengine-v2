@@ -689,7 +689,18 @@ fn guest_allocator_preserves_an_untracked_doubled_free_counter() {
 }
 
 #[test]
-fn guest_allocator_recovers_the_tail_after_a_legacy_payload_is_withdrawn() {
+fn guest_allocator_recovers_the_tail_after_a_legacy_payload_is_zeroed() {
+    assert_guest_allocator_recovers_tail_after_legacy_payload_withdrawal([0; 8]);
+}
+
+#[test]
+fn guest_allocator_recovers_the_tail_after_a_legacy_payload_is_poisoned() {
+    assert_guest_allocator_recovers_tail_after_legacy_payload_withdrawal([
+        0xfd, 0xa5, 0xfd, 0xa5, 0xfd, 0xa5, 0xfd, 0xa5,
+    ]);
+}
+
+fn assert_guest_allocator_recovers_tail_after_legacy_payload_withdrawal(header: [u8; 8]) {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let span = DEFAULT_HEAP_LEN as u32;
@@ -744,7 +755,7 @@ fn guest_allocator_recovers_the_tail_after_a_legacy_payload_is_withdrawn() {
     runtime.guest_allocations.remove(&backing.0);
     runtime
         .memory
-        .write(GuestAddr(heap.base + payload_offset), &[0; 8])
+        .write(GuestAddr(heap.base + payload_offset), &header)
         .unwrap();
     runtime
         .memory
@@ -2407,6 +2418,48 @@ fn compact_ram_package_writes_into_a_legacy_prefix_length_wrapper() {
         .free_guest_block_for_module(backing, expected.len() + 4, 0)
         .unwrap();
     assert!(!runtime.guest_allocations.contains_key(&backing.0));
+}
+
+#[test]
+fn compact_ram_package_prefers_an_explicit_descriptor_over_a_legacy_wrapper() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let output_len = 0x30_u32;
+    let stale_wrapper = runtime
+        .allocate_guest_block_for_module((output_len + 4) as usize, 0)
+        .unwrap()
+        .unwrap();
+    runtime.memory.write_u32(stale_wrapper, output_len).unwrap();
+
+    let prepared = runtime
+        .allocate_guest_block_for_module(output_len as usize, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(prepared.checked_add(4).unwrap(), output_len)
+        .unwrap();
+    let descriptor = runtime.allocate(8, 4).unwrap();
+    runtime.memory.write_u32(descriptor, prepared.0).unwrap();
+    runtime
+        .memory
+        .write_u32(descriptor.checked_add(4).unwrap(), output_len)
+        .unwrap();
+
+    let package = runtime.allocate(24, 8).unwrap();
+    let mut compact_header = [0_u8; 24];
+    compact_header[..4].copy_from_slice(b"MRPG");
+    compact_header[4..8].copy_from_slice(&4_u32.to_le_bytes());
+    compact_header[12..16].copy_from_slice(&4_u32.to_le_bytes());
+    runtime.memory.write(package, &compact_header).unwrap();
+
+    assert_eq!(
+        runtime
+            .compact_ram_output_target(package, compact_header.len(), output_len as usize, 0)
+            .unwrap(),
+        Some(prepared)
+    );
 }
 
 #[test]

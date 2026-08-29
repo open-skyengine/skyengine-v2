@@ -1727,6 +1727,17 @@ impl ExtRuntime {
                 .checked_add(len)
                 .ok_or_else(|| Error::Abi("guest free-block range overflow".into()))?;
             if len < FREE_BLOCK_HEADER_LEN || block_end > heap.span {
+                if let Some((recovered, terminator, counter_correction)) =
+                    self.recover_withdrawn_legacy_payload_head(heap, &blocks, offset)
+                {
+                    recovered_len =
+                        recovered_len
+                            .checked_add(counter_correction)
+                            .ok_or_else(|| {
+                                Error::Abi("recovered guest free-byte count overflow".into())
+                            })?;
+                    return Ok((recovered, terminator, recovered_len));
+                }
                 let (recovered, next, removed_len) = self
                     .recover_corrupted_free_header(heap, offset)
                     .ok_or_else(|| {
@@ -1743,6 +1754,17 @@ impl ExtRuntime {
                 continue;
             }
             if next > heap.span {
+                if let Some((recovered, terminator, counter_correction)) =
+                    self.recover_withdrawn_legacy_payload_head(heap, &blocks, offset)
+                {
+                    recovered_len =
+                        recovered_len
+                            .checked_add(counter_correction)
+                            .ok_or_else(|| {
+                                Error::Abi("recovered guest free-byte count overflow".into())
+                            })?;
+                    return Ok((recovered, terminator, recovered_len));
+                }
                 let (recovered, next, removed_len) = self
                     .recover_corrupted_free_header(heap, offset)
                     .ok_or_else(|| {
@@ -1847,7 +1869,7 @@ impl ExtRuntime {
         &self,
         heap: GuestHeapState,
         preceding: &[FreeBlock],
-        zeroed_offset: u32,
+        withdrawn_offset: u32,
     ) -> Option<(Vec<FreeBlock>, u32, u32)> {
         if !preceding.is_empty() {
             return None;
@@ -1856,7 +1878,7 @@ impl ExtRuntime {
         if snapshot.base != heap.base
             || snapshot.span != heap.span
             || snapshot.head != heap.head
-            || snapshot.blocks.first()?.offset != zeroed_offset
+            || snapshot.blocks.first()?.offset != withdrawn_offset
         {
             return None;
         }
