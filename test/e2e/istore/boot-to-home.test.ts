@@ -100,4 +100,39 @@ describe("istore 进入主界面", () => {
       /ARM fault|ABI error|unmapped|no memory|guest heap exhausted|panicked at/i,
     );
   }, 90_000);
+
+  it("可以重复进入并返回幻灯片详情页", async () => {
+    const { engine } = await openHome();
+
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      await engine.click(120, 70, 30_000);
+      await engine.waitForScreen(screen =>
+        screen.pixel(10, 38).toString() === "96,136,200"
+        && screen.pixel(120, 150).toString() === "80,88,80"
+        && screen.pixel(200, 305).toString() === "64,64,64", {
+          name: `slideshow-detail-${attempt}`,
+          timeoutMs: 30_000,
+          intervalMs: 250,
+        });
+      expect(await engine.waitForExit(500)).toBe(false);
+
+      await engine.click(216, 38, 30_000);
+      await engine.waitForScreen(screen =>
+        screen.pixel(23, 291).toString() === "144,144,144"
+        && screen.pixel(70, 291).toString() === "72,76,72"
+        && screen.pixel(120, 70).toString() === "176,156,104"
+        && screen.pixel(200, 140).toString() === "56,92,0", {
+          name: `slideshow-home-${attempt}`,
+          timeoutMs: 30_000,
+          intervalMs: 250,
+        });
+      expect(await engine.waitForExit(500)).toBe(false);
+    }
+
+    await engine.stop();
+    const stderr = await readFile(engine.stderrPath, "utf8");
+    expect(stderr).not.toMatch(
+      /ARM fault|ABI error|unmapped|no memory|guest heap exhausted|panicked at/i,
+    );
+  }, 180_000);
 });

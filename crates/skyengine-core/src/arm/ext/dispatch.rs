@@ -1057,6 +1057,7 @@ impl ExtRuntime {
                         ram_len,
                         bytes.len(),
                         module,
+                        GuestAddr(cpu.register(1)),
                     )?
                 } else {
                     None

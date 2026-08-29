@@ -1138,6 +1138,7 @@ impl ExtRuntime {
         package_len: usize,
         output_len: usize,
         module: usize,
+        output_len_pointer: GuestAddr,
     ) -> Result<Option<GuestAddr>> {
         if package_len < 24 {
             return Ok(None);
@@ -1160,7 +1161,7 @@ impl ExtRuntime {
                 as usize,
         )?;
         let heap_end = HEAP_BASE.0 + self.heap_len as u32;
-        let mut descriptor_candidates = Vec::new();
+        let mut descriptor_matches = Vec::new();
         for descriptor_len_address in (HEAP_BASE.0 + 4..heap_end).step_by(4) {
             let recorded_len = self.memory.read_u32(GuestAddr(descriptor_len_address))?;
             if recorded_len != aligned_len {
@@ -1189,11 +1190,30 @@ impl ExtRuntime {
                 module,
             )?;
             if claimable {
-                descriptor_candidates.push(candidate);
+                descriptor_matches.push((GuestAddr(descriptor_len_address - 4), candidate));
             }
         }
+        let mut descriptor_candidates = descriptor_matches
+            .iter()
+            .map(|(_, candidate)| *candidate)
+            .collect::<Vec<_>>();
         descriptor_candidates.sort_unstable();
         descriptor_candidates.dedup();
+        // Some legacy readers keep `[prepared buffer, aligned length]` together
+        // and pass the second word as mr_readFile's output-length pointer. A
+        // returned page can leave an older pair intact, so prefer the pair tied
+        // to this call before falling back to the heap-wide compatibility scan.
+        if let Some(preferred_descriptor) = output_len_pointer.0.checked_sub(4).map(GuestAddr) {
+            if let Some(candidate) =
+                descriptor_matches
+                    .iter()
+                    .find_map(|(descriptor, candidate)| {
+                        (*descriptor == preferred_descriptor).then_some(*candidate)
+                    })
+            {
+                return Ok(Some(candidate));
+            }
+        }
         match descriptor_candidates.as_slice() {
             [candidate] => return Ok(Some(*candidate)),
             [] => {}

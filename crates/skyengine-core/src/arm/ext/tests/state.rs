@@ -2456,9 +2456,90 @@ fn compact_ram_package_prefers_an_explicit_descriptor_over_a_legacy_wrapper() {
 
     assert_eq!(
         runtime
-            .compact_ram_output_target(package, compact_header.len(), output_len as usize, 0)
+            .compact_ram_output_target(
+                package,
+                compact_header.len(),
+                output_len as usize,
+                0,
+                GuestAddr(0),
+            )
             .unwrap(),
         Some(prepared)
+    );
+}
+
+#[test]
+fn compact_ram_package_uses_the_current_length_pointer_to_disambiguate_descriptors() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let output_len = 0x30_u32;
+
+    let stale_output = runtime
+        .allocate_guest_block_for_module(output_len as usize, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(stale_output.checked_add(4).unwrap(), output_len)
+        .unwrap();
+    let stale_descriptor = runtime.allocate(8, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(stale_descriptor, stale_output.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(stale_descriptor.checked_add(4).unwrap(), output_len)
+        .unwrap();
+
+    let current_output = runtime
+        .allocate_guest_block_for_module(output_len as usize, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(current_output.checked_add(4).unwrap(), output_len)
+        .unwrap();
+    let current_descriptor = runtime.allocate(8, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(current_descriptor, current_output.0)
+        .unwrap();
+    let current_length_pointer = current_descriptor.checked_add(4).unwrap();
+    runtime
+        .memory
+        .write_u32(current_length_pointer, output_len)
+        .unwrap();
+
+    let package = runtime.allocate(24, 8).unwrap();
+    let mut compact_header = [0_u8; 24];
+    compact_header[..4].copy_from_slice(b"MRPG");
+    compact_header[4..8].copy_from_slice(&4_u32.to_le_bytes());
+    compact_header[12..16].copy_from_slice(&4_u32.to_le_bytes());
+    runtime.memory.write(package, &compact_header).unwrap();
+
+    assert!(matches!(
+        runtime.compact_ram_output_target(
+            package,
+            compact_header.len(),
+            output_len as usize,
+            0,
+            GuestAddr(0),
+        ),
+        Err(Error::Abi(message)) if message.contains("ambiguous prepared buffers")
+    ));
+    assert_eq!(
+        runtime
+            .compact_ram_output_target(
+                package,
+                compact_header.len(),
+                output_len as usize,
+                0,
+                current_length_pointer,
+            )
+            .unwrap(),
+        Some(current_output)
     );
 }
 
@@ -2663,7 +2744,13 @@ fn compact_ram_package_preserves_prepared_output_ownership_errors() {
     runtime.memory.write(package, &compact_header).unwrap();
 
     assert!(matches!(
-        runtime.compact_ram_output_target(package, compact_header.len(), output_len as usize, 1),
+        runtime.compact_ram_output_target(
+            package,
+            compact_header.len(),
+            output_len as usize,
+            1,
+            GuestAddr(0),
+        ),
         Err(Error::Abi(message)) if message.contains("belongs to another module")
     ));
 }
@@ -3192,7 +3279,13 @@ fn compact_ram_package_accepts_a_prepared_platform_memory_target() {
 
     assert_eq!(
         runtime
-            .compact_ram_output_target(package, compact_header.len(), output_len as usize, 0)
+            .compact_ram_output_target(
+                package,
+                compact_header.len(),
+                output_len as usize,
+                0,
+                GuestAddr(0),
+            )
             .unwrap(),
         Some(MTK_NATIVE_EXTENSION_BASE)
     );
