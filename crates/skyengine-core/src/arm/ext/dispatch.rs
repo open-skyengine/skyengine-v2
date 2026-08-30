@@ -1026,6 +1026,9 @@ impl ExtRuntime {
                 let height = cpu.register(3) as i32;
                 self.draw_rectangle_to_screen(x, y, width, height, color)?;
                 cpu.set_register(0, 0);
+                // The vendor routine clobbers this volatile argument register.
+                // Some legacy callers rely on that before omitting a later r3 argument.
+                cpu.set_register(3, 0);
             }
             123 => {
                 let stack = GuestAddr(cpu.register(13));

@@ -210,6 +210,8 @@ fn rectangle_trap_draws_into_the_physical_screen_buffer() {
         read_bitmap_pixels(&runtime, active_screen, 2, 1),
         [0xaaaa, 0xaaaa]
     );
+    assert_eq!(cpu.register(0), 0);
+    assert_eq!(cpu.register(3), 0);
 }
 
 #[test]
