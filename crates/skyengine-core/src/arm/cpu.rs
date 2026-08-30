@@ -13,7 +13,7 @@ pub struct ArmCpu {
     overflow: bool,
     thumb: bool,
     semihosting_exit_reason: Option<u32>,
-    legacy_null_signed_halfword_loads: bool,
+    legacy_null_data: Option<[u8; LEGACY_NULL_DATA_LEN as usize]>,
 }
 
 impl Default for ArmCpu {
@@ -32,7 +32,7 @@ impl ArmCpu {
             overflow: false,
             thumb: false,
             semihosting_exit_reason: None,
-            legacy_null_signed_halfword_loads: false,
+            legacy_null_data: None,
         }
     }
 
@@ -65,8 +65,10 @@ impl ArmCpu {
         self.semihosting_exit_reason.take()
     }
 
-    pub(crate) fn allow_legacy_null_signed_halfword_loads(&mut self) {
-        self.legacy_null_signed_halfword_loads = true;
+    pub(crate) fn allow_legacy_null_data_accesses(&mut self) {
+        // Keep legacy low-address scratch state inside the CPU so NULL remains
+        // unmapped to host services and instruction fetches.
+        self.legacy_null_data = Some([0; LEGACY_NULL_DATA_LEN as usize]);
     }
 
     pub fn cpsr(&self) -> u32 {
@@ -403,9 +405,9 @@ impl ArmCpu {
 
         if load {
             let value = if byte {
-                u32::from(memory.read_u8(GuestAddr(transfer_address))?)
+                u32::from(self.read_data_byte(memory, GuestAddr(transfer_address))?)
             } else {
-                memory.read_u32(GuestAddr(transfer_address))?
+                self.read_data_word(memory, GuestAddr(transfer_address))?
             };
             if rd == 15 {
                 self.set_pc(value);
@@ -419,9 +421,9 @@ impl ArmCpu {
                 self.registers[rd]
             };
             if byte {
-                memory.write_u8(GuestAddr(transfer_address), value as u8)?;
+                self.write_data_byte(memory, GuestAddr(transfer_address), value as u8)?;
             } else {
-                memory.write_u32(GuestAddr(transfer_address), value)?;
+                self.write_data_word(memory, GuestAddr(transfer_address), value)?;
             }
         }
         if !pre_index || write_back {
@@ -463,8 +465,9 @@ impl ArmCpu {
         let transfer_address = if pre_index { adjusted } else { base };
         if load {
             let value = match operation {
-                1 => u32::from(memory.read_u16(GuestAddr(transfer_address))?),
-                2 => i32::from(memory.read_u8(GuestAddr(transfer_address))? as i8) as u32,
+                1 => u32::from(self.read_data_halfword(memory, GuestAddr(transfer_address))?),
+                2 => i32::from(self.read_data_byte(memory, GuestAddr(transfer_address))? as i8)
+                    as u32,
                 3 => self.read_signed_halfword(memory, GuestAddr(transfer_address))?,
                 _ => return Err(self.unsupported_arm(instruction, address)),
             };
@@ -474,7 +477,11 @@ impl ArmCpu {
                 self.registers[rd] = value;
             }
         } else if operation == 1 {
-            memory.write_u16(GuestAddr(transfer_address), self.registers[rd] as u16)?;
+            self.write_data_halfword(
+                memory,
+                GuestAddr(transfer_address),
+                self.registers[rd] as u16,
+            )?;
         } else {
             return Err(self.unsupported_arm(instruction, address));
         }
@@ -805,13 +812,16 @@ impl ArmCpu {
         let destination = usize::from(instruction & 7);
         let address = GuestAddr(base.wrapping_add(offset));
         match operation {
-            0 => memory.write_u32(address, self.registers[destination])?,
-            1 => memory.write_u16(address, self.registers[destination] as u16)?,
-            2 => memory.write_u8(address, self.registers[destination] as u8)?,
-            3 => self.registers[destination] = i32::from(memory.read_u8(address)? as i8) as u32,
-            4 => self.registers[destination] = memory.read_u32(address)?,
-            5 => self.registers[destination] = u32::from(memory.read_u16(address)?),
-            6 => self.registers[destination] = u32::from(memory.read_u8(address)?),
+            0 => self.write_data_word(memory, address, self.registers[destination])?,
+            1 => self.write_data_halfword(memory, address, self.registers[destination] as u16)?,
+            2 => self.write_data_byte(memory, address, self.registers[destination] as u8)?,
+            3 => {
+                self.registers[destination] =
+                    i32::from(self.read_data_byte(memory, address)? as i8) as u32
+            }
+            4 => self.registers[destination] = self.read_data_word(memory, address)?,
+            5 => self.registers[destination] = u32::from(self.read_data_halfword(memory, address)?),
+            6 => self.registers[destination] = u32::from(self.read_data_byte(memory, address)?),
             7 => self.registers[destination] = self.read_signed_halfword(memory, address)?,
             _ => unreachable!(),
         }
@@ -831,10 +841,14 @@ impl ArmCpu {
         let offset = if byte { immediate } else { immediate * 4 };
         let address = GuestAddr(base.wrapping_add(offset));
         match (load, byte) {
-            (false, false) => memory.write_u32(address, self.registers[destination])?,
-            (false, true) => memory.write_u8(address, self.registers[destination] as u8)?,
-            (true, false) => self.registers[destination] = memory.read_u32(address)?,
-            (true, true) => self.registers[destination] = u32::from(memory.read_u8(address)?),
+            (false, false) => self.write_data_word(memory, address, self.registers[destination])?,
+            (false, true) => {
+                self.write_data_byte(memory, address, self.registers[destination] as u8)?
+            }
+            (true, false) => self.registers[destination] = self.read_data_word(memory, address)?,
+            (true, true) => {
+                self.registers[destination] = u32::from(self.read_data_byte(memory, address)?)
+            }
         }
         Ok(())
     }
@@ -850,9 +864,9 @@ impl ArmCpu {
         let destination = usize::from(instruction & 7);
         let address = GuestAddr(base.wrapping_add(offset));
         if load {
-            self.registers[destination] = u32::from(memory.read_u16(address)?);
+            self.registers[destination] = u32::from(self.read_data_halfword(memory, address)?);
         } else {
-            memory.write_u16(address, self.registers[destination] as u16)?;
+            self.write_data_halfword(memory, address, self.registers[destination] as u16)?;
         }
         Ok(())
     }
@@ -970,16 +984,88 @@ impl ArmCpu {
     }
 
     fn read_signed_halfword(&self, memory: &GuestMemory, address: GuestAddr) -> Result<u32> {
-        let is_legacy_null_data = self.legacy_null_signed_halfword_loads
-            && address
-                .0
-                .checked_add(2)
-                .is_some_and(|end| end <= LEGACY_NULL_DATA_LEN)
-            && !memory.is_mapped(address, 2);
-        if is_legacy_null_data {
-            return Ok(0);
+        Ok(i32::from(self.read_data_halfword(memory, address)? as i16) as u32)
+    }
+
+    fn read_data_byte(&self, memory: &GuestMemory, address: GuestAddr) -> Result<u8> {
+        if let Some(offset) = self.legacy_null_data_offset(memory, address, 1) {
+            return Ok(self.legacy_null_data.as_ref().unwrap()[offset]);
         }
-        Ok(i32::from(memory.read_u16(address)? as i16) as u32)
+        memory.read_u8(address)
+    }
+
+    fn write_data_byte(
+        &mut self,
+        memory: &mut GuestMemory,
+        address: GuestAddr,
+        value: u8,
+    ) -> Result<()> {
+        if let Some(offset) = self.legacy_null_data_offset(memory, address, 1) {
+            self.legacy_null_data.as_mut().unwrap()[offset] = value;
+            return Ok(());
+        }
+        memory.write_u8(address, value)
+    }
+
+    fn read_data_halfword(&self, memory: &GuestMemory, address: GuestAddr) -> Result<u16> {
+        if let Some(offset) = self.legacy_null_data_offset(memory, address, 2) {
+            let data = self.legacy_null_data.as_ref().unwrap();
+            return Ok(u16::from_le_bytes([data[offset], data[offset + 1]]));
+        }
+        memory.read_u16(address)
+    }
+
+    fn write_data_halfword(
+        &mut self,
+        memory: &mut GuestMemory,
+        address: GuestAddr,
+        value: u16,
+    ) -> Result<()> {
+        if let Some(offset) = self.legacy_null_data_offset(memory, address, 2) {
+            self.legacy_null_data.as_mut().unwrap()[offset..offset + 2]
+                .copy_from_slice(&value.to_le_bytes());
+            return Ok(());
+        }
+        memory.write_u16(address, value)
+    }
+
+    fn read_data_word(&self, memory: &GuestMemory, address: GuestAddr) -> Result<u32> {
+        if let Some(offset) = self.legacy_null_data_offset(memory, address, 4) {
+            let data = self.legacy_null_data.as_ref().unwrap();
+            return Ok(u32::from_le_bytes(
+                data[offset..offset + 4].try_into().unwrap(),
+            ));
+        }
+        memory.read_u32(address)
+    }
+
+    fn write_data_word(
+        &mut self,
+        memory: &mut GuestMemory,
+        address: GuestAddr,
+        value: u32,
+    ) -> Result<()> {
+        if let Some(offset) = self.legacy_null_data_offset(memory, address, 4) {
+            self.legacy_null_data.as_mut().unwrap()[offset..offset + 4]
+                .copy_from_slice(&value.to_le_bytes());
+            return Ok(());
+        }
+        memory.write_u32(address, value)
+    }
+
+    fn legacy_null_data_offset(
+        &self,
+        memory: &GuestMemory,
+        address: GuestAddr,
+        len: u32,
+    ) -> Option<usize> {
+        self.legacy_null_data.as_ref()?;
+        address
+            .0
+            .checked_add(len)
+            .filter(|end| *end <= LEGACY_NULL_DATA_LEN)
+            .filter(|_| !memory.is_mapped(address, len as usize))?;
+        Some(address.0 as usize)
     }
 
     fn write_thumb_register(&mut self, index: usize, value: u32) {

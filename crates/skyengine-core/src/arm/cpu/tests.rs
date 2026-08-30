@@ -160,7 +160,33 @@ fn thumb_arithmetic_and_conditional_branch_follow_pipeline_pc() {
 }
 
 #[test]
-fn legacy_null_signed_halfword_loads_are_narrow_and_opt_in() {
+fn legacy_null_data_accesses_are_narrow_and_opt_in() {
+    let mut strict_memory = code_memory(&[0xe590_1000]); // ldr r1, [r0]
+    let mut strict_cpu = ArmCpu::new();
+    strict_cpu.set_pc(0x1000);
+    assert!(matches!(
+        strict_cpu.step(&mut strict_memory),
+        Err(Error::ArmFault(message)) if message.contains("unmapped guest access")
+    ));
+
+    let mut legacy_memory = code_memory(&[
+        0xe590_1000, // ldr r1, [r0]
+        0xe580_2000, // str r2, [r0]
+        0xe590_3000, // ldr r3, [r0]
+        0xe5d0_4000, // ldrb r4, [r0]
+    ]);
+    let mut legacy_cpu = ArmCpu::new();
+    legacy_cpu.allow_legacy_null_data_accesses();
+    legacy_cpu.set_pc(0x1000);
+    legacy_cpu.set_register(2, 0x1234_5678);
+    for _ in 0..4 {
+        legacy_cpu.step(&mut legacy_memory).unwrap();
+    }
+    assert_eq!(legacy_cpu.register(1), 0);
+    assert_eq!(legacy_cpu.register(3), 0x1234_5678);
+    assert_eq!(legacy_cpu.register(4), 0x78);
+    assert!(!legacy_memory.is_mapped(GuestAddr(0), 4));
+
     let instructions = [
         0x5e40, // ldrsh r0, [r0, r1]
         0x2102, // movs r1, #2
@@ -168,34 +194,26 @@ fn legacy_null_signed_halfword_loads_are_narrow_and_opt_in() {
         0x2104, // movs r1, #4
         0x5e40, // ldrsh r0, [r0, r1]
     ];
-    let mut strict_memory = thumb_code_memory(&instructions);
-    let mut strict_cpu = ArmCpu::new();
-    strict_cpu.set_pc(0x1001);
-    assert!(matches!(
-        strict_cpu.step(&mut strict_memory),
-        Err(Error::ArmFault(message)) if message.contains("unmapped guest access")
-    ));
-
-    let mut legacy_memory = thumb_code_memory(&instructions);
-    let mut legacy_cpu = ArmCpu::new();
-    legacy_cpu.allow_legacy_null_signed_halfword_loads();
-    legacy_cpu.set_pc(0x1001);
+    let mut halfword_memory = thumb_code_memory(&instructions);
+    let mut halfword_cpu = ArmCpu::new();
+    halfword_cpu.allow_legacy_null_data_accesses();
+    halfword_cpu.set_pc(0x1001);
     for _ in 0..instructions.len() {
-        legacy_cpu.step(&mut legacy_memory).unwrap();
+        halfword_cpu.step(&mut halfword_memory).unwrap();
     }
-    assert_eq!(legacy_cpu.register(0), 0);
+    assert_eq!(halfword_cpu.register(0), 0);
 
-    let mut out_of_range_memory = thumb_code_memory(&[0x5e40]);
+    let mut out_of_range_memory = code_memory(&[0xe590_1000]);
     let mut out_of_range_cpu = ArmCpu::new();
-    out_of_range_cpu.allow_legacy_null_signed_halfword_loads();
-    out_of_range_cpu.set_pc(0x1001);
-    out_of_range_cpu.set_register(1, 7);
+    out_of_range_cpu.allow_legacy_null_data_accesses();
+    out_of_range_cpu.set_pc(0x1000);
+    out_of_range_cpu.set_register(0, 8);
     assert!(matches!(
         out_of_range_cpu.step(&mut out_of_range_memory),
         Err(Error::ArmFault(message)) if message.contains("unmapped guest access")
     ));
 
-    let mut protected_memory = thumb_code_memory(&[0x5e40]);
+    let mut protected_memory = code_memory(&[0xe590_1000]);
     protected_memory
         .map(
             GuestAddr(0),
@@ -205,10 +223,26 @@ fn legacy_null_signed_halfword_loads_are_narrow_and_opt_in() {
         )
         .unwrap();
     let mut protected_cpu = ArmCpu::new();
-    protected_cpu.allow_legacy_null_signed_halfword_loads();
-    protected_cpu.set_pc(0x1001);
+    protected_cpu.allow_legacy_null_data_accesses();
+    protected_cpu.set_pc(0x1000);
     assert!(matches!(
         protected_cpu.step(&mut protected_memory),
+        Err(Error::ArmFault(message)) if message.contains("permission fault")
+    ));
+
+    protected_cpu.set_pc(0x1000);
+    protected_cpu.set_register(0, 0);
+    let mut protected_store_memory = code_memory(&[0xe580_1000]); // str r1, [r0]
+    protected_store_memory
+        .map(
+            GuestAddr(0),
+            LEGACY_NULL_DATA_LEN as usize,
+            Permissions::EXECUTE,
+            "protected low data",
+        )
+        .unwrap();
+    assert!(matches!(
+        protected_cpu.step(&mut protected_store_memory),
         Err(Error::ArmFault(message)) if message.contains("permission fault")
     ));
 }
