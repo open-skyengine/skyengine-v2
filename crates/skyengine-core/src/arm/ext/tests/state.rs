@@ -5,6 +5,178 @@ use flate2::{Compression, write::GzEncoder};
 use super::*;
 
 #[test]
+fn gzip_guest_call_recovers_the_platform_screen_buffer_capacity_from_abi_data() {
+    let mut runtime =
+        ExtRuntime::new(13, 9, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let mut module = b"MRPGCMAP".to_vec();
+    module.extend_from_slice(&0xe12f_ff1e_u32.to_le_bytes()); // entry: bx lr
+    module.extend_from_slice(&0xe92d_4000_u32.to_le_bytes()); // caller: push {lr}
+    module.extend_from_slice(&0xe24d_d020_u32.to_le_bytes()); // sub sp, sp, #32
+    module.extend_from_slice(&0xeb00_0001_u32.to_le_bytes()); // bl callee
+    module.extend_from_slice(&0xe28d_d020_u32.to_le_bytes()); // add sp, sp, #32
+    module.extend_from_slice(&0xe8bd_8000_u32.to_le_bytes()); // pop {pc}
+    module.extend_from_slice(&0xe12f_ff1e_u32.to_le_bytes()); // callee: bx lr
+    runtime
+        .load_and_call_entry(&module, 0, &mut StubServices)
+        .unwrap();
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[0x5a; 173]).unwrap();
+    let gzip = encoder.finish().unwrap();
+    let source = runtime.allocate(gzip.len(), 4).unwrap();
+    runtime.memory.write(source, &gzip).unwrap();
+
+    // The active-frame holders deliberately are not adjacent, so recovery
+    // relies on the ABI rather than a compiler's stack layout or instruction window.
+    let output_pointer = STACK_BASE.checked_add(STACK_LEN as u32 - 36).unwrap();
+    let output_len_pointer = STACK_BASE.checked_add(STACK_LEN as u32 - 20).unwrap();
+    runtime
+        .memory
+        .write_u32(output_pointer, SCREEN_BASE.0)
+        .unwrap();
+    runtime.memory.write_u32(output_len_pointer, 1).unwrap();
+
+    runtime
+        .call_guest(
+            GuestFunction {
+                module: 0,
+                address: MODULE_BASE + 12,
+                expected_image: Some(ExecutableImage::Static),
+                captured_r9: None,
+            },
+            [
+                source.0,
+                gzip.len() as u32,
+                output_pointer.0,
+                output_len_pointer.0,
+            ],
+            &[],
+            &mut StubServices,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.memory.read_u32(output_len_pointer).unwrap(),
+        13 * 9 * 2
+    );
+}
+
+#[test]
+fn gzip_screen_capacity_recovery_rejects_unowned_and_oversized_outputs() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let output_pointer = STACK_BASE.checked_add(0x100).unwrap();
+    let output_len_pointer = STACK_BASE.checked_add(0x120).unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(2, output_pointer.0);
+    cpu.set_register(3, output_len_pointer.0);
+    cpu.set_register(13, STACK_BASE.0);
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[0; 8 * 8 * 2 + 1]).unwrap();
+    let oversized = encoder.finish().unwrap();
+    let source = runtime.allocate(oversized.len(), 4).unwrap();
+    runtime.memory.write(source, &oversized).unwrap();
+    cpu.set_register(0, source.0);
+    cpu.set_register(1, oversized.len() as u32);
+    runtime
+        .memory
+        .write_u32(output_pointer, SCREEN_BASE.0)
+        .unwrap();
+    runtime.memory.write_u32(output_len_pointer, 1).unwrap();
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(runtime.memory.read_u32(output_len_pointer).unwrap(), 1);
+
+    runtime
+        .memory
+        .write_u32(output_len_pointer, u32::MAX)
+        .unwrap();
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(
+        runtime.memory.read_u32(output_len_pointer).unwrap(),
+        8 * 8 * 2
+    );
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[0x5a; 64]).unwrap();
+    let fitting = encoder.finish().unwrap();
+    let fitting_source = runtime.allocate(fitting.len(), 4).unwrap();
+    runtime.memory.write(fitting_source, &fitting).unwrap();
+    cpu.set_register(0, fitting_source.0);
+    cpu.set_register(1, fitting.len() as u32);
+
+    let short_source = runtime.allocate(7, 4).unwrap();
+    runtime
+        .memory
+        .write(short_source, &[0x1f, 0x8b, 0x08, 64, 0, 0, 0])
+        .unwrap();
+    runtime.memory.write_u32(output_len_pointer, 1).unwrap();
+    cpu.set_register(0, short_source.0);
+    cpu.set_register(1, 7);
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(runtime.memory.read_u32(output_len_pointer).unwrap(), 1);
+    cpu.set_register(0, fitting_source.0);
+    cpu.set_register(1, fitting.len() as u32);
+
+    let guest_buffer = runtime.allocate(8 * 8 * 2 + 1, 4).unwrap();
+    runtime
+        .memory
+        .write_u32(output_pointer, guest_buffer.0)
+        .unwrap();
+    runtime.memory.write_u32(output_len_pointer, 1).unwrap();
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(runtime.memory.read_u32(output_len_pointer).unwrap(), 1);
+
+    runtime
+        .memory
+        .write_u32(output_pointer, SCREEN_BASE.0)
+        .unwrap();
+    runtime.memory.write_u32(output_len_pointer, 100).unwrap();
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(runtime.memory.read_u32(output_len_pointer).unwrap(), 100);
+
+    runtime.memory.write_u32(output_len_pointer, 1).unwrap();
+    runtime.memory.write(fitting_source, &[0]).unwrap();
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(runtime.memory.read_u32(output_len_pointer).unwrap(), 1);
+
+    runtime.memory.write(fitting_source, &[0x1f]).unwrap();
+    runtime.memory.write(SCREEN_BASE, &fitting).unwrap();
+    runtime.memory.write_u32(output_len_pointer, 1).unwrap();
+    cpu.set_register(0, SCREEN_BASE.0);
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(runtime.memory.read_u32(output_len_pointer).unwrap(), 1);
+
+    let non_stack_holders = runtime.allocate(8, 4).unwrap();
+    let non_stack_len = non_stack_holders.checked_add(4).unwrap();
+    runtime
+        .memory
+        .write_u32(non_stack_holders, SCREEN_BASE.0)
+        .unwrap();
+    runtime.memory.write_u32(non_stack_len, 1).unwrap();
+    cpu.set_register(0, fitting_source.0);
+    cpu.set_register(2, non_stack_holders.0);
+    cpu.set_register(3, non_stack_len.0);
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(runtime.memory.read_u32(non_stack_len).unwrap(), 1);
+}
+
+#[test]
 fn legacy_keypad_registers_default_to_idle_and_track_key_events() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

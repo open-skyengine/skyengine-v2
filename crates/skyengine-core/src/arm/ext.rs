@@ -586,6 +586,7 @@ pub(crate) struct ExtRuntime {
     next_module_generation: u64,
     active_helper: Option<GuestFunction>,
     heap_len: usize,
+    screen_buffer_len: usize,
     guest_allocations: BTreeMap<u32, u32>,
     guest_allocation_owners: BTreeMap<u32, u64>,
     guest_allocation_views: BTreeMap<u32, GuestAllocationView>,
@@ -801,6 +802,7 @@ impl ExtRuntime {
             next_module_generation: 1,
             active_helper: None,
             heap_len,
+            screen_buffer_len: screen_len,
             guest_allocations: BTreeMap::new(),
             guest_allocation_owners: BTreeMap::new(),
             guest_allocation_views: BTreeMap::new(),
@@ -1889,6 +1891,101 @@ impl ExtRuntime {
         })
     }
 
+    fn prepare_guest_gzip_screen_buffer_capacity(&mut self, cpu: &ArmCpu) -> Result<()> {
+        let output_pointer = GuestAddr(cpu.register(2));
+        let output_len_pointer = GuestAddr(cpu.register(3));
+        let stack_end = STACK_BASE.0 + STACK_LEN as u32;
+        let stack_pointer = cpu.register(13);
+        if !(STACK_BASE.0..=stack_end).contains(&stack_pointer) {
+            return Ok(());
+        }
+        let is_stack_word = |address: GuestAddr| {
+            address.0 & 3 == 0
+                && address.0 >= stack_pointer
+                && address.0.checked_add(4).is_some_and(|end| end <= stack_end)
+        };
+        if output_pointer == output_len_pointer
+            || !is_stack_word(output_pointer)
+            || !is_stack_word(output_len_pointer)
+            || self
+                .memory
+                .check_range(output_pointer, 4, Permissions::READ_WRITE)
+                .is_err()
+            || self
+                .memory
+                .check_range(output_len_pointer, 4, Permissions::READ_WRITE)
+                .is_err()
+        {
+            return Ok(());
+        }
+
+        let Some(output) = self.memory.read_u32(output_pointer).ok().map(GuestAddr) else {
+            return Ok(());
+        };
+        let Some(screen) = self
+            .memory
+            .read_u32(data_slot_address(91))
+            .ok()
+            .map(GuestAddr)
+        else {
+            return Ok(());
+        };
+        if output != SCREEN_BASE || output != screen {
+            return Ok(());
+        }
+        let Some(output_len) = self.memory.read_u32(output_len_pointer).ok() else {
+            return Ok(());
+        };
+        let Ok(screen_len) = u32::try_from(self.screen_buffer_len) else {
+            return Ok(());
+        };
+
+        let source = GuestAddr(cpu.register(0));
+        let source_len = cpu.register(1);
+        if source_len < 18
+            || self
+                .memory
+                .check_range(source, source_len as usize, Permissions::READ)
+                .is_err()
+            || self.memory.read(source, 3).ok().as_deref() != Some(&[0x1f, 0x8b, 0x08])
+        {
+            return Ok(());
+        }
+        let Some(trailer) = source.0.checked_add(source_len - 4).map(GuestAddr) else {
+            return Ok(());
+        };
+        let Some(source_end) = source.0.checked_add(source_len) else {
+            return Ok(());
+        };
+        let Some(screen_end) = SCREEN_BASE.0.checked_add(screen_len) else {
+            return Ok(());
+        };
+        if source.0 < screen_end && SCREEN_BASE.0 < source_end {
+            return Ok(());
+        }
+        let Some(required_len) = self.memory.read_u32(trailer).ok() else {
+            return Ok(());
+        };
+        let capacity_is_unsafe = output_len > screen_len;
+        let missing_usable_capacity = output_len < required_len && required_len <= screen_len;
+        if !capacity_is_unsafe && !missing_usable_capacity {
+            return Ok(());
+        }
+
+        // Physical runtimes expose this fixed platform-owned allocation even
+        // when legacy guest code leaves its local capacity scalar indeterminate.
+        // Recover the capacity from ABI data at a guest call boundary; never
+        // identify a decompressor by its PC or compiled instruction sequence.
+        if self
+            .memory
+            .check_range(output, screen_len as usize, Permissions::READ_WRITE)
+            .is_ok()
+        {
+            self.memory.write_u32(output_len_pointer, screen_len)?;
+        }
+        Ok(())
+    }
+
     fn run_guest_execution(
         &mut self,
         execution: GuestExecution,
@@ -1999,6 +2096,14 @@ impl ExtRuntime {
                 return Ok(0);
             }
             if cpu.register(14) != previous_lr && cpu.pc().0 != sequential_pc {
+                let instruction_len = if cpu.is_thumb() { 2 } else { 4 };
+                if self
+                    .memory
+                    .check_range(cpu.pc(), instruction_len, Permissions::EXECUTE)
+                    .is_ok()
+                {
+                    self.prepare_guest_gzip_screen_buffer_capacity(&cpu)?;
+                }
                 entered_guest_call = Some(previous_thumb);
             }
             instruction_count += 1;
