@@ -1765,7 +1765,7 @@ fn platform_rx_initialization_accepts_the_default_mode() {
 }
 
 #[test]
-fn platform_motion_initialization_uses_the_silent_headless_provider() {
+fn platform_motion_provider_tracks_event_subscription_lifecycle() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let mut cpu = ArmCpu::new();
@@ -1796,11 +1796,26 @@ fn platform_motion_initialization_uses_the_silent_headless_provider() {
     }
     assert!(runtime.motion_active());
 
+    cpu.set_register(0, 4_003);
+    cpu.set_register(1, 0);
+    runtime
+        .dispatch(37, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 0);
+    assert!(!runtime.motion_active());
+
     cpu.set_register(0, 4_005);
     cpu.set_register(1, 1);
     assert!(matches!(
         runtime.dispatch(37, 0, &mut cpu, &mut StubServices),
         Err(Error::Abi(message)) if message.contains("command (4005, 1)")
+    ));
+
+    cpu.set_register(0, 4_003);
+    cpu.set_register(1, 1);
+    assert!(matches!(
+        runtime.dispatch(37, 0, &mut cpu, &mut StubServices),
+        Err(Error::Abi(message)) if message.contains("command (4003, 1)")
     ));
 }
 

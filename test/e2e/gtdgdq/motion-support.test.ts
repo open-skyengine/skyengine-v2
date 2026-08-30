@@ -95,5 +95,54 @@ describe("gtdgdq", () => {
       expect(Math.abs(paddleX(after)! - neutralX!)).toBeGreaterThan(5);
     }
   });
+
+  it("取消使用动感功能后继续游戏", async () => {
+    ws = await SkyEngineWorkspace.create();
+    fs.rmSync(ws.path("mythroad/gtdgdq"), { recursive: true, force: true });
+    engine = await SkyEngineE2e.start("test/fixtures/gtdgdq.mrp", { workDir: ws.dir });
+
+    await engine.waitForPixel(219, 312, [0, 200, 248], {
+      name: "cancel-motion-bgm-select",
+      timeoutMs: 10_000,
+      intervalMs: 250,
+    });
+    await engine.key("RIGHT_SOFT", 1_000);
+    await engine.waitForPixel(168, 162, [248, 248, 240], {
+      name: "cancel-motion-menu",
+      timeoutMs: 10_000,
+      intervalMs: 250,
+    });
+
+    await engine.key("LEFT_SOFT", 1_000);
+    await engine.waitForScreen(screen => screen.uniqueColorCount() === 2, {
+      name: "cancel-motion-prompt",
+      timeoutMs: 10_000,
+      intervalMs: 250,
+    });
+    await engine.key("RIGHT_SOFT", 1_000);
+
+    await engine.key("DOWN", 1_000);
+    await engine.key("LEFT_SOFT", 1_000);
+    await engine.waitForPixel(120, 160, [152, 40, 176], {
+      name: "cancel-motion-level-one-prompt",
+      timeoutMs: 10_000,
+      intervalMs: 250,
+    });
+    await engine.key("SELECT", 1_000);
+    const game = await engine.waitForScreen(
+      screen => screen.pixel(120, 160).join(",") !== "152,40,176" && paddleX(screen) !== undefined,
+      { name: "cancel-motion-game", timeoutMs: 10_000, intervalMs: 250 },
+    );
+
+    const paddleBeforeMotion = paddleX(game);
+    expect(paddleBeforeMotion).toBeDefined();
+    for (let sample = 0; sample < 5; sample += 1) {
+      await engine.motion(100, 0, 0);
+      await engine.delay(50);
+    }
+    const afterMotion = await engine.screen("cancel-motion-game-after-motion");
+    expect(paddleX(afterMotion)).toBe(paddleBeforeMotion);
+    expect(await engine.waitForExit(250)).toBe(false);
+  });
   
 });

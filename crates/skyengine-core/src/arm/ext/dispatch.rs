@@ -225,8 +225,13 @@ impl ExtRuntime {
                 // fart actions. The deterministic headless profile has no provider.
                 (1_211, 2 | 3) => cpu.set_register(0, 0),
                 // Query and configure the same deterministic motion provider.
-                // Mode 2 is the verified event-driven form used after startup.
+                // Mode 2 enables event delivery; command 4003 disables it when
+                // the guest declines motion input or leaves the active mode.
                 (4_002, 0) => cpu.set_register(0, 0),
+                (4_003, 0) => {
+                    self.motion_active = false;
+                    cpu.set_register(0, 0);
+                }
                 (4_005, 2) => {
                     self.motion_active = true;
                     cpu.set_register(0, 0);
