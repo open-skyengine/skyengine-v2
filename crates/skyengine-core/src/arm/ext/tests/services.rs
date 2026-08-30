@@ -347,7 +347,7 @@ fn platform_command_2023_rejects_unverified_request_shapes() {
 }
 
 #[test]
-fn platform_command_2043_preserves_playback_and_whitelists_only_the_parameterless_form() {
+fn platform_command_2043_preserves_playback_for_verified_start_forms() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let stack = runtime.allocate(8, 4).unwrap();
@@ -379,6 +379,32 @@ fn platform_command_2043_preserves_playback_and_whitelists_only_the_parameterles
         );
     });
 
+    let options = runtime.allocate(12, 4).unwrap();
+    runtime.memory.write(options, &[0; 12]).unwrap();
+    cpu.set_register(0, 2_043);
+    cpu.set_register(1, options.0);
+    cpu.set_register(2, 12);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 0);
+    STUB_SOUND.with(|sound| {
+        assert_eq!(
+            sound.borrow().as_ref(),
+            Some(&(SoundType::Mp3, b"ID3!".to_vec(), false))
+        );
+    });
+
+    runtime.memory.write_u32(options, 1).unwrap();
+    cpu.set_register(0, 2_043);
+    assert!(matches!(
+        runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
+        Err(Error::Abi(message)) if message.contains("player-start")
+    ));
+    runtime.memory.write_u32(options, 0).unwrap();
+    cpu.set_register(1, 0);
+    cpu.set_register(2, 0);
+
     cpu.set_register(0, 2_093);
     runtime
         .dispatch(38, 0, &mut cpu, &mut StubServices)
@@ -390,7 +416,7 @@ fn platform_command_2043_preserves_playback_and_whitelists_only_the_parameterles
         cpu.set_register(register, 1);
         assert!(matches!(
             runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
-            Err(Error::Abi(message)) if message.contains("command 2043")
+            Err(Error::Abi(message)) if message.contains("player-start")
         ));
         cpu.set_register(register, 0);
     }
@@ -403,7 +429,7 @@ fn platform_command_2043_preserves_playback_and_whitelists_only_the_parameterles
         cpu.set_register(0, 2_043);
         assert!(matches!(
             runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
-            Err(Error::Abi(message)) if message.contains("command 2043")
+            Err(Error::Abi(message)) if message.contains("player-start")
         ));
         runtime
             .memory

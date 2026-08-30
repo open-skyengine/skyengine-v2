@@ -386,17 +386,28 @@ impl ExtRuntime {
                 }
                 // Starts the file-backed player prepared by 2023. Playback already
                 // begins in the host adapter, so this transition must preserve it.
-                2_043
-                    if cpu.register(1) == 0
-                        && cpu.register(2) == 0
-                        && cpu.register(3) == 0
-                        && self.memory.read_u32(GuestAddr(cpu.register(13)))? == 0
+                2_043 => {
+                    let input_address = GuestAddr(cpu.register(1));
+                    let input_len = cpu.register(2) as usize;
+                    let stack_pointer = GuestAddr(cpu.register(13));
+                    let has_empty_input = input_address.0 == 0 && input_len == 0;
+                    let has_zeroed_player_options = input_address.0 != 0
+                        && input_len == 12
                         && self
                             .memory
-                            .read_u32(GuestAddr(cpu.register(13)).checked_add(4)?)?
-                            == 0 =>
-                {
-                    cpu.set_register(0, 0)
+                            .read(input_address, input_len)?
+                            .iter()
+                            .all(|byte| *byte == 0);
+                    if (!has_empty_input && !has_zeroed_player_options)
+                        || cpu.register(3) != 0
+                        || self.memory.read_u32(stack_pointer)? != 0
+                        || self.memory.read_u32(stack_pointer.checked_add(4)?)? != 0
+                    {
+                        return Err(Error::Abi(format!(
+                            "unsupported platform player-start request called by module {module}"
+                        )));
+                    }
+                    cpu.set_register(0, 0);
                 }
                 // Stops and releases the file-backed multimedia player. Talkcat
                 // issues both transitions before starting its face interaction.
@@ -510,8 +521,22 @@ impl ExtRuntime {
                     cpu.set_register(0, u32::MAX)
                 }
                 command => {
+                    let input_len = (cpu.register(2) as usize).min(32);
+                    let input = self
+                        .memory
+                        .read(GuestAddr(cpu.register(1)), input_len)
+                        .map(|bytes| format!("{bytes:02x?}"))
+                        .unwrap_or_else(|error| format!("unavailable: {error}"));
+                    let stack = (0..2)
+                        .map(|index| {
+                            self.memory
+                                .read_u32(GuestAddr(cpu.register(13).wrapping_add(index * 4)))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .map(|words| format!("{words:08x?}"))
+                        .unwrap_or_else(|error| format!("unavailable: {error}"));
                     return Err(Error::Abi(format!(
-                        "unsupported platform slot 38 command {command} called by module {module}"
+                        "unsupported platform slot 38 command {command} called by module {module} (input={input}, stack={stack})"
                     )));
                 }
             },
