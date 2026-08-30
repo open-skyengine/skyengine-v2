@@ -34,6 +34,7 @@ const MIDI_MASTER_GAIN: f32 = 0.62;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SoundType {
     Midi,
+    Wav,
     Mp3,
 }
 
@@ -69,6 +70,7 @@ impl SoundType {
     pub fn from_mrp(value: u32) -> Option<Self> {
         match value {
             0 => Some(Self::Midi),
+            1 => Some(Self::Wav),
             2 => Some(Self::Mp3),
             _ => None,
         }
@@ -156,6 +158,7 @@ impl AudioPlayer {
                 Some(sound_font) => decode_midi_with_sound_font(data, sound_font)?,
                 None => decode_midi(data)?,
             },
+            SoundType::Wav => decode_wav(data)?,
             SoundType::Mp3 => decode_mp3(data)?,
         };
         if samples.is_empty() {
@@ -1737,6 +1740,118 @@ fn float_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
 }
 
+fn decode_wav(data: &[u8]) -> Result<Vec<i16>> {
+    if data.len() < 12 || &data[..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err(Error::Platform("invalid WAV container".into()));
+    }
+    let riff_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let riff_end = 8_usize
+        .checked_add(riff_len)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| Error::Platform("truncated WAV container".into()))?;
+
+    let mut format = None;
+    let mut encoded_samples = None;
+    let mut cursor = 12_usize;
+    while cursor < riff_end {
+        let header_end = cursor
+            .checked_add(8)
+            .filter(|end| *end <= riff_end)
+            .ok_or_else(|| Error::Platform("truncated WAV chunk header".into()))?;
+        let chunk_len =
+            u32::from_le_bytes(data[cursor + 4..header_end].try_into().unwrap()) as usize;
+        let chunk_start = header_end;
+        let chunk_end = chunk_start
+            .checked_add(chunk_len)
+            .filter(|end| *end <= riff_end)
+            .ok_or_else(|| Error::Platform("truncated WAV chunk".into()))?;
+        match &data[cursor..cursor + 4] {
+            b"fmt " if format.is_none() => {
+                if chunk_len < 16 {
+                    return Err(Error::Platform("WAV fmt chunk is too short".into()));
+                }
+                format = Some((
+                    u16::from_le_bytes(data[chunk_start..chunk_start + 2].try_into().unwrap()),
+                    u16::from_le_bytes(data[chunk_start + 2..chunk_start + 4].try_into().unwrap()),
+                    u32::from_le_bytes(data[chunk_start + 4..chunk_start + 8].try_into().unwrap()),
+                    u16::from_le_bytes(
+                        data[chunk_start + 12..chunk_start + 14].try_into().unwrap(),
+                    ),
+                    u16::from_le_bytes(
+                        data[chunk_start + 14..chunk_start + 16].try_into().unwrap(),
+                    ),
+                ));
+            }
+            b"data" if encoded_samples.is_none() => {
+                encoded_samples = Some(&data[chunk_start..chunk_end]);
+            }
+            _ => {}
+        }
+        cursor = chunk_end
+            .checked_add(chunk_len & 1)
+            .filter(|next| *next <= riff_end)
+            .ok_or_else(|| Error::Platform("truncated WAV chunk padding".into()))?;
+    }
+
+    let (encoding, channels, sample_rate, block_align, bits_per_sample) =
+        format.ok_or_else(|| Error::Platform("WAV has no fmt chunk".into()))?;
+    if encoding != 1 {
+        return Err(Error::Platform(format!(
+            "unsupported WAV encoding {encoding}"
+        )));
+    }
+    let bytes_per_sample = match bits_per_sample {
+        8 => 1_usize,
+        16 => 2,
+        24 => 3,
+        32 => 4,
+        _ => {
+            return Err(Error::Platform(format!(
+                "unsupported WAV sample width {bits_per_sample}"
+            )));
+        }
+    };
+    let channels = usize::from(channels);
+    let expected_block_align = channels
+        .checked_mul(bytes_per_sample)
+        .filter(|align| channels != 0 && *align == usize::from(block_align))
+        .ok_or_else(|| Error::Platform("WAV has invalid channel alignment".into()))?;
+    if sample_rate == 0 {
+        return Err(Error::Platform("WAV has an invalid sample rate".into()));
+    }
+    let encoded_samples =
+        encoded_samples.ok_or_else(|| Error::Platform("WAV has no data chunk".into()))?;
+    if encoded_samples.is_empty() || encoded_samples.len() % expected_block_align != 0 {
+        return Err(Error::Platform(
+            "WAV sample data is empty or misaligned".into(),
+        ));
+    }
+    let sample_count = encoded_samples.len() / bytes_per_sample;
+    if sample_count > MAX_SOURCE_SAMPLES {
+        return Err(Error::ResourceLimit(
+            "decoded WAV working set exceeds 128 MiB".into(),
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(sample_count);
+    for encoded in encoded_samples.chunks_exact(bytes_per_sample) {
+        let sample = match bits_per_sample {
+            8 => (i16::from(encoded[0]) - 128) << 8,
+            16 => i16::from_le_bytes(encoded.try_into().unwrap()),
+            24 => {
+                let value = i32::from(encoded[0])
+                    | (i32::from(encoded[1]) << 8)
+                    | (i32::from(encoded[2]) << 16);
+                ((value << 8) >> 16) as i16
+            }
+            32 => (i32::from_le_bytes(encoded.try_into().unwrap()) >> 16) as i16,
+            _ => unreachable!(),
+        };
+        samples.push(sample);
+    }
+    resample_to_stereo(&samples, sample_rate, channels)
+}
+
 fn decode_mp3(data: &[u8]) -> Result<Vec<i16>> {
     let source = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
     let mut hint = Hint::new();
@@ -2356,5 +2471,25 @@ MTrk\0\0\0\x0c\0\x90\x45\x7f\x60\x80\x45\0\0\xff\x2f\0";
         assert!(!samples.is_empty());
         assert_eq!(samples.len() % AUDIO_CHANNELS, 0);
         assert!(samples.iter().any(|sample| *sample != 0));
+    }
+
+    #[test]
+    fn packaged_gtdgdq_collision_wav_decodes_and_resamples_to_output_format() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/gtdgdq.mrp");
+        let package = crate::Package::open(fixture, crate::ResourceLimits::default()).unwrap();
+        let encoded = package.read_named(b"zhuangji.wav").unwrap();
+
+        assert_eq!(SoundType::from_mrp(1), Some(SoundType::Wav));
+        let samples = decode_wav(&encoded).unwrap();
+        assert!(!samples.is_empty());
+        assert_eq!(samples.len() % AUDIO_CHANNELS, 0);
+        assert!(samples.iter().any(|sample| *sample != 0));
+
+        let player = AudioPlayer::default();
+        player.play(SoundType::Wav, &encoded, false).unwrap();
+        let mut rendered = vec![0; samples.len()];
+        assert_eq!(player.render(&mut rendered), samples.len() / AUDIO_CHANNELS);
+        assert_eq!(rendered, samples);
     }
 }

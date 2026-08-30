@@ -39,7 +39,7 @@ describe("gtdgdq wall collision", () => {
     ws = undefined;
   });
 
-  it("keeps running after the launched ball hits a wall", async () => {
+  it("keeps running after the launched ball hits a wall with sound enabled", async () => {
     ws = await SkyEngineWorkspace.create();
     fs.rmSync(ws.path("mythroad/gtdgdq"), { recursive: true, force: true });
     engine = await SkyEngineE2e.start("test/fixtures/gtdgdq.mrp", { workDir: ws.dir });
@@ -49,7 +49,7 @@ describe("gtdgdq wall collision", () => {
       timeoutMs: 10_000,
       intervalMs: 250,
     });
-    await engine.key("RIGHT_SOFT", 1_000);
+    await engine.key("LEFT_SOFT", 1_000);
     await engine.waitForPixel(168, 162, [248, 248, 240], {
       name: "wall-menu",
       timeoutMs: 10_000,

@@ -1323,7 +1323,7 @@ fn headless_audio_stop_is_idempotent() {
 }
 
 #[test]
-fn headless_audio_accepts_in_memory_midi_without_producing_output() {
+fn headless_audio_forwards_verified_in_memory_formats() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let midi = runtime.allocate(14, 4).unwrap();
@@ -1369,6 +1369,17 @@ fn headless_audio_accepts_in_memory_midi_without_producing_output() {
         assert!(!sound.as_ref().unwrap().2);
     });
 
+    cpu.set_register(0, 1);
+    runtime
+        .dispatch(57, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(cpu.register(0), 0);
+    STUB_SOUND.with(|sound| {
+        let sound = sound.borrow();
+        assert_eq!(sound.as_ref().unwrap().0, SoundType::Wav);
+        assert!(!sound.as_ref().unwrap().2);
+    });
+
     runtime
         .dispatch(58, 0, &mut cpu, &mut StubServices)
         .unwrap();
@@ -1385,7 +1396,7 @@ fn headless_audio_rejects_unverified_request_forms() {
     cpu.set_register(1, sound.0);
     cpu.set_register(2, 4);
 
-    for (sound_type, looped) in [(1, 0), (3, 0), (0, 2)] {
+    for (sound_type, looped) in [(3, 0), (0, 2)] {
         cpu.set_register(0, sound_type);
         cpu.set_register(3, looped);
         assert!(matches!(
