@@ -105,6 +105,12 @@ const LEGACY_EXTERNAL_ACTION_KINDS: [u32; 1] = [2];
 
 pub(crate) trait NativeServices {
     fn resize_screen(&mut self, width: u16, height: u16) -> Result<()>;
+    fn start_shake(&mut self, _milliseconds: u32) -> Result<()> {
+        Ok(())
+    }
+    fn stop_shake(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn capture_framebuffer(&mut self) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }

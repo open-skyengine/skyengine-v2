@@ -171,6 +171,10 @@ guest 缓冲区；`looped` 为 `0` 时单次播放，为 `1` 或有符号值 `-1
 profile 使用无输出音频 sink，调用成功推进 guest 状态但不产生宿主声音。
 `mr_stopSound` 停止当前音轨，在没有正在播放的声音时也成功返回。
 
+`mr_startShake(milliseconds)` 和 `mr_stopShake()` 均返回 `0`。无振动输出能力的
+headless/SDL profile 使用静默 sink；Flutter display 把非零时长锁存为单次事件，
+由 `skyengine_api_take_shake()` 消费。尚未消费时调用 `mr_stopShake()` 会取消该事件。
+
 ## UI 与网络（槽 63-90）
 
 | 槽 | 种类 | ABI 名称 | 作用 | 版本 |

@@ -64,6 +64,7 @@ SKYENGINE_EXPORT int32_t skyengine_api_cancel_edit(void);
 SKYENGINE_EXPORT int32_t skyengine_api_motion(int32_t x, int32_t y, int32_t z);
 /* Returns 1 while the running guest requests motion samples, otherwise 0. */
 SKYENGINE_EXPORT int32_t skyengine_api_motion_active(void);
+/* Consumes and returns a pending vibration duration in milliseconds, or 0 if none. */
 SKYENGINE_EXPORT int32_t skyengine_api_take_shake(void);
 
 /// Returns a UTF-8 description of the most recent bridge error.

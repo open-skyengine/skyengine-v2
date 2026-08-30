@@ -15,6 +15,14 @@ pub trait PlatformDisplay {
         Ok(())
     }
 
+    fn start_shake(&mut self, _milliseconds: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn stop_shake(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn present(&mut self, framebuffer: &Framebuffer) -> Result<()>;
     fn poll_event(&mut self) -> Result<Option<DisplayEvent>>;
     fn wait_timeout(&mut self, milliseconds: u32);

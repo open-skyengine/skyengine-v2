@@ -629,6 +629,14 @@ impl ExtRuntime {
                 self.exit_requested = true;
                 cpu.set_register(0, 0);
             }
+            55 => {
+                services.start_shake(cpu.register(0))?;
+                cpu.set_register(0, 0);
+            }
+            56 => {
+                services.stop_shake()?;
+                cpu.set_register(0, 0);
+            }
             57 => {
                 let sound_type = cpu.register(0);
                 let sound = GuestAddr(cpu.register(1));

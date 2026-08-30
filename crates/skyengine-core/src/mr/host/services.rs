@@ -217,6 +217,14 @@ impl NativeServices for PackageServices<'_> {
         self.display.resize(width, height)
     }
 
+    fn start_shake(&mut self, milliseconds: u32) -> Result<()> {
+        self.display.start_shake(milliseconds)
+    }
+
+    fn stop_shake(&mut self) -> Result<()> {
+        self.display.stop_shake()
+    }
+
     fn capture_framebuffer(&mut self) -> Result<Option<Vec<u8>>> {
         let mut bytes = Vec::with_capacity(self.framebuffer.pixels().len().saturating_mul(2));
         for pixel in self.framebuffer.pixels() {

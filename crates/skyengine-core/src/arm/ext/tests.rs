@@ -9,6 +9,9 @@ std::thread_local! {
     static STUB_SOUND: std::cell::RefCell<Option<(SoundType, Vec<u8>, bool)>> = const {
         std::cell::RefCell::new(None)
     };
+    static STUB_SHAKE: std::cell::RefCell<Option<u32>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 struct StubFramebufferCapture;
@@ -107,6 +110,16 @@ fn semihosting_exit_unwinds_the_guest_call_and_requests_runtime_exit() {
 
 impl NativeServices for StubServices {
     fn resize_screen(&mut self, _width: u16, _height: u16) -> Result<()> {
+        Ok(())
+    }
+
+    fn start_shake(&mut self, milliseconds: u32) -> Result<()> {
+        STUB_SHAKE.with(|shake| *shake.borrow_mut() = Some(milliseconds));
+        Ok(())
+    }
+
+    fn stop_shake(&mut self) -> Result<()> {
+        STUB_SHAKE.with(|shake| *shake.borrow_mut() = None);
         Ok(())
     }
 

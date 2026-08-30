@@ -104,6 +104,7 @@ impl Shared {
                 paused: false,
                 stop_requested: false,
                 motion_active: false,
+                pending_shake_ms: None,
                 edit_text: None,
                 last_error: None,
             }),
@@ -135,6 +136,16 @@ impl Shared {
         Ok(())
     }
 
+    fn take_shake(&self) -> i32 {
+        let mut state = lock(&self.state);
+        if !state.running || state.paused {
+            return 0;
+        }
+        state.pending_shake_ms.take().map_or(0, |milliseconds| {
+            i32::try_from(milliseconds).unwrap_or(i32::MAX)
+        })
+    }
+
     fn wait_timeout(&self, timeout: Duration) {
         let state = lock(&self.state);
         drop(
@@ -156,6 +167,7 @@ struct SharedState {
     paused: bool,
     stop_requested: bool,
     motion_active: bool,
+    pending_shake_ms: Option<u32>,
     edit_text: Option<String>,
     last_error: Option<String>,
 }
@@ -195,6 +207,16 @@ impl PlatformDisplay for FlutterDisplay {
         state.frame.clear();
         state.frame.extend_from_slice(framebuffer.pixels());
         state.dirty = true;
+        Ok(())
+    }
+
+    fn start_shake(&mut self, milliseconds: u32) -> CoreResult<()> {
+        lock(&self.shared.state).pending_shake_ms = (milliseconds != 0).then_some(milliseconds);
+        Ok(())
+    }
+
+    fn stop_shake(&mut self) -> CoreResult<()> {
+        lock(&self.shared.state).pending_shake_ms = None;
         Ok(())
     }
 
@@ -435,6 +457,7 @@ fn worker_main(
     state.running = false;
     state.paused = false;
     state.motion_active = false;
+    state.pending_shake_ms = None;
     state.edit_text = None;
     shared.wake.notify_all();
 }
@@ -1040,7 +1063,13 @@ pub extern "C" fn skyengine_api_motion_active() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn skyengine_api_take_shake() -> i32 {
-    0
+    catch_unwind(AssertUnwindSafe(|| {
+        lock(&ENGINE)
+            .worker
+            .as_ref()
+            .map_or(0, |worker| worker.shared.take_shake())
+    }))
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
@@ -1074,6 +1103,41 @@ mod tests {
         fn drop(&mut self) {
             skyengine_api_destroy();
         }
+    }
+
+    fn send_key(code: i32) {
+        assert_eq!(skyengine_api_event(0, code, 0), 0);
+        assert_eq!(skyengine_api_event(1, code, 0), 0);
+    }
+
+    fn screen_frame() -> Vec<u16> {
+        let width = usize::try_from(skyengine_api_get_screen_width()).unwrap();
+        let height = usize::try_from(skyengine_api_get_screen_height()).unwrap();
+        let pointer = skyengine_api_get_screen_buffer();
+        assert!(!pointer.is_null());
+        // SAFETY: The screen API exposes width * height stable RGB565 pixels.
+        unsafe { std::slice::from_raw_parts(pointer, width * height) }.to_vec()
+    }
+
+    fn wait_for_screen(timeout: Duration, predicate: impl Fn(&[u16], usize, usize) -> bool) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let width = usize::try_from(skyengine_api_get_screen_width()).unwrap();
+            let height = usize::try_from(skyengine_api_get_screen_height()).unwrap();
+            let frame = screen_frame();
+            if predicate(&frame, width, height) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "screen predicate did not match before timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    const fn rgb565(red: u8, green: u8, blue: u8) -> u16 {
+        (red as u16 >> 3) << 11 | (green as u16 >> 2) << 5 | blue as u16 >> 3
     }
 
     #[test]
@@ -1143,6 +1207,34 @@ mod tests {
     }
 
     #[test]
+    fn flutter_shake_requests_are_latched_until_consumed_or_stopped() {
+        let shared = Arc::new(Shared::new(2, 3));
+        let mut display = FlutterDisplay {
+            shared: shared.clone(),
+            panel_width: 2,
+            panel_height: 3,
+        };
+        lock(&shared.state).running = true;
+
+        display.start_shake(500).unwrap();
+        assert_eq!(shared.take_shake(), 500);
+        assert_eq!(shared.take_shake(), 0);
+
+        display.start_shake(750).unwrap();
+        lock(&shared.state).paused = true;
+        assert_eq!(shared.take_shake(), 0);
+        lock(&shared.state).paused = false;
+        assert_eq!(shared.take_shake(), 750);
+
+        display.start_shake(1_000).unwrap();
+        display.stop_shake().unwrap();
+        assert_eq!(shared.take_shake(), 0);
+
+        display.start_shake(u32::MAX).unwrap();
+        assert_eq!(shared.take_shake(), i32::MAX);
+    }
+
+    #[test]
     fn c_api_runs_a_real_package_and_publishes_its_first_frame() {
         let _serial = lock(&TEST_ENGINE);
         let _guard = EngineGuard;
@@ -1186,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn c_api_reports_and_delivers_motion_for_a_real_package() {
+    fn c_api_reports_motion_and_shake_for_a_real_package() {
         let _serial = lock(&TEST_ENGINE);
         let _guard = EngineGuard;
         let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1226,11 +1318,14 @@ mod tests {
         );
 
         assert_eq!(skyengine_api_motion_active(), 0);
-        for code in [18, 20, 17] {
-            assert_eq!(skyengine_api_event(0, code, 0), 0);
-            assert_eq!(skyengine_api_event(1, code, 0), 0);
-            thread::sleep(Duration::from_millis(100));
-        }
+        wait_for_screen(Duration::from_secs(2), |frame, width, _| {
+            frame[312 * width + 219] == rgb565(0, 200, 248)
+        });
+        send_key(18);
+        wait_for_screen(Duration::from_secs(2), |frame, width, _| {
+            frame[162 * width + 168] == rgb565(248, 248, 240)
+        });
+        send_key(17);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while skyengine_api_motion_active() == 0 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -1243,7 +1338,39 @@ mod tests {
         assert_eq!(skyengine_api_motion_active(), 1);
         assert_eq!(skyengine_api_motion(8, 0, 0), 0);
 
-        thread::sleep(Duration::from_millis(50));
+        send_key(17);
+        wait_for_screen(Duration::from_secs(2), |frame, _, _| {
+            frame
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 2
+        });
+        send_key(13);
+        thread::sleep(Duration::from_millis(100));
+        send_key(17);
+        wait_for_screen(Duration::from_secs(2), |frame, width, _| {
+            frame[160 * width + 120] == rgb565(152, 40, 176)
+        });
+        send_key(20);
+        wait_for_screen(Duration::from_secs(2), |frame, width, _| {
+            frame
+                .chunks_exact(width)
+                .skip(260)
+                .take(40)
+                .flatten()
+                .any(|pixel| *pixel == rgb565(24, 120, 248))
+        });
+        send_key(20);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut shake_ms = 0;
+        while shake_ms == 0 && std::time::Instant::now() < deadline {
+            shake_ms = skyengine_api_take_shake();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(shake_ms, 500);
+        assert_eq!(skyengine_api_take_shake(), 0);
         assert_eq!(skyengine_api_is_running(), 1);
         skyengine_api_destroy();
         std::fs::remove_dir_all(work_dir).unwrap();
