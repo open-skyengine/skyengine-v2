@@ -19,8 +19,8 @@ describe("gfhcq", () => {
     ws = await SkyEngineWorkspace.create();
     fs.rmSync(ws.path('mythroad/brw'), { recursive: true, force: true })
 
-    // 480x800 RGB565 屏幕本身占约 750 KiB；显式使用复现环境的 8 MiB
-    // 档位，避免默认 1 MiB 把资源内存不足混入游戏阶段的性能测量。
+    // 480x800 RGB565 屏幕本身占约 750 KiB；固定使用复现环境的 8 MiB
+    // 档位，避免内存配置变化混入游戏阶段的性能测量。
     engine = await SkyEngineE2e.start("test/fixtures/gfhcq.mrp", {
       workDir: ws.dir,
       screen: '480x800',

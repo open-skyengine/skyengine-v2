@@ -155,8 +155,8 @@ impl NativeServices for StubServices {
         Ok(0)
     }
 
-    fn open_file(&mut self, _name: &[u8], _mode: u32) -> Result<i32> {
-        Ok(-1)
+    fn open_file(&mut self, name: &[u8], _mode: u32) -> Result<i32> {
+        Ok(if name == b"opened.bin" { 123 } else { -1 })
     }
 
     fn close_file(&mut self, _handle: i32) -> Result<i32> {

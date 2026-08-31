@@ -94,7 +94,7 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     let sound_font =
         take_option(&mut args, "--sound-font")?.or_else(|| env::var("SKYENGINE_SOUNDFONT").ok());
     let screen = take_option(&mut args, "--screen")?.unwrap_or_else(|| "240x320".into());
-    let memory = take_option(&mut args, "--memory")?.unwrap_or_else(|| "1M".into());
+    let memory = take_option(&mut args, "--memory")?;
     let dns_map = take_option(&mut args, "--dns-map")?;
     let device_date =
         take_option(&mut args, "--device-date")?.or_else(|| env::var("SKYENGINE_DEVICE_DATE").ok());
@@ -106,7 +106,6 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
         ));
     }
     let (width, height) = parse_screen(&screen)?;
-    let memory_limit = parse_memory(&memory)?;
     let mut config = RuntimeConfig::for_app(PathBuf::from(&args[0]));
     config.entry = entry.as_bytes().to_vec();
     config.work_dir = PathBuf::from(work_dir);
@@ -115,7 +114,9 @@ fn run(mut args: Vec<std::ffi::OsString>) -> Result<()> {
     }
     config.screen_width = width;
     config.screen_height = height;
-    config.memory_limit = memory_limit;
+    if let Some(memory) = memory {
+        config.memory_limit = parse_memory(&memory)?;
+    }
     apply_dns_map_option(&mut config, dns_map.as_deref())?;
     config.device_date = match device_date {
         Some(device_date) => parse_device_date(&device_date)?,
@@ -430,7 +431,7 @@ fn print_help() {
          DNS MAP maps the default Skymobi hosts to 159.75.119.124.\n  \
          Connections to 10.0.0.172 use the built-in WAP proxy unless explicitly mapped.\n  \
          Device date and time default to the host clock; SKYENGINE_DEVICE_DATE starts at midnight.\n  \
-         Memory SIZE is one of 1M, 2M, 4M, 6M, 8M, or 16M.\n  \
+         Memory SIZE is one of 1M, 2M, 4M, 6M, 8M, or 16M; default 1M.\n  \
          The default font is mythroad/system/gb16.uc2."
     );
 }

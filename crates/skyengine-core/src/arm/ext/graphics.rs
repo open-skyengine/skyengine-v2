@@ -281,13 +281,13 @@ impl ExtRuntime {
         }
 
         let previous_screen = self.capture_platform_screen(services)?;
-        self.memory.write(SCREEN_BASE, &previous_screen)?;
+        self.memory.write(self.screen_base, &previous_screen)?;
         self.menus
             .get_mut(&handle)
             .expect("menu handle was checked")
             .previous_screen = Some(previous_screen.clone());
         if let Err(error) = self.render_platform_menu(handle, services) {
-            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.memory.write(self.screen_base, &previous_screen)?;
             self.menus
                 .get_mut(&handle)
                 .expect("menu handle was checked")
@@ -352,10 +352,10 @@ impl ExtRuntime {
                 })?;
             self.active_platform_ui.clear();
             self.platform_pointer_capture = None;
-            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.memory.write(self.screen_base, &previous_screen)?;
             self.present_screen(services)?;
         } else if was_top && let Some(previous_screen) = menu.previous_screen {
-            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.memory.write(self.screen_base, &previous_screen)?;
             self.present_screen(services)?;
         }
         Ok(true)
@@ -558,7 +558,7 @@ impl ExtRuntime {
 
         let menu_screen = self
             .memory
-            .read(SCREEN_BASE, self.platform_screen_byte_len()?)?;
+            .read(self.screen_base, self.platform_screen_byte_len()?)?;
         let menu = self
             .menus
             .get_mut(&handle)
@@ -584,7 +584,7 @@ impl ExtRuntime {
     fn capture_platform_screen(&self, services: &mut dyn NativeServices) -> Result<Vec<u8>> {
         let expected_len = self.platform_screen_byte_len()?;
         let Some(screen) = services.capture_framebuffer()? else {
-            return self.memory.read(SCREEN_BASE, expected_len);
+            return self.memory.read(self.screen_base, expected_len);
         };
         if screen.len() != expected_len {
             return Err(Error::Abi(format!(
@@ -648,7 +648,7 @@ impl ExtRuntime {
             Some(screen) => screen,
             None => self.capture_platform_screen(services)?,
         };
-        self.memory.write(SCREEN_BASE, &previous_screen)?;
+        self.memory.write(self.screen_base, &previous_screen)?;
 
         let black = Framebuffer::rgb565(0, 0, 0);
         let green = Framebuffer::rgb565(0, 252, 0);
@@ -668,7 +668,7 @@ impl ExtRuntime {
             services,
         )?;
 
-        let dialog_screen = self.memory.read(SCREEN_BASE, screen_len)?;
+        let dialog_screen = self.memory.read(self.screen_base, screen_len)?;
         self.dialogs.insert(
             handle,
             PlatformDialog {
@@ -707,7 +707,8 @@ impl ExtRuntime {
             self.platform_pointer_capture = None;
         }
         if was_top {
-            self.memory.write(SCREEN_BASE, &dialog.previous_screen)?;
+            self.memory
+                .write(self.screen_base, &dialog.previous_screen)?;
             self.present_screen(services)?;
         }
         Ok(true)
@@ -754,7 +755,7 @@ impl ExtRuntime {
             })
             .map(Ok)
             .unwrap_or_else(|| self.capture_platform_screen(services))?;
-        self.memory.write(SCREEN_BASE, &previous_screen)?;
+        self.memory.write(self.screen_base, &previous_screen)?;
 
         let (width, _) = self.screen_dimensions()?;
         self.text_viewers.insert(
@@ -773,7 +774,8 @@ impl ExtRuntime {
         if let Err(error) = self.render_platform_text_viewer(handle, services) {
             self.active_platform_ui.pop();
             if let Some(viewer) = self.text_viewers.remove(&handle) {
-                self.memory.write(SCREEN_BASE, &viewer.previous_screen)?;
+                self.memory
+                    .write(self.screen_base, &viewer.previous_screen)?;
             }
             return Err(error);
         }
@@ -871,7 +873,7 @@ impl ExtRuntime {
 
         let viewer_screen = self
             .memory
-            .read(SCREEN_BASE, self.platform_screen_byte_len()?)?;
+            .read(self.screen_base, self.platform_screen_byte_len()?)?;
         let viewer = self
             .text_viewers
             .get_mut(&handle)
@@ -977,7 +979,8 @@ impl ExtRuntime {
             self.platform_pointer_capture = None;
         }
         if was_top {
-            self.memory.write(SCREEN_BASE, &viewer.previous_screen)?;
+            self.memory
+                .write(self.screen_base, &viewer.previous_screen)?;
             self.present_screen(services)?;
         }
         Ok(true)
@@ -994,7 +997,7 @@ impl ExtRuntime {
         let Some(viewer) = self.text_viewers.get(&handle) else {
             return Ok(false);
         };
-        self.memory.write(SCREEN_BASE, &viewer.viewer_screen)?;
+        self.memory.write(self.screen_base, &viewer.viewer_screen)?;
         self.present_screen(services)?;
         Ok(true)
     }
@@ -1077,7 +1080,7 @@ impl ExtRuntime {
             })
             .and_then(|pixels| pixels.checked_mul(2))
             .ok_or_else(|| Error::Abi("screen presentation size overflow".into()))?;
-        let pixels = self.memory.read(SCREEN_BASE, byte_len)?;
+        let pixels = self.memory.read(self.screen_base, byte_len)?;
         services.draw_bitmap(&pixels, 0, 0, width as usize, height as usize)
     }
 
@@ -1098,7 +1101,7 @@ impl ExtRuntime {
                 "mr_drawBitmap source is {byte_len} bytes"
             )));
         }
-        if source != SCREEN_BASE {
+        if source != self.screen_base {
             return self.memory.read(source, byte_len);
         }
 
@@ -1644,7 +1647,7 @@ impl ExtRuntime {
             .and_then(|len| u32::try_from(len).ok())
             .ok_or_else(|| Error::Abi("screen bitmap size overflow".into()))?;
         self.memory
-            .check_range(SCREEN_BASE, byte_len as usize, Permissions::READ_WRITE)?;
+            .check_range(self.screen_base, byte_len as usize, Permissions::READ_WRITE)?;
         let bitmap_table = GuestAddr(self.memory.read_u32(table_slot_address(95))?);
         let screen_bitmap = bitmap_table.checked_add(SCREEN_BITMAP_ID * BITMAP_ENTRY_SIZE)?;
 
@@ -1662,7 +1665,7 @@ impl ExtRuntime {
     }
 
     pub(super) fn screen_address(&self, x: i32, y: i32, width: i32) -> Result<GuestAddr> {
-        screen_pixel_address(SCREEN_BASE, x, y, width)
+        screen_pixel_address(self.screen_base, x, y, width)
     }
 
     fn active_screen_address(&self, x: i32, y: i32, width: i32) -> Result<GuestAddr> {

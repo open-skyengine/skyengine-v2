@@ -17,6 +17,8 @@ use crate::{
     wap_proxy::{WAP_PROXY_ADDRESS, WapProxyService},
 };
 
+pub const DEFAULT_MEMORY_LIMIT: u32 = 1 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeState {
     Created,
@@ -288,7 +290,7 @@ impl RuntimeConfig {
             entry: b"start.mr".to_vec(),
             work_dir: PathBuf::from("."),
             font_path: PathBuf::from("mythroad/system/gb16.uc2"),
-            memory_limit: 1024 * 1024,
+            memory_limit: DEFAULT_MEMORY_LIMIT,
             screen_width: 240,
             screen_height: 320,
             dns_mappings: default_dns_mappings(),
@@ -682,6 +684,14 @@ mod tests {
         assert_eq!(
             RuntimeConfig::for_app("app.mrp").font_path,
             PathBuf::from("mythroad/system/gb16.uc2")
+        );
+    }
+
+    #[test]
+    fn uses_the_compatible_memory_profile_by_default() {
+        assert_eq!(
+            RuntimeConfig::for_app("app.mrp").memory_limit,
+            DEFAULT_MEMORY_LIMIT
         );
     }
 

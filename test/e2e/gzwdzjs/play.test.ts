@@ -17,7 +17,7 @@ describe("gzwdzjs 游戏", () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
     fs.rmSync(ws.path("mythroad/plugins/netpay.mrp"), { recursive: true, force: true });
-    // gzwdzjs 教程开始时的场景分配超过 1MB 默认应用堆:分配失败后游戏
+    // gzwdzjs 教程开始时的场景分配超过 1 MiB 应用堆:分配失败后游戏
     // 不检查返回值,拿垃圾指针调 DrawBitmap 导致崩溃(真机大内存下正常)。
     engine = await SkyEngineE2e.start("test/fixtures/gzwdzjs.mrp", { workDir: ws.dir, memory: "2M" });
 

@@ -18,7 +18,7 @@ export interface SkyEngineE2eOptions {
   dnsMap?: string;
   /** 屏幕分辨率(--screen WxH),如 "480x320"。默认由 SkyEngine 决定(240x320)。 */
   screen?: `${number}x${number}`;
-  /** 应用可见内存(--memory),档位 1M/2M/4M/6M/8M/16M。默认由 SkyEngine 决定(1M)。 */
+  /** 应用可见内存(--memory),档位 1M/2M/4M/6M/8M/16M。默认由 SkyEngine 决定(6M)。 */
   memory?: "1M" | "2M" | "4M" | "6M" | "8M" | "16M";
   /** 应用可见设备日期；"host" 显式使用宿主墙钟日期。 */
   deviceDate?: `${number}-${number}-${number}` | "host";

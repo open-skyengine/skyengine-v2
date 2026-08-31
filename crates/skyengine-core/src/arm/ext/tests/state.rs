@@ -56,7 +56,7 @@ fn gzip_guest_call_recovers_the_platform_screen_buffer_capacity_from_abi_data() 
         .unwrap();
     assert_eq!(
         runtime.memory.read_u32(output_len_pointer).unwrap(),
-        13 * 9 * 2
+        SCREEN_STAGING_CAPACITY as u32
     );
 }
 
@@ -72,7 +72,9 @@ fn gzip_screen_capacity_recovery_rejects_unowned_and_oversized_outputs() {
     cpu.set_register(13, STACK_BASE.0);
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&[0; 8 * 8 * 2 + 1]).unwrap();
+    encoder
+        .write_all(&vec![0; SCREEN_STAGING_CAPACITY + 1])
+        .unwrap();
     let oversized = encoder.finish().unwrap();
     let source = runtime.allocate(oversized.len(), 4).unwrap();
     runtime.memory.write(source, &oversized).unwrap();
@@ -97,7 +99,7 @@ fn gzip_screen_capacity_recovery_rejects_unowned_and_oversized_outputs() {
         .unwrap();
     assert_eq!(
         runtime.memory.read_u32(output_len_pointer).unwrap(),
-        8 * 8 * 2
+        SCREEN_STAGING_CAPACITY as u32
     );
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -143,6 +145,19 @@ fn gzip_screen_capacity_recovery_rejects_unowned_and_oversized_outputs() {
         .prepare_guest_gzip_screen_buffer_capacity(&cpu)
         .unwrap();
     assert_eq!(runtime.memory.read_u32(output_len_pointer).unwrap(), 100);
+
+    let valid_staging_capacity = 800 * 1024;
+    runtime
+        .memory
+        .write_u32(output_len_pointer, valid_staging_capacity)
+        .unwrap();
+    runtime
+        .prepare_guest_gzip_screen_buffer_capacity(&cpu)
+        .unwrap();
+    assert_eq!(
+        runtime.memory.read_u32(output_len_pointer).unwrap(),
+        valid_staging_capacity
+    );
 
     runtime.memory.write_u32(output_len_pointer, 1).unwrap();
     runtime.memory.write(fitting_source, &[0]).unwrap();
@@ -3736,6 +3751,136 @@ fn exposes_the_configured_heap_to_the_guest() {
         runtime.memory.read_u32(data_slot_address(111)).unwrap(),
         heap_len
     );
+}
+
+#[test]
+fn keeps_the_legacy_screen_address_and_complete_ram_window_for_ordinary_heaps() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let final_ram_page = GuestAddr(SCREEN_BASE.0 - GUEST_MEMORY_GUARD_LEN);
+
+    assert_eq!(runtime.screen_base, SCREEN_BASE);
+    assert_eq!(
+        runtime.memory.read_u32(data_slot_address(91)).unwrap(),
+        SCREEN_BASE.0
+    );
+    runtime
+        .memory
+        .write_u32(final_ram_page, 0x1234_5678)
+        .unwrap();
+    assert_eq!(
+        runtime.memory.read_u32(final_ram_page).unwrap(),
+        0x1234_5678
+    );
+    assert!(runtime.memory.read(GuestAddr(SCREEN_BASE.0 - 1), 1).is_ok());
+    assert!(runtime.memory.read(SCREEN_BASE, 1).is_ok());
+}
+
+#[test]
+fn selects_the_expanded_screen_only_above_the_legacy_ram_window() {
+    let legacy = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", MIN_GUEST_RAM_LEN as u32).unwrap();
+    let expanded =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", MIN_GUEST_RAM_LEN as u32 + 1).unwrap();
+
+    assert_eq!(legacy.screen_base, SCREEN_BASE);
+    assert_eq!(expanded.screen_base, EXPANDED_SCREEN_BASE);
+}
+
+#[test]
+fn keeps_an_unmapped_guard_between_the_largest_heap_and_expanded_screen() {
+    let runtime = ExtRuntime::new(
+        240,
+        320,
+        b"test.mrp",
+        b"start.mr",
+        MAX_GUEST_HEAP_LEN as u32,
+    )
+    .unwrap();
+    let heap_end = GuestAddr(HEAP_BASE.0 + MAX_GUEST_HEAP_LEN as u32);
+
+    assert_eq!(runtime.screen_base, EXPANDED_SCREEN_BASE);
+    assert_eq!(
+        runtime.memory.read_u32(data_slot_address(91)).unwrap(),
+        EXPANDED_SCREEN_BASE.0
+    );
+    assert_eq!(EXPANDED_SCREEN_BASE.0 - heap_end.0, GUEST_MEMORY_GUARD_LEN);
+    assert!(runtime.memory.read(GuestAddr(heap_end.0 - 1), 1).is_ok());
+    assert!(runtime.memory.read(heap_end, 1).is_err());
+    assert!(
+        runtime
+            .memory
+            .read(heap_end, GUEST_MEMORY_GUARD_LEN as usize)
+            .is_err()
+    );
+    assert!(runtime.memory.read(EXPANDED_SCREEN_BASE, 1).is_ok());
+}
+
+#[test]
+fn draws_and_presents_from_the_expanded_screen_address() {
+    let mut runtime =
+        ExtRuntime::new(2, 2, b"test.mrp", b"start.mr", MAX_GUEST_HEAP_LEN as u32).unwrap();
+    let _capture = capture_stub_framebuffer(vec![0; 2 * 2 * 2]);
+    let legacy_heap_marker = 0x55aa;
+    let screen_color = 0x1234;
+    runtime
+        .memory
+        .write_u16(SCREEN_BASE, legacy_heap_marker)
+        .unwrap();
+
+    runtime
+        .draw_rectangle_to_screen(0, 0, 1, 1, screen_color)
+        .unwrap();
+    runtime.present_screen(&mut StubServices).unwrap();
+
+    assert_eq!(
+        runtime.screen_address(0, 0, 2).unwrap(),
+        EXPANDED_SCREEN_BASE
+    );
+    assert_eq!(
+        runtime.memory.read_u16(EXPANDED_SCREEN_BASE).unwrap(),
+        screen_color
+    );
+    assert_eq!(
+        runtime.memory.read_u16(SCREEN_BASE).unwrap(),
+        legacy_heap_marker
+    );
+    assert_eq!(
+        STUB_FRAMEBUFFER.with(|framebuffer| framebuffer.borrow().clone()),
+        Some(vec![0x34, 0x12, 0, 0, 0, 0, 0, 0])
+    );
+}
+
+#[test]
+fn maps_screen_staging_capacity_beyond_the_visible_framebuffer() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    let last_staging_byte = runtime
+        .screen_base
+        .checked_add(SCREEN_STAGING_CAPACITY as u32 - 1)
+        .unwrap();
+    let after_staging = runtime
+        .screen_base
+        .checked_add(SCREEN_STAGING_CAPACITY as u32)
+        .unwrap();
+
+    assert_eq!(runtime.screen_memory_len, SCREEN_STAGING_CAPACITY);
+    runtime.memory.write(last_staging_byte, &[0x5a]).unwrap();
+    assert_eq!(runtime.memory.read(last_staging_byte, 1).unwrap(), [0x5a]);
+    assert!(runtime.memory.write(after_staging, &[0xa5]).is_err());
+}
+
+#[test]
+fn rejects_heaps_that_would_cross_the_guarded_memory_layout() {
+    assert!(matches!(
+        ExtRuntime::new(
+            240,
+            320,
+            b"test.mrp",
+            b"start.mr",
+            MAX_GUEST_HEAP_LEN as u32 + 1,
+        ),
+        Err(Error::ArmFault(message)) if message.contains("exceeds supported maximum")
+    ));
 }
 
 #[test]

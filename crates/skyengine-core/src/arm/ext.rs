@@ -73,6 +73,9 @@ const MODULE_BASE: u32 = 0x1000_0000;
 const MODULE_STRIDE: u32 = 0x0010_0000;
 const HEAP_BASE: GuestAddr = GuestAddr(0x2000_0000);
 const MIN_GUEST_RAM_LEN: usize = 8 * 1024 * 1024;
+const MAX_GUEST_HEAP_LEN: usize = 16 * 1024 * 1024;
+const GUEST_MEMORY_GUARD_LEN: u32 = 4 * 1024;
+const SCREEN_STAGING_CAPACITY: usize = 1024 * 1024;
 #[cfg(test)]
 const DEFAULT_HEAP_LEN: usize = 4 * 1024 * 1024;
 const STACK_BASE: GuestAddr = GuestAddr(0x3000_0000);
@@ -82,6 +85,8 @@ const DETACHED_GUEST_ALLOCATION_BASE: GuestAddr = GuestAddr(0x5000_0000);
 const LEGACY_KEYPAD_REGISTERS: GuestAddr = GuestAddr(0x8011_0000);
 const LEGACY_KEYPAD_REGISTERS_LEN: usize = 16;
 const SCREEN_BASE: GuestAddr = GuestAddr(HEAP_BASE.0 + MIN_GUEST_RAM_LEN as u32);
+const EXPANDED_SCREEN_BASE: GuestAddr =
+    GuestAddr(HEAP_BASE.0 + MAX_GUEST_HEAP_LEN as u32 + GUEST_MEMORY_GUARD_LEN);
 const FREE_BLOCK_HEADER_LEN: u32 = 8;
 const HEAP_ALIGNMENT: u32 = 8;
 const BITMAP_ENTRY_SIZE: u32 = 16;
@@ -586,7 +591,8 @@ pub(crate) struct ExtRuntime {
     next_module_generation: u64,
     active_helper: Option<GuestFunction>,
     heap_len: usize,
-    screen_buffer_len: usize,
+    screen_base: GuestAddr,
+    screen_memory_len: usize,
     guest_allocations: BTreeMap<u32, u32>,
     guest_allocation_owners: BTreeMap<u32, u64>,
     guest_allocation_views: BTreeMap<u32, GuestAllocationView>,
@@ -655,10 +661,22 @@ impl ExtRuntime {
         if heap_len == 0 {
             return Err(Error::ArmFault("guest heap length must be non-zero".into()));
         }
+        if heap_len > MAX_GUEST_HEAP_LEN {
+            return Err(Error::ArmFault(format!(
+                "guest heap length {heap_len} exceeds supported maximum {MAX_GUEST_HEAP_LEN}"
+            )));
+        }
         let heap_end = HEAP_BASE
             .0
             .checked_add(heap_len as u32)
             .ok_or_else(|| Error::ArmFault("guest heap end overflow".into()))?;
+        // Legacy helpers use the full fixed RAM window even when the configured
+        // allocator heap is smaller. Larger heaps use a separately guarded screen.
+        let (guest_ram_len, screen_base) = if heap_len <= MIN_GUEST_RAM_LEN {
+            (MIN_GUEST_RAM_LEN, SCREEN_BASE)
+        } else {
+            (heap_len, EXPANDED_SCREEN_BASE)
+        };
         let mut memory = GuestMemory::new();
         memory.map(
             PLATFORM_TABLE,
@@ -695,7 +713,7 @@ impl ExtRuntime {
         )?;
         memory.map(
             HEAP_BASE,
-            heap_len.max(MIN_GUEST_RAM_LEN),
+            guest_ram_len,
             Permissions::READ_WRITE,
             "guest RAM",
         )?;
@@ -712,11 +730,12 @@ impl ExtRuntime {
             .checked_mul(usize::from(screen_height))
             .and_then(|pixels| pixels.checked_mul(2))
             .ok_or_else(|| Error::ArmFault("guest screen buffer size overflow".into()))?;
+        let screen_memory_len = screen_len.max(SCREEN_STAGING_CAPACITY);
         memory.map(
-            SCREEN_BASE,
-            screen_len,
+            screen_base,
+            screen_memory_len,
             Permissions::READ_WRITE,
-            "screen buffer",
+            "screen memory",
         )?;
 
         for slot in 0..PLATFORM_SLOT_COUNT {
@@ -755,7 +774,7 @@ impl ExtRuntime {
         )?;
         memory.write_u32(INTERNAL_TABLE_DATA.checked_add(20)?, TIMER_ACTIVE_DATA.0)?;
         memory.write_u32(APPLICATION_STATE_DATA, APPLICATION_STATE_NORMAL)?;
-        memory.write_u32(data_slot_address(91), SCREEN_BASE.0)?;
+        memory.write_u32(data_slot_address(91), screen_base.0)?;
         memory.write_u32(data_slot_address(92), u32::from(screen_width))?;
         memory.write_u32(data_slot_address(93), u32::from(screen_height))?;
         memory.write_u32(data_slot_address(94), 16)?;
@@ -769,7 +788,7 @@ impl ExtRuntime {
                 .map_err(|_| Error::ArmFault("guest screen buffer size exceeds u32".into()))?,
         )?;
         memory.write_u32(screen_bitmap.checked_add(8)?, 0)?;
-        memory.write_u32(screen_bitmap.checked_add(12)?, SCREEN_BASE.0)?;
+        memory.write_u32(screen_bitmap.checked_add(12)?, screen_base.0)?;
         memory.write_u32(data_slot_address(106), 1)?;
         memory.write_u32(data_slot_address(107), 1)?;
         memory.write_u32(data_slot_address(108), HEAP_BASE.0)?;
@@ -802,7 +821,8 @@ impl ExtRuntime {
             next_module_generation: 1,
             active_helper: None,
             heap_len,
-            screen_buffer_len: screen_len,
+            screen_base,
+            screen_memory_len,
             guest_allocations: BTreeMap::new(),
             guest_allocation_owners: BTreeMap::new(),
             guest_allocation_views: BTreeMap::new(),
@@ -1370,7 +1390,7 @@ impl ExtRuntime {
             ))
         });
         let restore_screen = if let Some((menu_screen, previous_screen)) = screens {
-            (self.memory.read(SCREEN_BASE, menu_screen.len())? == menu_screen)
+            (self.memory.read(self.screen_base, menu_screen.len())? == menu_screen)
                 .then_some(previous_screen)
         } else {
             None
@@ -1379,7 +1399,7 @@ impl ExtRuntime {
             menu.modal_detached = menu.previous_screen.is_some();
         }
         if let Some(previous_screen) = restore_screen {
-            self.memory.write(SCREEN_BASE, &previous_screen)?;
+            self.memory.write(self.screen_base, &previous_screen)?;
             self.present_screen(services)?;
         }
         Ok(())
@@ -1930,13 +1950,13 @@ impl ExtRuntime {
         else {
             return Ok(());
         };
-        if output != SCREEN_BASE || output != screen {
+        if output != self.screen_base || output != screen {
             return Ok(());
         }
         let Some(output_len) = self.memory.read_u32(output_len_pointer).ok() else {
             return Ok(());
         };
-        let Ok(screen_len) = u32::try_from(self.screen_buffer_len) else {
+        let Ok(screen_memory_len) = u32::try_from(self.screen_memory_len) else {
             return Ok(());
         };
 
@@ -1957,17 +1977,18 @@ impl ExtRuntime {
         let Some(source_end) = source.0.checked_add(source_len) else {
             return Ok(());
         };
-        let Some(screen_end) = SCREEN_BASE.0.checked_add(screen_len) else {
+        let Some(screen_end) = self.screen_base.0.checked_add(screen_memory_len) else {
             return Ok(());
         };
-        if source.0 < screen_end && SCREEN_BASE.0 < source_end {
+        if source.0 < screen_end && self.screen_base.0 < source_end {
             return Ok(());
         }
         let Some(required_len) = self.memory.read_u32(trailer).ok() else {
             return Ok(());
         };
-        let capacity_is_unsafe = output_len > screen_len;
-        let missing_usable_capacity = output_len < required_len && required_len <= screen_len;
+        let capacity_is_unsafe = output_len > screen_memory_len;
+        let missing_usable_capacity =
+            output_len < required_len && required_len <= screen_memory_len;
         if !capacity_is_unsafe && !missing_usable_capacity {
             return Ok(());
         }
@@ -1978,10 +1999,11 @@ impl ExtRuntime {
         // identify a decompressor by its PC or compiled instruction sequence.
         if self
             .memory
-            .check_range(output, screen_len as usize, Permissions::READ_WRITE)
+            .check_range(output, screen_memory_len as usize, Permissions::READ_WRITE)
             .is_ok()
         {
-            self.memory.write_u32(output_len_pointer, screen_len)?;
+            self.memory
+                .write_u32(output_len_pointer, screen_memory_len)?;
         }
         Ok(())
     }

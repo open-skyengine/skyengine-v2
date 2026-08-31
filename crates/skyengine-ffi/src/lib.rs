@@ -11,13 +11,13 @@ use std::{
 };
 
 use skyengine_core::{
-    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioPlayer, DeviceDate, DisplayEvent, DnsMapping,
-    Framebuffer, PlatformDisplay, Result as CoreResult, Runtime, RuntimeConfig, RuntimeState,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioPlayer, DEFAULT_MEMORY_LIMIT, DeviceDate, DisplayEvent,
+    DnsMapping, Framebuffer, PlatformDisplay, Result as CoreResult, Runtime, RuntimeConfig,
+    RuntimeState,
 };
 
 const DEFAULT_WIDTH: u16 = 240;
 const DEFAULT_HEIGHT: u16 = 320;
-const DEFAULT_MEMORY_MB: i32 = 1;
 const WORKER_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SCREEN_DIMENSION: u16 = 4096;
 
@@ -42,7 +42,7 @@ impl Default for EngineConfig {
             initialized: false,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
-            memory_limit: DEFAULT_MEMORY_MB as u32 * 1024 * 1024,
+            memory_limit: DEFAULT_MEMORY_LIMIT,
             device_date: DeviceDate::host_now(),
             work_dir: PathBuf::from("."),
             sound_font_path: None,
