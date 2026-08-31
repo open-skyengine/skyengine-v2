@@ -17,7 +17,7 @@ use crate::{
     wap_proxy::{WAP_PROXY_ADDRESS, WapProxyService},
 };
 
-pub const DEFAULT_MEMORY_LIMIT: u32 = 1 * 1024 * 1024;
+pub const DEFAULT_MEMORY_LIMIT: u32 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeState {
