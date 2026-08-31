@@ -275,9 +275,9 @@ impl ExtRuntime {
                 }
             },
             38 => match cpu.register(0) {
-                // Requests an additional guest-memory arena. The requested byte
-                // count is carried in input_len even though input is null; the
-                // returned arena follows the normal mr_platEx output convention.
+                // Requests an additional guest-memory arena. Verified capacity
+                // probes carry a signed target-minus-current delta in input_len
+                // even though input is null; positive values remain byte counts.
                 1_014 if cpu.register(1) == 0 => {
                     self.allocate_platform_memory_extension(module, cpu)?
                 }

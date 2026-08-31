@@ -2628,6 +2628,181 @@ fn platform_memory_extension_returns_a_zeroed_guest_arena() {
 }
 
 #[test]
+fn platform_memory_extension_treats_nonpositive_probe_as_already_satisfied() {
+    for requested_len in [0, 0xfffe_d800] {
+        let mut runtime =
+            ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+        load_test_module(&mut runtime);
+        let output = runtime.allocate(4, 4).unwrap();
+        let output_len = runtime.allocate(4, 4).unwrap();
+        let stack = runtime.allocate(4, 4).unwrap();
+        runtime.memory.write_u32(output, 0xaaaa_aaaa).unwrap();
+        runtime.memory.write_u32(output_len, 0xbbbb_bbbb).unwrap();
+        runtime.memory.write_u32(stack, output_len.0).unwrap();
+        let cursor_before = runtime.platform_memory_cursor;
+
+        let mut cpu = ArmCpu::new();
+        cpu.set_register(0, 1_014);
+        cpu.set_register(2, requested_len);
+        cpu.set_register(3, output.0);
+        cpu.set_register(13, stack.0);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+
+        let arena = GuestAddr(runtime.memory.read_u32(output).unwrap());
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(arena, PLATFORM_MEMORY_BASE);
+        assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0);
+        assert_eq!(runtime.memory.read(arena, 1).unwrap(), [0]);
+
+        cpu.set_register(0, 1_015);
+        cpu.set_register(1, arena.0);
+        cpu.set_register(2, 4);
+        runtime
+            .dispatch(38, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0);
+        assert_eq!(runtime.platform_memory_cursor, cursor_before);
+        assert!(runtime.memory.read(arena, 1).is_err());
+    }
+}
+
+#[test]
+fn platform_memory_extension_rejects_oversized_positive_requests_without_mutating_state() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let output = runtime.allocate(4, 4).unwrap();
+    let output_len = runtime.allocate(4, 4).unwrap();
+    let stack = runtime.allocate(4, 4).unwrap();
+    runtime.memory.write_u32(output, 0xaaaa_aaaa).unwrap();
+    runtime.memory.write_u32(output_len, 0xbbbb_bbbb).unwrap();
+    runtime.memory.write_u32(stack, output_len.0).unwrap();
+    let cursor_before = runtime.platform_memory_cursor;
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 1_014);
+    cpu.set_register(2, MAX_PLATFORM_MEMORY_EXTENSION_LEN as u32 + 1);
+    cpu.set_register(3, output.0);
+    cpu.set_register(13, stack.0);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), u32::MAX);
+    assert_eq!(runtime.memory.read_u32(output).unwrap(), 0);
+    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0);
+    assert_eq!(runtime.platform_memory_cursor, cursor_before);
+    assert!(runtime.platform_memory_extensions.is_empty());
+}
+
+#[test]
+fn platform_memory_extension_rejects_an_exhausted_address_window() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let output = runtime.allocate(4, 4).unwrap();
+    let output_len = runtime.allocate(4, 4).unwrap();
+    let stack = runtime.allocate(4, 4).unwrap();
+    runtime.memory.write_u32(output, 0xaaaa_aaaa).unwrap();
+    runtime.memory.write_u32(output_len, 0xbbbb_bbbb).unwrap();
+    runtime.memory.write_u32(stack, output_len.0).unwrap();
+    runtime.platform_memory_cursor = DETACHED_GUEST_ALLOCATION_BASE.0 - 0x1000;
+    let cursor_before = runtime.platform_memory_cursor;
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 1_014);
+    cpu.set_register(2, 0x1001);
+    cpu.set_register(3, output.0);
+    cpu.set_register(13, stack.0);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    assert_eq!(cpu.register(0), u32::MAX);
+    assert_eq!(runtime.memory.read_u32(output).unwrap(), 0);
+    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0);
+    assert_eq!(runtime.platform_memory_cursor, cursor_before);
+    assert!(runtime.platform_memory_extensions.is_empty());
+    assert!(!runtime.memory.is_mapped(GuestAddr(cursor_before), 1));
+}
+
+#[test]
+fn platform_memory_extension_accepts_the_address_window_boundary() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let output = runtime.allocate(4, 4).unwrap();
+    let output_len = runtime.allocate(4, 4).unwrap();
+    let stack = runtime.allocate(4, 4).unwrap();
+    runtime.memory.write_u32(stack, output_len.0).unwrap();
+    runtime.platform_memory_cursor = DETACHED_GUEST_ALLOCATION_BASE.0 - 0x1000;
+    let cursor_before = runtime.platform_memory_cursor;
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 1_014);
+    cpu.set_register(2, 0x1000);
+    cpu.set_register(3, output.0);
+    cpu.set_register(13, stack.0);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+
+    let arena = GuestAddr(runtime.memory.read_u32(output).unwrap());
+    assert_eq!(cpu.register(0), 0);
+    assert_eq!(arena, GuestAddr(cursor_before));
+    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0x1000);
+    assert_eq!(
+        runtime.platform_memory_cursor,
+        DETACHED_GUEST_ALLOCATION_BASE.0
+    );
+    assert_eq!(runtime.memory.read(arena, 0x1000).unwrap(), vec![0; 0x1000]);
+
+    cpu.set_register(0, 1_015);
+    cpu.set_register(1, arena.0);
+    cpu.set_register(2, 4);
+    runtime
+        .dispatch(38, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(runtime.platform_memory_cursor, cursor_before);
+}
+
+#[test]
+fn platform_memory_extension_validates_outputs_before_mutating_state() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let output = runtime.allocate(4, 4).unwrap();
+    let output_len = runtime.allocate(4, 4).unwrap();
+    let stack = runtime.allocate(4, 4).unwrap();
+    runtime.memory.write_u32(output, 0xaaaa_aaaa).unwrap();
+    runtime.memory.write_u32(output_len, 0xbbbb_bbbb).unwrap();
+    runtime.memory.write_u32(stack, output_len.0).unwrap();
+    runtime
+        .memory
+        .remove_permissions(output_len, 4, Permissions::WRITE)
+        .unwrap();
+    let cursor_before = runtime.platform_memory_cursor;
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_register(0, 1_014);
+    cpu.set_register(2, 32);
+    cpu.set_register(3, output.0);
+    cpu.set_register(13, stack.0);
+    assert!(matches!(
+        runtime.dispatch(38, 0, &mut cpu, &mut StubServices),
+        Err(Error::ArmFault(_))
+    ));
+
+    assert_eq!(runtime.memory.read_u32(output).unwrap(), 0xaaaa_aaaa);
+    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0xbbbb_bbbb);
+    assert_eq!(runtime.platform_memory_cursor, cursor_before);
+    assert!(runtime.platform_memory_extensions.is_empty());
+    assert!(!runtime.memory.is_mapped(PLATFORM_MEMORY_BASE, 1));
+}
+
+#[test]
 fn module_cannot_register_another_modules_platform_arena_as_executable() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

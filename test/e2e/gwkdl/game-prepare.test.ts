@@ -35,15 +35,28 @@ describe("gwkdl 进入准备界面", () => {
     }
     // 是否检测内存？-> 是
     await engine.key('LEFT_SOFT', 1_000);
-    const boot = await engine.waitForScreen(
+    const firstBgm = await engine.waitForScreen(
       screen =>
         screen.pixel(150, 308).toString() === "0,0,0" &&
         screen.pixel(116, 84).toString() === "248,240,0",
-      { name: "bgm-select", timeoutMs: 30_000, intervalMs: 250 },
+      { name: "first-bgm-select", timeoutMs: 30_000, intervalMs: 250 },
     );
-    expect(boot.pixel(150, 308)).toEqual([0, 0, 0]);
+    expect(firstBgm.pixel(150, 308)).toEqual([0, 0, 0]);
     // rgb(248, 240, 0)
-    expect(boot.pixel(116, 84)).toEqual([248, 240, 0]);
+    expect(firstBgm.pixel(116, 84)).toEqual([248, 240, 0]);
+
+    // 内存检测结果会落盘；复用同一设备目录重新打开，必须跳过检测且不能崩溃。
+    expect(fs.statSync(ws.path('mythroad/cache/exdet.dat')).size).toBe(76);
+    await engine.close();
+    engine = undefined;
+    engine = await SkyEngineE2e.start("test/fixtures/gwkdl_v1003.mrp", { workDir: ws.dir });
+    const secondBgm = await engine.waitForScreen(
+      screen =>
+        screen.pixel(150, 308).toString() === "0,0,0" &&
+        screen.pixel(116, 84).toString() === "248,240,0",
+      { name: "second-bgm-select", timeoutMs: 30_000, intervalMs: 250 },
+    );
+    expect(secondBgm.diffPixelCount(firstBgm)).toBe(0);
 
     // 是否开启音乐？-> 否
     await engine.click(227, 301, 1_000);

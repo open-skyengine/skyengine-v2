@@ -94,6 +94,12 @@ native extension 固定内存窗口相互独立。
 
 基线 profile 只白名单以下已由本地 fixture 验证的 `mr_platEx` 子集：
 
+- `1014`/`1015` 在本地 `gwkdl` fixture 的已验证路径中构成配对的容量探测。
+  `1014` 的 input 为空，调用方把 `input_len` 作为有符号 32 位的
+  `target - current` 差值；非正值表示目标容量已经满足。该形态成功时 `output`
+  仍返回非空 token，guest 可见的 `output_len` 为 `0`；调用方不访问 token，随即
+  把它作为 4 字节输入交给 `1015` 释放。这只记录该 fixture 所需的兼容语义，不据此
+  推断其他 SDK 或其他 `mr_platEx` 命令对负长度的处理。
 - `1204` 接受单字节逻辑卷 `C`、`X`、`Y` 或 `Z`，并把这些应用逻辑卷解析到当前
   物理应用卷 `C:/mythroad/`；不支持的逻辑卷返回 `-1`。文件 API 中显式出现的
   `X:`、`Y:`、`Z:` 路径仍分别映射到工作区的 `disk/x`、`disk/y`、`disk/z`，不与

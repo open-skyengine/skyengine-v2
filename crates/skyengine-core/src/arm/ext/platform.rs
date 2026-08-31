@@ -412,12 +412,7 @@ impl ExtRuntime {
         module: usize,
         cpu: &mut ArmCpu,
     ) -> Result<()> {
-        let requested_len = cpu.register(2) as usize;
-        if requested_len == 0 {
-            return Err(Error::Abi(
-                "platform memory extension requested zero bytes".into(),
-            ));
-        }
+        let requested_len = cpu.register(2) as i32;
         let output = GuestAddr(cpu.register(3));
         if output.0 == 0 {
             return Err(Error::Abi(
@@ -430,6 +425,8 @@ impl ExtRuntime {
                 "platform memory extension has a null output-length pointer".into(),
             ));
         }
+        self.memory.check_range(output, 4, Permissions::WRITE)?;
+        self.memory.check_range(output_len, 4, Permissions::WRITE)?;
         let owner_generation = self
             .modules
             .get(module)
@@ -438,23 +435,38 @@ impl ExtRuntime {
                 Error::Abi(format!("platform allocation for missing module {module}"))
             })?;
 
+        // The verified memory probe passes `target - current` as input_len. A
+        // non-positive result means no extra capacity is needed, but its caller
+        // still requires a non-null handle that command 1015 can release.
+        let allocation_len = requested_len.max(1) as usize;
         let previous_cursor = self.platform_memory_cursor;
-        let arena_value = previous_cursor
-            .checked_add(0xfff)
-            .map(|value| value & !0xfff)
-            .ok_or_else(|| Error::ArmFault("platform memory alignment overflow".into()))?;
-        let requested_len_u32 = u32::try_from(requested_len).map_err(|_| {
-            Error::ArmFault(format!(
-                "platform memory request {requested_len} does not fit u32"
-            ))
-        })?;
-        let arena_end = arena_value
-            .checked_add(requested_len_u32)
-            .ok_or_else(|| Error::ArmFault("platform memory request overflow".into()))?;
+        if !(PLATFORM_MEMORY_BASE.0..=DETACHED_GUEST_ALLOCATION_BASE.0).contains(&previous_cursor) {
+            return Err(Error::ArmFault(format!(
+                "platform memory cursor {previous_cursor:#010x} is outside its allocation window"
+            )));
+        }
+
+        self.memory.write_u32(output, 0)?;
+        self.memory.write_u32(output_len, 0)?;
+        if allocation_len > MAX_PLATFORM_MEMORY_EXTENSION_LEN {
+            cpu.set_register(0, u32::MAX);
+            return Ok(());
+        }
+
+        let arena_value = (u64::from(previous_cursor) + 0xfff) & !0xfff;
+        let arena_end = arena_value + allocation_len as u64;
+        if arena_end > u64::from(DETACHED_GUEST_ALLOCATION_BASE.0) {
+            cpu.set_register(0, u32::MAX);
+            return Ok(());
+        }
+        let arena_value = u32::try_from(arena_value)
+            .expect("platform memory allocation window fits in a guest address");
+        let arena_end = u32::try_from(arena_end)
+            .expect("platform memory allocation window fits in a guest address");
         let arena = GuestAddr(arena_value);
         self.memory.map(
             arena,
-            requested_len,
+            allocation_len,
             Permissions::READ_WRITE,
             "platform memory extension",
         )?;
@@ -462,13 +474,14 @@ impl ExtRuntime {
         self.platform_memory_extensions.insert(
             arena.0,
             PlatformMemoryExtension {
-                len: requested_len,
+                len: allocation_len,
                 previous_cursor,
                 owner_generation,
             },
         );
         self.memory.write_u32(output, arena.0)?;
-        self.memory.write_u32(output_len, cpu.register(2))?;
+        self.memory
+            .write_u32(output_len, requested_len.max(0) as u32)?;
         cpu.set_register(0, 0);
         Ok(())
     }

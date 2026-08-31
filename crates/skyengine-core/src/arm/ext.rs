@@ -81,6 +81,7 @@ const DEFAULT_HEAP_LEN: usize = 4 * 1024 * 1024;
 const STACK_BASE: GuestAddr = GuestAddr(0x3000_0000);
 const STACK_LEN: usize = 256 * 1024;
 const PLATFORM_MEMORY_BASE: GuestAddr = GuestAddr(0x4000_0000);
+const MAX_PLATFORM_MEMORY_EXTENSION_LEN: usize = 16 * 1024 * 1024;
 const DETACHED_GUEST_ALLOCATION_BASE: GuestAddr = GuestAddr(0x5000_0000);
 const LEGACY_KEYPAD_REGISTERS: GuestAddr = GuestAddr(0x8011_0000);
 const LEGACY_KEYPAD_REGISTERS_LEN: usize = 16;
