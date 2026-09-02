@@ -73,6 +73,12 @@ jobs:
       - name: Check TypeScript
         run: pnpm exec tsc --noEmit
 
+      - name: Run E2E tests
+        env:
+          SDL_AUDIODRIVER: dummy
+          SDL_VIDEODRIVER: dummy
+        run: pnpm test:e2e
+
   build:
     name: Build ${{ matrix.platform }}
     needs: checks
