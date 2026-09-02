@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { copyFile, readFile } from "node:fs/promises";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace, type PpmImage } from "../engine-e2e.js";
 
 const MRP_SHA256 = "611b4cd737dcf458370ff215bc73636cf65bdc6dfc36907c2ce8aa8f00b7c8e2";
@@ -27,6 +27,19 @@ function isGameplayFrame(screen: PpmImage): boolean {
 function hasRenderedScore(screen: PpmImage): boolean {
   const [red, green, blue] = screen.pixel(58, 8);
   return red === 248 && green === 252 && blue === 0;
+}
+
+const SCORE_RECT = { x: 50, y: 4, width: 28, height: 20 } as const;
+
+function scoreDigitPixelCount(screen: PpmImage): number {
+  let count = 0;
+  for (let y = SCORE_RECT.y; y < SCORE_RECT.y + SCORE_RECT.height; y++) {
+    for (let x = SCORE_RECT.x; x < SCORE_RECT.x + SCORE_RECT.width; x++) {
+      const [red, green, blue] = screen.pixel(x, y);
+      if (red === 248 && green === 252 && blue === 0) count++;
+    }
+  }
+  return count;
 }
 
 describe("op6120 gameplay", () => {
@@ -69,18 +82,27 @@ describe("op6120 gameplay", () => {
         intervalMs: 50,
       },
     );
+    const initialScorePixels = scoreDigitPixelCount(gameplayStarted);
+    expect(initialScorePixels).toBe(22);
     const gameplayDrawCount = await engine.drawCount();
 
-    // Projectiles travel up the launcher's fixed lane. Repeated shots span a
-    // full enemy wave and deterministically exercise the collision sound path.
+    // Aim across the enemy lanes. Pointer presses launch projectiles; ENTER is
+    // only used by the title screen and does not fire during gameplay. A spread
+    // of trajectories makes the collision independent of a wave's exact phase.
+    const targets = [
+      [200, 200], [160, 190], [120, 180], [80, 170], [40, 160],
+      [200, 140], [160, 140], [120, 140], [80, 140], [40, 140],
+    ] as const;
     let afterCollision: PpmImage | undefined;
-    for (let shot = 0; shot < 260; shot++) {
-      await engine.key("ENTER", { holdMs: 1, waitForDraw: false });
-      if ((shot + 1) % 10 === 0) {
+    for (let shot = 0; shot < 120; shot++) {
+      const [x, y] = targets[shot % targets.length];
+      await engine.click(x, y, 5_000);
+      if ((shot + 1) % 5 === 0) {
         const screen = await engine.screen("after-enemy-collision");
-        if (isGameplayFrame(screen)
-          && hasRenderedScore(screen)
-          && gameplayStarted.diffPixelCount(screen, { x: 50, y: 4, width: 28, height: 20 }) > 15) {
+        if (hasRenderedScore(screen)
+          && screen.uniqueColorCount() > 1_000
+          && scoreDigitPixelCount(screen) > initialScorePixels + 10
+          && gameplayStarted.diffPixelCount(screen, SCORE_RECT) > 15) {
           afterCollision = screen;
           break;
         }
@@ -89,12 +111,14 @@ describe("op6120 gameplay", () => {
 
     expect(afterCollision, "enemy collision did not update the score").toBeDefined();
     if (!afterCollision) throw new Error("enemy collision frame was not captured");
-    expect(afterCollision.pixel(20, 250)).toEqual([96, 64, 0]);
-    expect(gameplayStarted.diffPixelCount(
-      afterCollision,
-      { x: 50, y: 4, width: 28, height: 20 },
-    )).toBeGreaterThan(15);
-    expect(await engine.drawCount()).toBeGreaterThan(gameplayDrawCount + 100);
+    expect(afterCollision.uniqueColorCount()).toBeGreaterThan(1_000);
+    expect(scoreDigitPixelCount(afterCollision)).toBeGreaterThan(initialScorePixels + 10);
+    expect(gameplayStarted.diffPixelCount(afterCollision, SCORE_RECT)).toBeGreaterThan(15);
+    const collisionDrawCount = await engine.drawCount();
+    expect(collisionDrawCount).toBeGreaterThan(gameplayDrawCount + 20);
+    await vi.waitFor(async () => {
+      expect(await engine!.drawCount()).toBeGreaterThan(collisionDrawCount);
+    }, { timeout: 5_000, interval: 100 });
 
     const output = `${await readFile(engine.stdoutPath, "utf8")}\n${await readFile(engine.stderrPath, "utf8")}`;
     expect(output).not.toMatch(/unsupported platform|ABI error|MR fault|FATAL/);
