@@ -1533,11 +1533,31 @@ impl ExtRuntime {
             }
             merged.push(block);
         }
-        let free_left = heap
-            .free_left
-            .checked_sub(recovered_len)
-            .and_then(|free_left| free_left.checked_add(block_len - already_free))
-            .ok_or_else(|| Error::Abi("guest free-byte count overflow".into()))?;
+        let released_len = block_len
+            .checked_sub(already_free)
+            .ok_or_else(|| Error::Abi("released guest free-byte count underflow".into()))?;
+        let counter_before_release =
+            heap.free_left.checked_sub(recovered_len).ok_or_else(|| {
+                Error::Abi("guest free-byte count underflow while returning range".into())
+            })?;
+        let free_left = match counter_before_release.checked_add(released_len) {
+            Some(free_left) => free_left,
+            None => {
+                let wrapped_free_left = counter_before_release.wrapping_add(released_len);
+                let merged_free_len = merged.iter().try_fold(0_u32, |total, block| {
+                    total
+                        .checked_add(block.len)
+                        .ok_or_else(|| Error::Abi("merged guest free-byte count overflow".into()))
+                })?;
+                // Some legacy allocators subtract a platform allocation twice while
+                // staging it in a private arena. Accept the unsigned underflow only
+                // when the free-list proves both the staged and released totals.
+                if wrapped_free_left.checked_add(released_len) != Some(merged_free_len) {
+                    return Err(Error::Abi("guest free-byte count overflow".into()));
+                }
+                merged_free_len
+            }
+        };
         self.revoke_executable_ranges_in(ExecutableRange {
             base: address,
             len: block_len as usize,

@@ -886,6 +886,83 @@ fn guest_allocator_preserves_an_untracked_doubled_free_counter() {
 }
 
 #[test]
+fn freeing_a_guest_allocation_recovers_a_wrapped_double_decrement_counter() {
+    let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", 0x10_0000).unwrap();
+    load_test_module(&mut runtime);
+    let prefix_request_len = 0x9cfc0;
+    let request_len = 0x36966;
+    let block_len = heap::aligned_heap_len(request_len).unwrap();
+    let _prefix = runtime
+        .allocate_guest_block(prefix_request_len)
+        .unwrap()
+        .unwrap();
+    let allocation = runtime
+        .allocate_guest_block_for_module(request_len, 0)
+        .unwrap()
+        .unwrap();
+    let heap = runtime.guest_heap_state().unwrap();
+    let allocation_offset = allocation.0 - heap.base;
+    let tail_len = heap.span - allocation_offset - block_len;
+    assert_eq!(heap.free_left, tail_len);
+
+    runtime
+        .memory
+        .write_u32(data_slot_address(111), tail_len.wrapping_sub(block_len))
+        .unwrap();
+
+    runtime
+        .free_guest_block_for_module(allocation, request_len, 0)
+        .unwrap();
+
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(
+        blocks,
+        [FreeBlock {
+            offset: allocation_offset,
+            len: heap.span - allocation_offset,
+        }]
+    );
+    assert_eq!(terminator, heap.span);
+    assert_eq!(recovered_len, 0);
+    assert_eq!(heap.free_left, heap.span - allocation_offset);
+    assert!(!runtime.guest_allocations.contains_key(&allocation.0));
+}
+
+#[test]
+fn freeing_a_guest_allocation_rejects_an_unrelated_wrapped_counter() {
+    let mut runtime = ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", 0x10_0000).unwrap();
+    load_test_module(&mut runtime);
+    let prefix_request_len = 0x9cfc0;
+    let request_len = 0x36966;
+    let block_len = heap::aligned_heap_len(request_len).unwrap();
+    let _prefix = runtime
+        .allocate_guest_block(prefix_request_len)
+        .unwrap()
+        .unwrap();
+    let allocation = runtime
+        .allocate_guest_block_for_module(request_len, 0)
+        .unwrap()
+        .unwrap();
+    let heap = runtime.guest_heap_state().unwrap();
+    let allocation_offset = allocation.0 - heap.base;
+    let tail_len = heap.span - allocation_offset - block_len;
+    runtime
+        .memory
+        .write_u32(
+            data_slot_address(111),
+            tail_len.wrapping_sub(block_len).wrapping_add(8),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        runtime.free_guest_block_for_module(allocation, request_len, 0),
+        Err(Error::Abi(message)) if message == "guest free-byte count overflow"
+    ));
+    assert!(runtime.guest_allocations.contains_key(&allocation.0));
+}
+
+#[test]
 fn guest_allocator_recovers_the_tail_after_a_legacy_payload_is_zeroed() {
     assert_guest_allocator_recovers_tail_after_legacy_payload_withdrawal([0; 8]);
 }
