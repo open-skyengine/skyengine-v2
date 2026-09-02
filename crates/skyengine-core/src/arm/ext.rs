@@ -2298,6 +2298,22 @@ fn write_platform_string(memory: &mut GuestMemory, address: GuestAddr, value: &[
     memory.write_u8(address.checked_add(value.len() as u32)?, 0)
 }
 
+fn native_file_open_result(name: &[u8], result: i32) -> u32 {
+    if result >= 0 {
+        return result as u32;
+    }
+    // Package probes compare MR_FAILED; native stdio wrappers compare NULL.
+    let file_name = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or_default();
+    if file_name.len() >= 4 && file_name[file_name.len() - 4..].eq_ignore_ascii_case(b".mrp") {
+        u32::MAX
+    } else {
+        0
+    }
+}
+
 fn is_function_slot(slot: u32) -> bool {
     matches!(
         slot,

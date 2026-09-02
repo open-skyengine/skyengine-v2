@@ -544,9 +544,7 @@ impl ExtRuntime {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
                 let mode = cpu.register(1);
                 let result = services.open_file(&name, mode)?;
-                // Native EXT stdio wrappers use a null handle for fopen failure,
-                // while the shared host service uses a negative result.
-                cpu.set_register(0, if result < 0 { 0 } else { result as u32 });
+                cpu.set_register(0, native_file_open_result(&name, result));
             }
             41 => {
                 cpu.set_register(0, services.close_file(cpu.register(0) as i32)? as u32);
