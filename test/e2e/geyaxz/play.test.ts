@@ -92,8 +92,8 @@ describe("geyaxz", () => {
       await engine.delay(500)
       await engine.key('LEFT_SOFT', 1_000)
       await engine.delay(500)
-      // 前置两次 ENTER 已消耗两步；精确提交剩余 98 步，再等待零步数结算。
-      for (let i=0; i<98; i++) {
+      // 前置两次 ENTER 已消耗两步；再提交 98 步归零，第 99 次触发失败结算。
+      for (let i=0; i<99; i++) {
         await engine.key('ENTER', { holdMs: 80, waitForDraw: false })
       }
       await vi.waitFor(async () => {

@@ -118,6 +118,8 @@ describe("geyaxz", () => {
       // 开始完成第一关
       await engine.click(15, 74, 1_000)
       await engine.delay(500)
+      await engine.click(15, 74, 1_000)
+      await engine.delay(500)
       await engine.click(41, 74, 1_000)
       await engine.delay(500)
       await engine.click(75, 74, 1_000)
