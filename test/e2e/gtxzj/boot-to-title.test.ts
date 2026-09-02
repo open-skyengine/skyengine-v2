@@ -19,6 +19,8 @@ describe("gtxzj 启动", () => {
     ws = await SkyEngineWorkspace.create();
     engine = await SkyEngineE2e.start("test/fixtures/gtxzj.mrp", {
       workDir: ws.dir,
+      // 游戏会在设备年份晚于 2012 时于首帧前退出；固定日期以验证完整交互流程。
+      deviceDate: "2012-06-20",
     });
 
     await engine.delay(4_000);
