@@ -33,9 +33,11 @@ describe("gzwdzjs 游戏", () => {
     {
       // 是否开启音乐？-> 否
       await engine.key('RIGHT_SOFT', 1_000);
-      await engine.delay(3_000);
       // 进入主菜单
-      const screen = await engine.screen("menu");
+      const screen = await engine.waitForPixel(169, 117, [232, 176, 152], {
+        name: "menu",
+        timeoutMs: 30_000,
+      });
       // rgb(232, 176, 152)
       expect(screen.pixel(169, 117)).toEqual([232, 176, 152]);
       // rgb(152, 228, 0)

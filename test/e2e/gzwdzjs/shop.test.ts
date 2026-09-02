@@ -49,7 +49,10 @@ describe("gzwdzjs 商城", () => {
 
     await engine.delay(5_000);
     await engine.key("RIGHT_SOFT", 1_000);
-    await engine.delay(3_000);
+    await engine.waitForPixel(169, 117, [232, 176, 152], {
+      name: "shop-main-menu-initial",
+      timeoutMs: 30_000,
+    });
 
     for (let i = 0; i < 3; i++) {
       await engine.key("ENTER", 1_000);
