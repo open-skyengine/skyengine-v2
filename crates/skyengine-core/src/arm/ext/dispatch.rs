@@ -321,10 +321,10 @@ impl ExtRuntime {
                         "unsupported platform JPEG handle command {command} called by module {module}"
                     )));
                 }
-                // Paired platform-state notification; callers ignore the result
-                // and continue their normal guest control flow.
-                1_223 if cpu.register(1) == 0 && cpu.register(2) == 0 && cpu.register(3) == 0 => {
-                    cpu.set_register(0, u32::MAX)
+                // Optional platform-state query. Both the parameterless probe and
+                // the normal output/output-length form use the unavailable result.
+                1_223 if cpu.register(1) == 0 && cpu.register(2) == 0 => {
+                    self.return_unavailable_platform_extension(cpu)?
                 }
                 // Optional parameterless vendor notification. The baseline has no
                 // corresponding provider and reports the standard unavailable value.

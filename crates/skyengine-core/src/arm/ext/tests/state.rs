@@ -1251,14 +1251,18 @@ fn unavailable_platform_extension_clears_its_output_fields() {
     assert_eq!(runtime.memory.read_u32(output).unwrap(), 0);
     assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0);
 
+    runtime.memory.write_u32(output, 0xaaaa_aaaa).unwrap();
+    runtime.memory.write_u32(output_len, 0xbbbb_bbbb).unwrap();
     cpu.set_register(0, 1_223);
     cpu.set_register(1, 0);
     cpu.set_register(2, 0);
-    cpu.set_register(3, 0);
+    cpu.set_register(3, output.0);
     runtime
         .dispatch(38, 0, &mut cpu, &mut StubServices)
         .unwrap();
     assert_eq!(cpu.register(0) as i32, -1);
+    assert_eq!(runtime.memory.read_u32(output).unwrap(), 0);
+    assert_eq!(runtime.memory.read_u32(output_len).unwrap(), 0);
 
     cpu.set_register(0, 2_011);
     cpu.set_register(1, 0);
@@ -2591,6 +2595,24 @@ fn compact_ram_package_writes_into_a_legacy_prefix_length_wrapper() {
     let name = runtime.allocate(4, 1).unwrap();
     runtime.memory.write(name, b"abc\0").unwrap();
     let output_len = runtime.allocate(4, 4).unwrap();
+    let heap = runtime.guest_heap_state().unwrap();
+    let (mut blocks, terminator, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(recovered_len, 0);
+    blocks.insert(
+        0,
+        FreeBlock {
+            offset: prepared.0 - heap.base,
+            len: expected.len() as u32,
+        },
+    );
+    runtime
+        .write_free_blocks(
+            heap,
+            &blocks,
+            terminator,
+            heap.free_left + expected.len() as u32,
+        )
+        .unwrap();
     let mut cpu = ArmCpu::new();
 
     cpu.set_register(0, name.0);
@@ -2607,6 +2629,14 @@ fn compact_ram_package_writes_into_a_legacy_prefix_length_wrapper() {
     assert_eq!(
         runtime.memory.read(prepared, expected.len()).unwrap(),
         expected
+    );
+    let heap = runtime.guest_heap_state().unwrap();
+    let (blocks, _, recovered_len) = runtime.read_free_blocks(heap).unwrap();
+    assert_eq!(recovered_len, 0);
+    assert!(
+        blocks
+            .iter()
+            .all(|block| block.offset != prepared.0 - heap.base)
     );
     assert!(runtime.guest_allocations.contains_key(&backing.0));
     assert!(!runtime.guest_allocation_views.contains_key(&prepared.0));

@@ -656,12 +656,13 @@ impl ExtRuntime {
             .map(|module| module.generation)
             .ok_or_else(|| Error::Abi(format!("compact RAM output for missing module {module}")))?;
 
-        if self
-            .legacy_wrapper_backing(address, block_len, owner_generation)?
-            .is_some()
-        {
+        if let Some(backing) = self.legacy_wrapper_backing(address, block_len, owner_generation)? {
             // The wrapper frees its original backing address, so do not replace
-            // its allocation tracking with an interior payload view.
+            // its allocation tracking with an interior payload view. It may have
+            // staged backing+4 in the shared free-list so mr_readFile can fill it;
+            // withdraw those payload bytes before they become a compact image.
+            let payload_len = self.memory.read_u32(backing)?;
+            self.reserve_guest_heap_range(address, payload_len)?;
             return Ok(());
         }
 

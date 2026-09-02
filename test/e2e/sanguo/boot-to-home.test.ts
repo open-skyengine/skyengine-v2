@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
 
@@ -58,5 +59,8 @@ describe("sanguo 启动", () => {
     // 服务器停运后这是该画面唯一有效的交互。
     await engine.key("ENTER", 8_000);
     expect(await engine.waitForExit(8_000)).toBe(true);
+    await engine.stop();
+    const stderr = await readFile(engine.stderrPath, "utf8");
+    expect(stderr).not.toMatch(/ARM fault|ABI error|MR fault|instruction budget|panicked at/i);
   }, 240_000);
 });
