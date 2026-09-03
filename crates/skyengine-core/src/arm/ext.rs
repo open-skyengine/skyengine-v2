@@ -2302,11 +2302,15 @@ fn native_file_open_result(name: &[u8], result: i32) -> u32 {
     if result >= 0 {
         return result as u32;
     }
-    // Package probes compare MR_FAILED; native stdio wrappers compare NULL.
     let file_name = name
         .rsplit(|byte| matches!(byte, b'/' | b'\\'))
         .next()
         .unwrap_or_default();
+    // The shared advertising bootstrap treats a null package handle as its
+    // signal to start simpleDownload. Other package loaders compare MR_FAILED.
+    if file_name.eq_ignore_ascii_case(b"advbar.mrp") {
+        return 0;
+    }
     if file_name.len() >= 4 && file_name[file_name.len() - 4..].eq_ignore_ascii_case(b".mrp") {
         u32::MAX
     } else {

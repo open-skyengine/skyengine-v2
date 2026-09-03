@@ -1,6 +1,50 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
+import { SkyEngineE2e, SkyEngineWorkspace, type PpmImage } from "../engine-e2e.js";
 import fs from "fs";
+
+const ADVBAR_APP_ID = 490244;
+const ADVBAR_RECT = { x: 0, y: 0, width: 240, height: 40 };
+
+function pixelEquals(
+  image: PpmImage,
+  x: number,
+  y: number,
+  expected: readonly [number, number, number],
+): boolean {
+  const actual = image.pixel(x, y);
+  return actual[0] === expected[0] && actual[1] === expected[1] && actual[2] === expected[2];
+}
+
+function countMatchingPixels(
+  image: PpmImage,
+  rect: { x: number; y: number; width: number; height: number },
+  predicate: (red: number, green: number, blue: number) => boolean,
+): number {
+  let count = 0;
+  for (let y = rect.y; y < rect.y + rect.height; y++) {
+    for (let x = rect.x; x < rect.x + rect.width; x++) {
+      if (predicate(...image.pixel(x, y))) count += 1;
+    }
+  }
+  return count;
+}
+
+function isMenuWithAdvbar(image: PpmImage): boolean {
+  const redBannerPixels = countMatchingPixels(
+    image,
+    ADVBAR_RECT,
+    (red, green, blue) => red >= 160 && green <= 48 && blue <= 56,
+  );
+  const portraitPixels = countMatchingPixels(
+    image,
+    ADVBAR_RECT,
+    (red, green, blue) => red >= 160 && green >= 72 && green <= 184 && blue >= 48 && blue <= 160,
+  );
+  return redBannerPixels > 3_000
+    && portraitPixels > 1_000
+    && image.uniqueColorCount() > 250
+    && pixelEquals(image, 98, 264, [0, 252, 0]);
+}
 
 function countColor(
   image: Awaited<ReturnType<SkyEngineE2e["screen"]>>,
@@ -27,14 +71,14 @@ describe("optwar 进入主菜单", () => {
     ws = undefined;
   });
 
-  it("advbar", async () => {
+  it("自动下载 advbar 并显示顶部广告条", async () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
-    // advbar 自身拥有更新逻辑；主应用不会在插件完全缺失时引导下载。
-    fs.cpSync('test/fixtures/plugins/advbar.mrp', ws.path('mythroad/plugins/advbar.mrp'));
+    const pluginPath = ws.path('mythroad/plugins/advbar.mrp');
+    fs.rmSync(pluginPath, { force: true });
     engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", { workDir: ws.dir });
 
-    await engine.delay(10000);
+    await engine.delay(2_000);
     const boot = await engine.screen("bgm-select");
     expect(boot.pixel(150, 308)).toEqual([0, 0, 0]);
     // rgb(248, 0, 0)
@@ -42,13 +86,16 @@ describe("optwar 进入主菜单", () => {
 
     // 是否开启音乐？-> 否
     await engine.click(227, 301, 1_000);
-    await engine.delay(1_000);
 
-    // 进入主菜单
-    const wake = await engine.screen("menu");
-    // rgb(128, 48, 40)
-    expect(wake.pixel(110, 27)).toEqual([128, 48, 40]);
-    expect(wake.pixel(120, 20)).toEqual([176, 120, 120]);
+    // 进入主菜单后，等待游戏下载广告插件并把广告层合成到顶部 40 像素区域。
+    const wake = await engine.waitForScreen(
+      screen => fs.existsSync(pluginPath) && isMenuWithAdvbar(screen),
+      { name: "menu-with-downloaded-advbar", timeoutMs: 30_000, intervalMs: 250 },
+    );
+    const plugin = fs.readFileSync(pluginPath);
+    expect(plugin.subarray(0, 4).toString("ascii")).toBe("MRPG");
+    expect(plugin.readUInt32LE(0x44)).toBe(ADVBAR_APP_ID);
+    expect(isMenuWithAdvbar(wake)).toBe(true);
     // rgb(24, 24, 24)
     expect(wake.pixel(83, 267)).toEqual([24, 24, 24]);
     // rgb(0, 252, 0)
