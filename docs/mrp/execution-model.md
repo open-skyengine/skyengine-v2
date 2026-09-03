@@ -161,8 +161,9 @@ timer。一次正常分发可能连续提交不同周期，因此宿主不能根
 校验 parameter、extChunk、映像地址和长度的双向回指，再在受所有权和总预算约束的 RW 区
 内解析 timer node 引用。node 还必须属于同一 module generation 和 dynamic image，且 handler
 确实可执行。suspend depth 从 `0` 进入非零时保存仍存活的重复 timer；最终回到 `0` 时重新
-验证 node 的 RW 可达性及 handler/data/repeat/tail 身份，只恢复错误变化的 period，保留 guest
-重新计算的当前 deadline 和链表状态。
+验证 node 的 RW 可达性及 handler/data/repeat 身份，只恢复错误变化的 period，保留 guest
+重新计算的当前 deadline 和 tail 链表状态。tail 在前台 timer 退链期间允许临时变化，不能用作
+timer 身份字段。
 
 这一兼容路径解析的是有边界、有所有权关系的运行时 ABI 数据，不搜索或反汇编 EXT 的指令
 字节。任何地址、回指、magic、映射、身份或预算检查失败时都放弃修复；私有 extChunk 与 timer

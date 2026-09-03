@@ -780,6 +780,13 @@ fn modal_return_restores_only_the_repeating_timer_period() {
         .unwrap();
     runtime
         .memory
+        .write_u32(
+            node.checked_add(COMPACT_TIMER_TAIL_OFFSET).unwrap(),
+            second_node.0,
+        )
+        .unwrap();
+    runtime
+        .memory
         .write_u32(ext_chunk.checked_add(0x34).unwrap(), 0)
         .unwrap();
     runtime.finish_modal_timer_observations(leaving).unwrap();
@@ -808,6 +815,13 @@ fn modal_return_restores_only_the_repeating_timer_period() {
             .read_u32(node.checked_add(8).unwrap())
             .unwrap(),
         10
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_TAIL_OFFSET).unwrap())
+            .unwrap(),
+        second_node.0
     );
     assert!(runtime.modal_repeating_timers.is_empty());
     assert_eq!(

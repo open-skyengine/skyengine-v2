@@ -63,6 +63,7 @@ const COMPACT_TIMER_PERIOD_OFFSET: u32 = 0x04;
 const COMPACT_TIMER_HANDLER_OFFSET: u32 = 0x0c;
 const COMPACT_TIMER_DATA_OFFSET: u32 = 0x10;
 const COMPACT_TIMER_REPEAT_OFFSET: u32 = 0x14;
+#[cfg(test)]
 const COMPACT_TIMER_TAIL_OFFSET: u32 = 0x18;
 const COMPACT_TIMER_NODE_LEN: usize = 0x1c;
 const MAX_COMPACT_TIMER_POINTER_SCAN_LEN: usize = 1024 * 1024;
@@ -346,7 +347,6 @@ struct RepeatingTimerSnapshot {
     handler: u32,
     data: u32,
     repeat: u32,
-    tail: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1382,12 +1382,13 @@ impl ExtRuntime {
                 continue;
             };
             // Guest timers have no exposed allocation generation. Treat the
-            // immutable callback record plus module/image ownership as identity;
+            // stable callback record plus module/image ownership as identity;
             // any observable reuse makes this compatibility repair fail closed.
+            // `tail` is scheduler linkage, so it can legitimately differ while
+            // the foreground timer is being removed and is never restored here.
             if current.handler != saved.handler
                 || current.data != saved.data
                 || current.repeat != saved.repeat
-                || current.tail != saved.tail
             {
                 continue;
             }
@@ -1503,10 +1504,6 @@ impl ExtRuntime {
             repeat: self
                 .memory
                 .read_u32(node.checked_add(COMPACT_TIMER_REPEAT_OFFSET).ok()?)
-                .ok()?,
-            tail: self
-                .memory
-                .read_u32(node.checked_add(COMPACT_TIMER_TAIL_OFFSET).ok()?)
                 .ok()?,
         };
         if timer.repeat == 0
