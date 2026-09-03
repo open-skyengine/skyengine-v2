@@ -5,6 +5,885 @@ use flate2::{Compression, write::GzEncoder};
 use super::*;
 
 #[test]
+fn discovers_repeating_timers_from_registered_runtime_data() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let owner_generation = runtime.modules[0].generation;
+    let parameter = runtime
+        .allocate_guest_block_for_module(MODULE_PARAMETER_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let ext_chunk = runtime
+        .allocate_guest_block_for_module(EXT_CHUNK_TIMER_STATE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let static_base = runtime
+        .allocate_guest_block_for_module(0x40, 0)
+        .unwrap()
+        .unwrap();
+    let timer_reference = static_base.checked_add(0x2c).unwrap();
+    let node = runtime
+        .allocate_guest_block_for_module(COMPACT_TIMER_NODE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let image_address = runtime
+        .allocate_guest_block_for_module(64, 0)
+        .unwrap()
+        .unwrap();
+    for (address, len) in [
+        (parameter, MODULE_PARAMETER_LEN),
+        (ext_chunk, EXT_CHUNK_TIMER_STATE_LEN),
+        (static_base, 0x40),
+        (node, COMPACT_TIMER_NODE_LEN),
+        (image_address, 64),
+    ] {
+        runtime.memory.write(address, &vec![0; len]).unwrap();
+    }
+    runtime.memory.write_u32(static_base, 0xe12f_ff1e).unwrap();
+    runtime
+        .memory
+        .add_permissions(static_base, 4, Permissions::EXECUTE)
+        .unwrap();
+    runtime.memory.write_u32(parameter, static_base.0).unwrap();
+    runtime
+        .memory
+        .write_u32(
+            parameter
+                .checked_add(MODULE_PARAMETER_RW_LEN_OFFSET)
+                .unwrap(),
+            0x40,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            parameter
+                .checked_add(MODULE_PARAMETER_EXT_CHUNK_OFFSET)
+                .unwrap(),
+            ext_chunk.0,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk, EXT_CHUNK_MAGIC)
+        .unwrap();
+    for (offset, value) in [
+        (
+            EXT_CHUNK_ENTRY_OFFSET,
+            image_address
+                .checked_add(DYNAMIC_IMAGE_ENTRY_OFFSET)
+                .unwrap()
+                .0,
+        ),
+        (EXT_CHUNK_IMAGE_ADDRESS_OFFSET, image_address.0),
+        (EXT_CHUNK_IMAGE_LEN_OFFSET, 64),
+        (EXT_CHUNK_PARAMETER_OFFSET, parameter.0),
+        (EXT_CHUNK_PARAMETER_LEN_OFFSET, MODULE_PARAMETER_LEN as u32),
+    ] {
+        runtime
+            .memory
+            .write_u32(ext_chunk.checked_add(offset).unwrap(), value)
+            .unwrap();
+    }
+    runtime
+        .memory
+        .write_u32(
+            ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+    runtime.memory.write_u32(timer_reference, node.0).unwrap();
+    runtime
+        .memory
+        .write_u32(timer_reference.checked_add(4).unwrap(), node.0)
+        .unwrap();
+    runtime.memory.write_u32(node, COMPACT_TIMER_MAGIC).unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 100)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            node.checked_add(COMPACT_TIMER_HANDLER_OFFSET).unwrap(),
+            static_base.0,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_REPEAT_OFFSET).unwrap(), 1)
+        .unwrap();
+
+    runtime.memory.write_u32(parameter, 0).unwrap();
+    runtime
+        .memory
+        .write_u32(
+            parameter
+                .checked_add(MODULE_PARAMETER_RW_LEN_OFFSET)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+    let mut image = vec![0xa5; 64];
+    image[DYNAMIC_IMAGE_PARAMETER_OFFSET..DYNAMIC_IMAGE_PARAMETER_OFFSET + 4]
+        .copy_from_slice(&parameter.0.to_le_bytes());
+    assert_eq!(
+        runtime.registered_dynamic_image_parameter(
+            &image,
+            image_address,
+            image.len() as u32,
+            owner_generation,
+        ),
+        Some(parameter)
+    );
+    runtime
+        .memory
+        .write_u32(
+            ext_chunk.checked_add(EXT_CHUNK_IMAGE_LEN_OFFSET).unwrap(),
+            63,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.registered_dynamic_image_parameter(
+            &image,
+            image_address,
+            image.len() as u32,
+            owner_generation,
+        ),
+        None
+    );
+    runtime
+        .memory
+        .write_u32(
+            ext_chunk.checked_add(EXT_CHUNK_IMAGE_LEN_OFFSET).unwrap(),
+            64,
+        )
+        .unwrap();
+    runtime.memory.write_u32(parameter, static_base.0).unwrap();
+    runtime
+        .memory
+        .write_u32(
+            parameter
+                .checked_add(MODULE_PARAMETER_RW_LEN_OFFSET)
+                .unwrap(),
+            0x40,
+        )
+        .unwrap();
+    runtime.modules[0]
+        .dynamic_executable_ranges
+        .push(DynamicExecutableImageSlot(Some(DynamicExecutableImage {
+            id: 7,
+            intervals: vec![ExecutableRange {
+                base: static_base,
+                len: 4,
+            }],
+            module_parameter: Some(parameter),
+            compact_repeating_timers: Vec::new(),
+        })));
+
+    runtime.discover_compact_repeating_timers();
+    assert_eq!(
+        runtime.modules[0].dynamic_executable_ranges[0]
+            .as_ref()
+            .unwrap()
+            .compact_repeating_timers,
+        vec![node]
+    );
+    runtime.modules[0].dynamic_executable_ranges[0]
+        .as_mut()
+        .unwrap()
+        .compact_repeating_timers
+        .clear();
+    let wrapper_handler = runtime.modules[0].base.0 + 8;
+    runtime
+        .memory
+        .write_u32(
+            node.checked_add(COMPACT_TIMER_HANDLER_OFFSET).unwrap(),
+            wrapper_handler,
+        )
+        .unwrap();
+    runtime.discover_compact_repeating_timers();
+    assert!(
+        runtime.modules[0].dynamic_executable_ranges[0]
+            .as_ref()
+            .unwrap()
+            .compact_repeating_timers
+            .is_empty()
+    );
+    load_test_module(&mut runtime);
+    assert_eq!(
+        runtime.registered_dynamic_image_parameter(
+            &image,
+            image_address,
+            image.len() as u32,
+            runtime.modules[1].generation,
+        ),
+        None
+    );
+}
+
+#[test]
+fn repeating_timer_discovery_rotates_its_shared_scan_budget() {
+    const FIRST_RW_LEN: usize = 700 * 1024;
+    const SECOND_RW_LEN: usize = 400 * 1024;
+
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let owner_generation = runtime.modules[0].generation;
+    let first_parameter = runtime
+        .allocate_guest_block_for_module(MODULE_PARAMETER_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let first_ext_chunk = runtime
+        .allocate_guest_block_for_module(EXT_CHUNK_TIMER_STATE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let first_rw = runtime
+        .allocate_guest_block_for_module(FIRST_RW_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let second_parameter = runtime
+        .allocate_guest_block_for_module(MODULE_PARAMETER_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let second_ext_chunk = runtime
+        .allocate_guest_block_for_module(EXT_CHUNK_TIMER_STATE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let second_rw = runtime
+        .allocate_guest_block_for_module(SECOND_RW_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let first_node = runtime
+        .allocate_guest_block_for_module(COMPACT_TIMER_NODE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let node = runtime
+        .allocate_guest_block_for_module(COMPACT_TIMER_NODE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    for (address, len) in [
+        (first_parameter, MODULE_PARAMETER_LEN),
+        (first_ext_chunk, EXT_CHUNK_TIMER_STATE_LEN),
+        (first_rw, FIRST_RW_LEN),
+        (second_parameter, MODULE_PARAMETER_LEN),
+        (second_ext_chunk, EXT_CHUNK_TIMER_STATE_LEN),
+        (second_rw, SECOND_RW_LEN),
+        (first_node, COMPACT_TIMER_NODE_LEN),
+        (node, COMPACT_TIMER_NODE_LEN),
+    ] {
+        runtime.memory.write(address, &vec![0; len]).unwrap();
+    }
+    for (parameter, ext_chunk, rw, len) in [
+        (first_parameter, first_ext_chunk, first_rw, FIRST_RW_LEN),
+        (second_parameter, second_ext_chunk, second_rw, SECOND_RW_LEN),
+    ] {
+        runtime.memory.write_u32(parameter, rw.0).unwrap();
+        runtime
+            .memory
+            .write_u32(
+                parameter
+                    .checked_add(MODULE_PARAMETER_RW_LEN_OFFSET)
+                    .unwrap(),
+                len as u32,
+            )
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(
+                parameter
+                    .checked_add(MODULE_PARAMETER_EXT_CHUNK_OFFSET)
+                    .unwrap(),
+                ext_chunk.0,
+            )
+            .unwrap();
+        runtime
+            .memory
+            .write_u32(ext_chunk, EXT_CHUNK_MAGIC)
+            .unwrap();
+    }
+
+    let first_handler = first_rw.checked_add(4).unwrap();
+    runtime.memory.write_u32(first_rw, first_node.0).unwrap();
+    runtime
+        .memory
+        .write_u32(first_handler, 0xe12f_ff1e)
+        .unwrap();
+    runtime
+        .memory
+        .add_permissions(first_handler, 4, Permissions::EXECUTE)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(first_node, COMPACT_TIMER_MAGIC)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            first_node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(),
+            80,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            first_node
+                .checked_add(COMPACT_TIMER_HANDLER_OFFSET)
+                .unwrap(),
+            first_handler.0,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            first_node.checked_add(COMPACT_TIMER_REPEAT_OFFSET).unwrap(),
+            1,
+        )
+        .unwrap();
+
+    let handler = second_rw.checked_add(4).unwrap();
+    runtime.memory.write_u32(second_rw, node.0).unwrap();
+    runtime.memory.write_u32(handler, 0xe12f_ff1e).unwrap();
+    runtime
+        .memory
+        .add_permissions(handler, 4, Permissions::EXECUTE)
+        .unwrap();
+    runtime.memory.write_u32(node, COMPACT_TIMER_MAGIC).unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 100)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            node.checked_add(COMPACT_TIMER_HANDLER_OFFSET).unwrap(),
+            handler.0,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_REPEAT_OFFSET).unwrap(), 1)
+        .unwrap();
+    runtime.modules[0].dynamic_executable_ranges.extend([
+        DynamicExecutableImageSlot(Some(DynamicExecutableImage {
+            id: 7,
+            intervals: vec![ExecutableRange {
+                base: first_handler,
+                len: 4,
+            }],
+            module_parameter: Some(first_parameter),
+            compact_repeating_timers: Vec::new(),
+        })),
+        DynamicExecutableImageSlot(Some(DynamicExecutableImage {
+            id: 8,
+            intervals: vec![ExecutableRange {
+                base: handler,
+                len: 4,
+            }],
+            module_parameter: Some(second_parameter),
+            compact_repeating_timers: Vec::new(),
+        })),
+    ]);
+    runtime.compact_timer_scan_cursor = 0;
+
+    runtime.discover_compact_repeating_timers();
+    assert_eq!(
+        runtime.modules[0].dynamic_executable_ranges[0]
+            .as_ref()
+            .unwrap()
+            .compact_repeating_timers,
+        vec![first_node]
+    );
+    assert!(
+        runtime.modules[0].dynamic_executable_ranges[1]
+            .as_ref()
+            .unwrap()
+            .compact_repeating_timers
+            .is_empty()
+    );
+    runtime.discover_compact_repeating_timers();
+    assert_eq!(
+        runtime.modules[0].dynamic_executable_ranges[1]
+            .as_ref()
+            .unwrap()
+            .compact_repeating_timers,
+        vec![node]
+    );
+    assert_eq!(runtime.modules[0].generation, owner_generation);
+
+    let states = runtime.current_repeating_timer_states();
+    runtime.modal_repeating_timers.push(states[0].clone());
+    assert!(!runtime.modal_timer_state_fits_budget(&states[1]));
+    runtime.modal_repeating_timers.clear();
+
+    let entering = runtime.modal_timer_observations().unwrap();
+    assert_eq!(entering.len(), 2);
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            1,
+        )
+        .unwrap();
+    runtime.finish_modal_timer_observations(entering).unwrap();
+    assert_eq!(runtime.modal_repeating_timers.len(), 1);
+    assert_eq!(runtime.modal_repeating_timers[0].image_id, 8);
+
+    let leaving = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 10)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+    runtime.finish_modal_timer_observations(leaving).unwrap();
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap())
+            .unwrap(),
+        100
+    );
+    assert!(runtime.modal_repeating_timers.is_empty());
+
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_DATA_OFFSET).unwrap(), 0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 100)
+        .unwrap();
+    runtime.modules[0].dynamic_executable_ranges[1]
+        .as_mut()
+        .unwrap()
+        .compact_repeating_timers = vec![node];
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            1,
+        )
+        .unwrap();
+    let first_suspended_observation = runtime.modal_timer_observations().unwrap();
+    assert_eq!(runtime.modal_repeating_timers.len(), 1);
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 10)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+    runtime
+        .finish_modal_timer_observations(first_suspended_observation)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap())
+            .unwrap(),
+        100
+    );
+
+    let entering = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            1,
+        )
+        .unwrap();
+    runtime.finish_modal_timer_observations(entering).unwrap();
+    let obscured_exit = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 10)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+    runtime.memory.write_u32(second_ext_chunk, 0).unwrap();
+    runtime
+        .finish_modal_timer_observations(obscured_exit)
+        .unwrap();
+    assert_eq!(runtime.modal_repeating_timers.len(), 1);
+
+    runtime
+        .memory
+        .write_u32(second_ext_chunk, EXT_CHUNK_MAGIC)
+        .unwrap();
+    runtime.modal_timer_observations().unwrap();
+    assert!(runtime.modal_repeating_timers.is_empty());
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap())
+            .unwrap(),
+        100
+    );
+
+    let replacement_rw = runtime
+        .allocate_guest_block_for_module(SECOND_RW_LEN, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write(replacement_rw, &vec![0; SECOND_RW_LEN])
+        .unwrap();
+    runtime.memory.write_u32(replacement_rw, node.0).unwrap();
+    let entering = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            1,
+        )
+        .unwrap();
+    runtime.finish_modal_timer_observations(entering).unwrap();
+    let leaving = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 10)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(second_parameter, replacement_rw.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+    runtime.finish_modal_timer_observations(leaving).unwrap();
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap())
+            .unwrap(),
+        10
+    );
+}
+
+#[test]
+fn modal_return_restores_only_the_repeating_timer_period() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let parameter = runtime
+        .allocate_guest_block_for_module(MODULE_PARAMETER_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let ext_chunk = runtime
+        .allocate_guest_block_for_module(EXT_CHUNK_TIMER_STATE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let static_base = runtime
+        .allocate_guest_block_for_module(0x40, 0)
+        .unwrap()
+        .unwrap();
+    let scheduler = static_base.checked_add(0x20).unwrap();
+    let node = runtime
+        .allocate_guest_block_for_module(COMPACT_TIMER_NODE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let second_node = runtime
+        .allocate_guest_block_for_module(COMPACT_TIMER_NODE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    for (address, len) in [
+        (parameter, MODULE_PARAMETER_LEN),
+        (ext_chunk, EXT_CHUNK_TIMER_STATE_LEN),
+        (static_base, 0x40),
+        (node, COMPACT_TIMER_NODE_LEN),
+        (second_node, COMPACT_TIMER_NODE_LEN),
+    ] {
+        runtime.memory.write(address, &vec![0; len]).unwrap();
+    }
+    runtime.memory.write_u32(static_base, 0xe12f_ff1e).unwrap();
+    runtime
+        .memory
+        .add_permissions(static_base, 4, Permissions::EXECUTE)
+        .unwrap();
+    runtime.memory.write_u32(parameter, static_base.0).unwrap();
+    runtime
+        .memory
+        .write_u32(
+            parameter
+                .checked_add(MODULE_PARAMETER_RW_LEN_OFFSET)
+                .unwrap(),
+            0x40,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(parameter.checked_add(12).unwrap(), ext_chunk.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk, EXT_CHUNK_MAGIC)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk.checked_add(0x34).unwrap(), 0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(scheduler.checked_add(8).unwrap(), node.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(scheduler.checked_add(12).unwrap(), 0)
+        .unwrap();
+    runtime.memory.write_u32(node, COMPACT_TIMER_MAGIC).unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 100)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            node.checked_add(COMPACT_TIMER_HANDLER_OFFSET).unwrap(),
+            static_base.0,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(8).unwrap(), 100)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_REPEAT_OFFSET).unwrap(), 1)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(scheduler.checked_add(12).unwrap(), second_node.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(second_node, COMPACT_TIMER_MAGIC)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_node
+                .checked_add(COMPACT_TIMER_PERIOD_OFFSET)
+                .unwrap(),
+            250,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_node
+                .checked_add(COMPACT_TIMER_HANDLER_OFFSET)
+                .unwrap(),
+            static_base.0,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_node
+                .checked_add(COMPACT_TIMER_REPEAT_OFFSET)
+                .unwrap(),
+            1,
+        )
+        .unwrap();
+    runtime.modules[0]
+        .dynamic_executable_ranges
+        .push(DynamicExecutableImageSlot(Some(DynamicExecutableImage {
+            id: 7,
+            intervals: vec![ExecutableRange {
+                base: static_base,
+                len: 4,
+            }],
+            module_parameter: Some(parameter),
+            compact_repeating_timers: vec![node, second_node],
+        })));
+
+    let live_timers = runtime.current_repeating_timer_states().remove(0);
+    let mut stale_timers = live_timers.clone();
+    stale_timers.image_id += 1;
+    runtime.modal_repeating_timers.push(stale_timers);
+    assert_eq!(
+        runtime.modal_timer_observations().unwrap()[0].timers,
+        live_timers
+    );
+    assert!(runtime.modal_repeating_timers.is_empty());
+
+    let entering = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk.checked_add(0x34).unwrap(), 1)
+        .unwrap();
+    runtime.finish_modal_timer_observations(entering).unwrap();
+
+    // A foreground browser can reuse this executable arena. The saved timer
+    // identity must remain authoritative while its live cache is unavailable.
+    runtime.modules[0].dynamic_executable_ranges[0]
+        .as_mut()
+        .unwrap()
+        .compact_repeating_timers = Vec::new();
+
+    let leaving = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 10)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(8).unwrap(), 10)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            second_node
+                .checked_add(COMPACT_TIMER_PERIOD_OFFSET)
+                .unwrap(),
+            25,
+        )
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk.checked_add(0x34).unwrap(), 0)
+        .unwrap();
+    runtime.finish_modal_timer_observations(leaving).unwrap();
+
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(
+                second_node
+                    .checked_add(COMPACT_TIMER_PERIOD_OFFSET)
+                    .unwrap(),
+            )
+            .unwrap(),
+        250
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap())
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(8).unwrap())
+            .unwrap(),
+        10
+    );
+    assert!(runtime.modal_repeating_timers.is_empty());
+    assert_eq!(
+        runtime.modules[0].dynamic_executable_ranges[0]
+            .as_ref()
+            .unwrap()
+            .compact_repeating_timers,
+        vec![node, second_node]
+    );
+
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 100)
+        .unwrap();
+    let entering = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk.checked_add(0x34).unwrap(), 1)
+        .unwrap();
+    runtime.finish_modal_timer_observations(entering).unwrap();
+    let leaving = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 10)
+        .unwrap();
+    runtime.memory.write_u32(node, 0).unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk.checked_add(0x34).unwrap(), 0)
+        .unwrap();
+    runtime.finish_modal_timer_observations(leaving).unwrap();
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap())
+            .unwrap(),
+        10
+    );
+    assert!(runtime.modal_repeating_timers.is_empty());
+
+    runtime.memory.write_u32(node, COMPACT_TIMER_MAGIC).unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 100)
+        .unwrap();
+    let entering = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk.checked_add(0x34).unwrap(), 1)
+        .unwrap();
+    runtime.finish_modal_timer_observations(entering).unwrap();
+    let leaving = runtime.modal_timer_observations().unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap(), 10)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(node.checked_add(COMPACT_TIMER_DATA_OFFSET).unwrap(), 1)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(ext_chunk.checked_add(0x34).unwrap(), 0)
+        .unwrap();
+    runtime.finish_modal_timer_observations(leaving).unwrap();
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).unwrap())
+            .unwrap(),
+        10
+    );
+    assert!(runtime.modal_repeating_timers.is_empty());
+}
+
+#[test]
 fn gzip_guest_call_recovers_the_platform_screen_buffer_capacity_from_abi_data() {
     let mut runtime =
         ExtRuntime::new(13, 9, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();

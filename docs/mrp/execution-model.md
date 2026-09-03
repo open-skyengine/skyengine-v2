@@ -149,3 +149,21 @@ CALL/pcall/tail-call 帧，也不调用 guest 的 `resume`；同一应用的系�
 退出清理顺序通常从前台子模块开始，逆向释放到 wrapper 和 MR VM。即使初始化只完成一部分，也必须能沿相同所有权关系回收资源。
 
 **证据：稳定 SDK ABI（生命周期入口与消息）；版本/平台相关（暂停计时器和异步重入细节）。**
+
+## 模态前台模块与 compact timer
+
+部分 SDK 在 guest 内维护多个逻辑 timer，再把最近期限通过平台表槽 31 汇聚成一个宿主
+timer。一次正常分发可能连续提交不同周期，因此宿主不能根据上一周期钳制槽 31 的 delay；
+同一调用点出现 `10 ms`、`100 ms` 或更长 delay 本身都不构成异常证据。内置浏览器等前台
+模块也不保证发送 helper code 4/5 或 `mr_plat(1011)`，不能把这些可选通知当成模态边界。
+
+对已验证的 compact timer 变体，运行时从槽 131 登记映像的 relocated parameter 字段出发，
+校验 parameter、extChunk、映像地址和长度的双向回指，再在受所有权和总预算约束的 RW 区
+内解析 timer node 引用。node 还必须属于同一 module generation 和 dynamic image，且 handler
+确实可执行。suspend depth 从 `0` 进入非零时保存仍存活的重复 timer；最终回到 `0` 时重新
+验证 node 的 RW 可达性及 handler/data/repeat/tail 身份，只恢复错误变化的 period，保留 guest
+重新计算的当前 deadline 和链表状态。
+
+这一兼容路径解析的是有边界、有所有权关系的运行时 ABI 数据，不搜索或反汇编 EXT 的指令
+字节。任何地址、回指、magic、映射、身份或预算检查失败时都放弃修复；私有 extChunk 与 timer
+布局仍属于按 SDK 样本验证的兼容行为，不应推广成所有 MRP 的格式要求。

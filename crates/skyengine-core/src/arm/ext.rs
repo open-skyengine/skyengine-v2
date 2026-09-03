@@ -45,6 +45,28 @@ const INTERNAL_TABLE_DATA: GuestAddr = GuestAddr(0x0100_1900);
 const APPLICATION_STATE_DATA: GuestAddr = GuestAddr(0x0100_1980);
 const LIFECYCLE_CALLBACK_DATA: GuestAddr = GuestAddr(0x0100_1984);
 const TIMER_ACTIVE_DATA: GuestAddr = GuestAddr(0x0100_1988);
+const EXT_CHUNK_MAGIC: u32 = 0x7fd8_54eb;
+const DYNAMIC_IMAGE_PARAMETER_OFFSET: usize = 4;
+const DYNAMIC_IMAGE_ENTRY_OFFSET: u32 = 8;
+const MODULE_PARAMETER_LEN: usize = 0x14;
+const MODULE_PARAMETER_RW_LEN_OFFSET: u32 = 0x04;
+const MODULE_PARAMETER_EXT_CHUNK_OFFSET: u32 = 0x0c;
+const EXT_CHUNK_ENTRY_OFFSET: u32 = 0x04;
+const EXT_CHUNK_IMAGE_ADDRESS_OFFSET: u32 = 0x0c;
+const EXT_CHUNK_IMAGE_LEN_OFFSET: u32 = 0x10;
+const EXT_CHUNK_PARAMETER_OFFSET: u32 = 0x1c;
+const EXT_CHUNK_PARAMETER_LEN_OFFSET: u32 = 0x20;
+const EXT_CHUNK_SUSPEND_DEPTH_OFFSET: u32 = 0x34;
+const EXT_CHUNK_TIMER_STATE_LEN: usize = 0x38;
+const COMPACT_TIMER_MAGIC: u32 = 0x79ab_bccf;
+const COMPACT_TIMER_PERIOD_OFFSET: u32 = 0x04;
+const COMPACT_TIMER_HANDLER_OFFSET: u32 = 0x0c;
+const COMPACT_TIMER_DATA_OFFSET: u32 = 0x10;
+const COMPACT_TIMER_REPEAT_OFFSET: u32 = 0x14;
+const COMPACT_TIMER_TAIL_OFFSET: u32 = 0x18;
+const COMPACT_TIMER_NODE_LEN: usize = 0x1c;
+const MAX_COMPACT_TIMER_POINTER_SCAN_LEN: usize = 1024 * 1024;
+const MAX_TRACKED_COMPACT_TIMERS: usize = 1024;
 const APPLICATION_STATE_NORMAL: u32 = 1;
 const APPLICATION_STATE_RESTART_PENDING: u32 = 3;
 const PLATFORM_SIM_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a00);
@@ -288,6 +310,8 @@ impl ExecutableRange {
 struct DynamicExecutableImage {
     id: u64,
     intervals: Vec<ExecutableRange>,
+    module_parameter: Option<GuestAddr>,
+    compact_repeating_timers: Vec<GuestAddr>,
 }
 
 // Keep existing single-range state assertions readable while dynamic images can
@@ -313,6 +337,31 @@ impl DynamicExecutableImageSlot {
     fn is_none(&self) -> bool {
         self.0.is_none()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RepeatingTimerSnapshot {
+    node: GuestAddr,
+    period: u32,
+    handler: u32,
+    data: u32,
+    repeat: u32,
+    tail: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModalRepeatingTimers {
+    owner_generation: u64,
+    image_id: u64,
+    parameter: GuestAddr,
+    rw_range: ExecutableRange,
+    timers: Vec<RepeatingTimerSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModalTimerObservation {
+    depth: u32,
+    timers: ModalRepeatingTimers,
 }
 
 impl PartialEq<Option<ExecutableRange>> for DynamicExecutableImageSlot {
@@ -630,6 +679,8 @@ pub(crate) struct ExtRuntime {
     native_extension_profile: NativeExtensionProfile,
     clock_origin: Instant,
     timer_deadline: Option<Instant>,
+    compact_timer_scan_cursor: usize,
+    modal_repeating_timers: Vec<ModalRepeatingTimers>,
     motion_active: bool,
 }
 
@@ -860,6 +911,8 @@ impl ExtRuntime {
             native_extension_profile: NativeExtensionProfile::Baseline,
             clock_origin: Instant::now(),
             timer_deadline: None,
+            compact_timer_scan_cursor: 0,
+            modal_repeating_timers: Vec::new(),
             motion_active: false,
         })
     }
@@ -1063,6 +1116,552 @@ impl ExtRuntime {
             services,
         )? as i32;
         self.active_helper_output(return_value, output_fields)
+    }
+
+    fn range_is_owned_by(&self, address: GuestAddr, len: usize, owner_generation: u64) -> bool {
+        self.allocation_owner_for_range(ExecutableRange { base: address, len })
+            == Some(owner_generation)
+    }
+
+    fn registered_dynamic_image_parameter(
+        &self,
+        image: &[u8],
+        image_address: GuestAddr,
+        image_len: u32,
+        owner_generation: u64,
+    ) -> Option<GuestAddr> {
+        // The relocated loader header carries its parameter pointer in word 1.
+        // Validate the extChunk's bidirectional ABI links so arbitrary code bytes
+        // cannot opt into timer-state handling.
+        let end = DYNAMIC_IMAGE_PARAMETER_OFFSET.checked_add(4)?;
+        let parameter = GuestAddr(u32::from_le_bytes(
+            image
+                .get(DYNAMIC_IMAGE_PARAMETER_OFFSET..end)?
+                .try_into()
+                .ok()?,
+        ));
+        self.compact_timer_suspend_depth(parameter, owner_generation)?;
+        let ext_chunk = GuestAddr(
+            self.memory
+                .read_u32(
+                    parameter
+                        .checked_add(MODULE_PARAMETER_EXT_CHUNK_OFFSET)
+                        .ok()?,
+                )
+                .ok()?,
+        );
+        if self
+            .memory
+            .read_u32(ext_chunk.checked_add(EXT_CHUNK_ENTRY_OFFSET).ok()?)
+            .ok()?
+            != image_address
+                .checked_add(DYNAMIC_IMAGE_ENTRY_OFFSET)
+                .ok()?
+                .0
+            || self
+                .memory
+                .read_u32(ext_chunk.checked_add(EXT_CHUNK_IMAGE_ADDRESS_OFFSET).ok()?)
+                .ok()?
+                != image_address.0
+            || self
+                .memory
+                .read_u32(ext_chunk.checked_add(EXT_CHUNK_IMAGE_LEN_OFFSET).ok()?)
+                .ok()?
+                != image_len
+            || self
+                .memory
+                .read_u32(ext_chunk.checked_add(EXT_CHUNK_PARAMETER_OFFSET).ok()?)
+                .ok()?
+                != parameter.0
+            || self
+                .memory
+                .read_u32(ext_chunk.checked_add(EXT_CHUNK_PARAMETER_LEN_OFFSET).ok()?)
+                .ok()?
+                != MODULE_PARAMETER_LEN as u32
+        {
+            return None;
+        }
+        Some(parameter)
+    }
+
+    fn compact_timer_rw_range(
+        &self,
+        parameter: GuestAddr,
+        owner_generation: u64,
+    ) -> Option<(GuestAddr, usize)> {
+        self.compact_timer_suspend_depth(parameter, owner_generation)?;
+        let static_base = GuestAddr(self.memory.read_u32(parameter).ok()?);
+        let static_len = usize::try_from(
+            self.memory
+                .read_u32(parameter.checked_add(MODULE_PARAMETER_RW_LEN_OFFSET).ok()?)
+                .ok()?,
+        )
+        .ok()?;
+        if !static_base.0.is_multiple_of(4)
+            || !static_len.is_multiple_of(4)
+            || static_len == 0
+            || static_len > MAX_COMPACT_TIMER_POINTER_SCAN_LEN
+            || self
+                .memory
+                .check_range(static_base, static_len, Permissions::READ_WRITE)
+                .is_err()
+            || !self.range_is_owned_by(static_base, static_len, owner_generation)
+        {
+            return None;
+        }
+        Some((static_base, static_len))
+    }
+
+    fn reachable_repeating_timers(
+        &self,
+        module_index: usize,
+        image_id: u64,
+        parameter: GuestAddr,
+        owner_generation: u64,
+    ) -> Option<Vec<RepeatingTimerSnapshot>> {
+        // Inspect only the module-declared RW range. Multiple scheduler layouts
+        // can reference the same node, so node identity is the stable unit.
+        let (static_base, static_len) = self.compact_timer_rw_range(parameter, owner_generation)?;
+        let mut checked_pointers = BTreeSet::new();
+        let mut timers = BTreeMap::new();
+        for offset in (0..static_len).step_by(4) {
+            let pointer = GuestAddr(
+                self.memory
+                    .read_u32(static_base.checked_add(u32::try_from(offset).ok()?).ok()?)
+                    .ok()?,
+            );
+            if pointer.0 == 0
+                || !pointer.0.is_multiple_of(4)
+                || self.memory.read_u32(pointer).ok() != Some(COMPACT_TIMER_MAGIC)
+            {
+                continue;
+            }
+            if !checked_pointers.insert(pointer.0) {
+                continue;
+            }
+            if checked_pointers.len() > MAX_TRACKED_COMPACT_TIMERS {
+                return None;
+            }
+            if let Some(timer) =
+                self.repeating_timer_at(pointer, module_index, image_id, owner_generation)
+            {
+                if !timers.contains_key(&pointer.0) && timers.len() >= MAX_TRACKED_COMPACT_TIMERS {
+                    return None;
+                }
+                timers.insert(pointer.0, timer);
+            }
+        }
+        Some(timers.into_values().collect())
+    }
+
+    fn discover_compact_repeating_timers(&mut self) {
+        let active = self
+            .modal_repeating_timers
+            .iter()
+            .map(|timers| (timers.owner_generation, timers.image_id, timers.parameter))
+            .collect::<BTreeSet<_>>();
+        let mut pending = self
+            .modules
+            .iter()
+            .enumerate()
+            .flat_map(|(module_index, module)| {
+                let active = &active;
+                module
+                    .dynamic_executable_ranges
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(image_index, slot)| {
+                        let image = slot.as_ref()?;
+                        let parameter = image.module_parameter?;
+                        (!active.contains(&(module.generation, image.id, parameter))).then_some((
+                            module_index,
+                            image_index,
+                            module.generation,
+                            image.id,
+                            parameter,
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        if !pending.is_empty() {
+            let start = self.compact_timer_scan_cursor % pending.len();
+            pending.rotate_left(start);
+            self.compact_timer_scan_cursor = self.compact_timer_scan_cursor.wrapping_add(1);
+        }
+        // This is a per-dispatch budget shared by every dynamic image.
+        let mut scan_budget = MAX_COMPACT_TIMER_POINTER_SCAN_LEN;
+        for (module_index, image_index, owner_generation, image_id, parameter) in pending {
+            let Some((_, static_len)) = self.compact_timer_rw_range(parameter, owner_generation)
+            else {
+                continue;
+            };
+            if static_len > scan_budget {
+                continue;
+            }
+            scan_budget -= static_len;
+            let Some(discovered) = self.reachable_repeating_timers(
+                module_index,
+                image_id,
+                parameter,
+                owner_generation,
+            ) else {
+                continue;
+            };
+            if discovered.is_empty() {
+                continue;
+            }
+            let Some(image) = self
+                .modules
+                .get_mut(module_index)
+                .and_then(|module| module.dynamic_executable_ranges.get_mut(image_index))
+                .and_then(DynamicExecutableImageSlot::as_mut)
+            else {
+                continue;
+            };
+            if image.id != image_id || image.module_parameter != Some(parameter) {
+                continue;
+            }
+            for node in discovered.into_iter().map(|timer| timer.node) {
+                if image.compact_repeating_timers.len() >= MAX_TRACKED_COMPACT_TIMERS {
+                    break;
+                }
+                if !image.compact_repeating_timers.contains(&node) {
+                    image.compact_repeating_timers.push(node);
+                }
+            }
+        }
+    }
+
+    fn modal_timer_state_is_live(&self, timers: &ModalRepeatingTimers) -> bool {
+        self.modules
+            .iter()
+            .find(|module| module.generation == timers.owner_generation)
+            .and_then(|module| {
+                module
+                    .dynamic_executable_ranges
+                    .iter()
+                    .filter_map(DynamicExecutableImageSlot::as_ref)
+                    .find(|image| {
+                        image.id == timers.image_id
+                            && image.module_parameter == Some(timers.parameter)
+                    })
+            })
+            .is_some()
+    }
+
+    fn restore_compact_repeating_timers(&mut self, timers: &ModalRepeatingTimers) -> Result<()> {
+        let Some(module_index) = self
+            .modules
+            .iter()
+            .position(|module| module.generation == timers.owner_generation)
+        else {
+            return Ok(());
+        };
+        if self
+            .compact_timer_rw_range(timers.parameter, timers.owner_generation)
+            .map(|(base, len)| ExecutableRange { base, len })
+            != Some(timers.rw_range)
+        {
+            return Ok(());
+        }
+        let reachable = self
+            .reachable_repeating_timers(
+                module_index,
+                timers.image_id,
+                timers.parameter,
+                timers.owner_generation,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|timer| (timer.node.0, timer))
+            .collect::<BTreeMap<_, _>>();
+        let mut retained_nodes = Vec::new();
+        for saved in &timers.timers {
+            let Some(current) = reachable.get(&saved.node.0) else {
+                continue;
+            };
+            // Guest timers have no exposed allocation generation. Treat the
+            // immutable callback record plus module/image ownership as identity;
+            // any observable reuse makes this compatibility repair fail closed.
+            if current.handler != saved.handler
+                || current.data != saved.data
+                || current.repeat != saved.repeat
+                || current.tail != saved.tail
+            {
+                continue;
+            }
+            // The current deadline at +8 was recomputed while suspended. Preserve
+            // it and restore only the repeating interval corrupted by modal return.
+            self.memory.write_u32(
+                saved.node.checked_add(COMPACT_TIMER_PERIOD_OFFSET)?,
+                saved.period,
+            )?;
+            retained_nodes.push(saved.node);
+        }
+
+        if let Some(image) = self.modules[module_index]
+            .dynamic_executable_ranges
+            .iter_mut()
+            .filter_map(DynamicExecutableImageSlot::as_mut)
+            .find(|image| image.id == timers.image_id)
+        {
+            image.module_parameter = Some(timers.parameter);
+            image.compact_repeating_timers = retained_nodes;
+        }
+        Ok(())
+    }
+
+    fn compact_timer_suspend_depth(
+        &self,
+        parameter: GuestAddr,
+        owner_generation: u64,
+    ) -> Option<u32> {
+        if parameter.0 == 0
+            || !parameter.0.is_multiple_of(4)
+            || self
+                .memory
+                .check_range(parameter, MODULE_PARAMETER_LEN, Permissions::READ_WRITE)
+                .is_err()
+            || !self.range_is_owned_by(parameter, MODULE_PARAMETER_LEN, owner_generation)
+        {
+            return None;
+        }
+        let ext_chunk = GuestAddr(
+            self.memory
+                .read_u32(
+                    parameter
+                        .checked_add(MODULE_PARAMETER_EXT_CHUNK_OFFSET)
+                        .ok()?,
+                )
+                .ok()?,
+        );
+        if ext_chunk.0 == 0
+            || !ext_chunk.0.is_multiple_of(4)
+            || self
+                .memory
+                .check_range(
+                    ext_chunk,
+                    EXT_CHUNK_TIMER_STATE_LEN,
+                    Permissions::READ_WRITE,
+                )
+                .is_err()
+            || !self.range_is_owned_by(ext_chunk, EXT_CHUNK_TIMER_STATE_LEN, owner_generation)
+            || self.memory.read_u32(ext_chunk).ok()? != EXT_CHUNK_MAGIC
+        {
+            return None;
+        }
+        self.memory
+            .read_u32(ext_chunk.checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET).ok()?)
+            .ok()
+    }
+
+    fn repeating_timer_at(
+        &self,
+        node: GuestAddr,
+        module_index: usize,
+        image_id: u64,
+        owner_generation: u64,
+    ) -> Option<RepeatingTimerSnapshot> {
+        if node.0 == 0
+            || !node.0.is_multiple_of(4)
+            || self.memory.read_u32(node).ok()? != COMPACT_TIMER_MAGIC
+        {
+            return None;
+        }
+        if self
+            .memory
+            .check_range(node, COMPACT_TIMER_NODE_LEN, Permissions::READ_WRITE)
+            .is_err()
+        {
+            return None;
+        }
+        let period = self
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_PERIOD_OFFSET).ok()?)
+            .ok()
+            .filter(|period| *period != 0)?;
+        let handler = self
+            .memory
+            .read_u32(node.checked_add(COMPACT_TIMER_HANDLER_OFFSET).ok()?)
+            .ok()?;
+        let module = self.modules.get(module_index)?;
+        if module.generation != owner_generation
+            || module.executable_image(handler).map(|(image, _)| image)
+                != Some(ExecutableImage::Dynamic(image_id))
+        {
+            return None;
+        }
+        let timer = RepeatingTimerSnapshot {
+            node,
+            period,
+            handler,
+            data: self
+                .memory
+                .read_u32(node.checked_add(COMPACT_TIMER_DATA_OFFSET).ok()?)
+                .ok()?,
+            repeat: self
+                .memory
+                .read_u32(node.checked_add(COMPACT_TIMER_REPEAT_OFFSET).ok()?)
+                .ok()?,
+            tail: self
+                .memory
+                .read_u32(node.checked_add(COMPACT_TIMER_TAIL_OFFSET).ok()?)
+                .ok()?,
+        };
+        if timer.repeat == 0
+            || !self.range_is_owned_by(node, COMPACT_TIMER_NODE_LEN, owner_generation)
+        {
+            return None;
+        }
+        Some(timer)
+    }
+
+    fn current_repeating_timer_states(&self) -> Vec<ModalRepeatingTimers> {
+        let mut states = Vec::new();
+        for (module_index, module) in self.modules.iter().enumerate() {
+            for image in module
+                .dynamic_executable_ranges
+                .iter()
+                .filter_map(DynamicExecutableImageSlot::as_ref)
+            {
+                let Some(parameter) = image.module_parameter else {
+                    continue;
+                };
+                let timers = image
+                    .compact_repeating_timers
+                    .iter()
+                    .filter_map(|node| {
+                        self.repeating_timer_at(*node, module_index, image.id, module.generation)
+                    })
+                    .collect::<Vec<_>>();
+                let Some((rw_base, rw_len)) =
+                    self.compact_timer_rw_range(parameter, module.generation)
+                else {
+                    continue;
+                };
+                if timers.is_empty() {
+                    continue;
+                }
+                states.push(ModalRepeatingTimers {
+                    owner_generation: module.generation,
+                    image_id: image.id,
+                    parameter,
+                    rw_range: ExecutableRange {
+                        base: rw_base,
+                        len: rw_len,
+                    },
+                    timers,
+                });
+            }
+        }
+        states
+    }
+
+    fn modal_timer_key(timers: &ModalRepeatingTimers) -> (u64, u64, GuestAddr) {
+        (timers.owner_generation, timers.image_id, timers.parameter)
+    }
+
+    fn modal_timer_state_fits_budget(&self, timers: &ModalRepeatingTimers) -> bool {
+        self.modal_repeating_timers
+            .iter()
+            .try_fold(timers.rw_range.len, |total, active| {
+                total.checked_add(active.rw_range.len)
+            })
+            .is_some_and(|total| total <= MAX_COMPACT_TIMER_POINTER_SCAN_LEN)
+    }
+
+    fn modal_timer_observations(&mut self) -> Result<Vec<ModalTimerObservation>> {
+        let mut observations = Vec::new();
+        for timers in std::mem::take(&mut self.modal_repeating_timers) {
+            if !self.modal_timer_state_is_live(&timers) {
+                continue;
+            }
+            match self.compact_timer_suspend_depth(timers.parameter, timers.owner_generation) {
+                Some(0) => self.restore_compact_repeating_timers(&timers)?,
+                Some(depth) => {
+                    observations.push(ModalTimerObservation {
+                        depth,
+                        timers: timers.clone(),
+                    });
+                    self.modal_repeating_timers.push(timers);
+                }
+                None => self.modal_repeating_timers.push(timers),
+            }
+        }
+        let active_keys = self
+            .modal_repeating_timers
+            .iter()
+            .map(Self::modal_timer_key)
+            .collect::<BTreeSet<_>>();
+        for timers in self
+            .current_repeating_timer_states()
+            .into_iter()
+            .filter(|timers| !active_keys.contains(&Self::modal_timer_key(timers)))
+        {
+            let Some(depth) =
+                self.compact_timer_suspend_depth(timers.parameter, timers.owner_generation)
+            else {
+                continue;
+            };
+            observations.push(ModalTimerObservation {
+                depth,
+                timers: timers.clone(),
+            });
+            if depth > 0 && self.modal_timer_state_fits_budget(&timers) {
+                self.modal_repeating_timers.push(timers);
+            }
+        }
+        Ok(observations)
+    }
+
+    fn remove_modal_timer_state(
+        &mut self,
+        key: (u64, u64, GuestAddr),
+    ) -> Option<ModalRepeatingTimers> {
+        self.modal_repeating_timers
+            .iter()
+            .position(|timers| Self::modal_timer_key(timers) == key)
+            .map(|index| self.modal_repeating_timers.remove(index))
+    }
+
+    fn finish_modal_timer_observations(
+        &mut self,
+        before: Vec<ModalTimerObservation>,
+    ) -> Result<()> {
+        for before in before {
+            let key = Self::modal_timer_key(&before.timers);
+            if !self.modal_timer_state_is_live(&before.timers) {
+                self.remove_modal_timer_state(key);
+                continue;
+            }
+            let Some(depth_after) = self.compact_timer_suspend_depth(
+                before.timers.parameter,
+                before.timers.owner_generation,
+            ) else {
+                if before.depth == 0 {
+                    self.remove_modal_timer_state(key);
+                }
+                continue;
+            };
+            if before.depth == 0 && depth_after > 0 {
+                if !self
+                    .modal_repeating_timers
+                    .iter()
+                    .any(|timers| Self::modal_timer_key(timers) == key)
+                    && self.modal_timer_state_fits_budget(&before.timers)
+                {
+                    self.modal_repeating_timers.push(before.timers);
+                }
+            } else if before.depth > 0
+                && depth_after == 0
+                && let Some(timers) = self.remove_modal_timer_state(key)
+                && self.modal_timer_state_is_live(&timers)
+            {
+                self.restore_compact_repeating_timers(&timers)?;
+            }
+        }
+        Ok(())
     }
 
     fn active_helper_output(
@@ -1849,8 +2448,11 @@ impl ExtRuntime {
         stack_arguments: &[u32],
         services: &mut dyn NativeServices,
     ) -> Result<u32> {
+        let modal_timer_before = self.modal_timer_observations()?;
         let execution = self.prepare_guest_execution(function, registers, stack_arguments)?;
-        self.run_guest_execution(execution, services)
+        let return_value = self.run_guest_execution(execution, services)?;
+        self.finish_modal_timer_observations(modal_timer_before)?;
+        Ok(return_value)
     }
 
     fn prepare_guest_execution(

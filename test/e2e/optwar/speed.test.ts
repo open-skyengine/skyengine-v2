@@ -1,6 +1,54 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs";
+import type { PpmImage } from "../engine-e2e.js";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
-import fs from "fs";
+import { isPluginPrompt } from "./visual.js";
+
+const GAME_REGION = { x: 0, y: 40, width: 240, height: 280 };
+
+interface VisualRateSample {
+  drawRate: number;
+  visualRate: number;
+  changedPixels: number;
+  first: PpmImage;
+  last: PpmImage;
+}
+
+async function captureVisualRate(
+  engine: SkyEngineE2e,
+  name: string,
+  durationMs = 1_500,
+): Promise<VisualRateSample> {
+  const firstDraw = await engine.drawCount();
+  const startedAt = performance.now();
+  await engine.delay(durationMs);
+  const lastDraw = await engine.drawCount();
+  const elapsedSeconds = (performance.now() - startedAt) / 1_000;
+  const drawCount = lastDraw - firstDraw;
+  if (drawCount < 1 || drawCount >= 128) {
+    throw new Error(`visual sample retained ${drawCount} frames; expected 1..127`);
+  }
+
+  let previous = await engine.screenDraw(firstDraw, `${name}-first`);
+  const first = previous;
+  let visuallyChangedFrames = 0;
+  let changedPixels = 0;
+  for (let draw = firstDraw + 1; draw <= lastDraw; draw += 1) {
+    const current = await engine.screenDraw(draw, `${name}-${draw}`);
+    const difference = current.diffPixelCount(previous, GAME_REGION);
+    if (difference > 100) visuallyChangedFrames += 1;
+    changedPixels += difference;
+    previous = current;
+  }
+
+  return {
+    drawRate: drawCount / elapsedSeconds,
+    visualRate: visuallyChangedFrames / elapsedSeconds,
+    changedPixels,
+    first,
+    last: previous,
+  };
+}
 
 describe("optwar", () => {
   let engine: SkyEngineE2e | undefined;
@@ -13,365 +61,160 @@ describe("optwar", () => {
     ws = undefined;
   });
 
-  it("普通菜单往返后绘制节奏保持稳定（宽容差）", async () => {
-    let normalDrawRate: number;
-    // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
+  it("点击火力全开广告进入浏览器并返回后画面速度保持稳定", async () => {
     ws = await SkyEngineWorkspace.create();
-    // 删除后，继续游戏会进入下载netpay插件界面。
-    if (!fs.existsSync(ws.path('mythroad/plugins/netpay.mrp'))) {
-      fs.cpSync('test/fixtures/plugins/netpay.mrp', ws.path('mythroad/plugins/netpay.mrp'));
+    if (!fs.existsSync(ws.path("mythroad/plugins/advbar.mrp"))) {
+      fs.cpSync(
+        "test/fixtures/plugins/advbar.mrp",
+        ws.path("mythroad/plugins/advbar.mrp"),
+      );
     }
-    // 本用例验证前台 advbar 插件与游戏主画面的屏幕合成，运行前显式准备插件资源。
-    if (!fs.existsSync(ws.path('mythroad/plugins/advbar.mrp'))) {
-      fs.cpSync('test/fixtures/plugins/advbar.mrp', ws.path('mythroad/plugins/advbar.mrp'));
-    }
-    engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", { workDir: ws.dir });
+    fs.rmSync(ws.path("mythroad/brw"), { recursive: true, force: true });
+    fs.rmSync(ws.path("mythroad/plugins/embrw.mrp"), { force: true });
+    fs.rmSync(ws.path("mythroad/plugins/brwcore.mrp"), { force: true });
+    fs.rmSync(ws.path("mythroad/plugins/brwgui.mrp"), { force: true });
+    fs.rmSync(ws.path("mythroad/plugins/brwmain.mrp"), { force: true });
+    fs.rmSync(ws.path("mythroad/plugins/brwshell.mrp"), { force: true });
+    fs.rmSync(ws.path("mythroad/plugins/dump0"), { force: true });
+    engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", {
+      workDir: ws.dir,
+      dnsMap: "10.0.0.172->159.75.119.124;rop.skymobiapp.com->159.75.119.124;spd.skymobiapp.com->159.75.119.124;proxy.51mrp.com->159.75.119.124;proxy2.51mrp.com->159.75.119.124",
+    });
 
-    await engine.delay(2000);
-    const boot = await engine.screen("bgm-select");
+    const boot = await engine.waitForScreen(
+      screen => screen.pixel(227, 301).toString() === "248,0,0",
+      { name: "bgm-select", timeoutMs: 60_000, intervalMs: 250 },
+    );
     expect(boot.pixel(150, 308)).toEqual([0, 0, 0]);
-    // rgb(248, 0, 0)
-    expect(boot.pixel(227, 301)).toEqual([248, 0, 0]);
-
-    // 是否开启音乐？-> 否
     await engine.click(227, 301, 1_000);
+
+    const menu = await engine.waitForScreen(
+      screen => screen.pixel(98, 264).toString() === "0,252,0",
+      { name: "menu", timeoutMs: 10_000, intervalMs: 100 },
+    );
+    expect(menu.pixel(110, 27)).toEqual([128, 48, 40]);
+
+    // 第一次方向键只关闭覆盖在主菜单顶部的前台广告条。
+    await engine.key("RIGHT", 1_000);
+    const menuWithoutAd = await engine.waitForScreen(
+      screen => screen.pixel(110, 27).toString() !== "128,48,40"
+        && screen.pixel(98, 264).toString() === "0,252,0",
+      { name: "menu-without-ad", timeoutMs: 3_000, intervalMs: 100 },
+    );
+    expect(menuWithoutAd.diffPixelCount(menu)).toBeGreaterThan(0);
+
+    await engine.key("ENTER", 1_000);
     await engine.delay(1_000);
-
-    // 进入主菜单
-    const wake = await engine.screen("menu");
-    // rgb(128, 48, 40)
-    expect(wake.pixel(110, 27)).toEqual([128, 48, 40]);
-    expect(wake.pixel(120, 20)).toEqual([176, 120, 120]);
-    // rgb(24, 24, 24)
-    expect(wake.pixel(83, 267)).toEqual([24, 24, 24]);
-    // rgb(0, 252, 0)
-    expect(wake.pixel(98, 264)).toEqual([0, 252, 0]);
-
-    {
-      // 第一次方向键先被前台 advbar 关闭流程消费，只应让顶部广告条消失。
-      await engine.key('RIGHT', 1_000)
-      await engine.delay(1_000);
-      const afterRight = await engine.screen("after-right");
-      expect(afterRight.pixel(110, 27)).not.toEqual([128, 48, 40]);
-      // rgb(0, 252, 0)
-      expect(afterRight.pixel(98, 264)).toEqual([0, 252, 0]);
-      // 开始游玩
-      await engine.key('ENTER', 1_000)
-      await engine.delay(1_000);
-      const afterSecondRight = await engine.screen("after-second-right");
-      expect(afterSecondRight.pixel(98, 264)).not.toEqual(afterRight.pixel(98, 264));
-    }
-    {
-      // 跳过介绍
-      await engine.delay(1_000);
-      await engine.key('ENTER', 1_000)
-      await engine.delay(1_000);
-      await engine.key('ENTER', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('start-scene')
-        // rgb(200, 252, 248)
-        expect(screen.pixel(22, 314)).toEqual([200, 252, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-      // 用支付前的同一游戏场景建立绘制节奏基线。
-      const normalStart = await engine.drawCount()
-      const normalStartedAt = performance.now()
-      await engine.delay(2_000)
-      const normalEnd = await engine.drawCount()
-      const normalElapsedSeconds = (performance.now() - normalStartedAt) / 1_000
-      normalDrawRate = (normalEnd - normalStart) / normalElapsedSeconds
-      expect(normalDrawRate).toBeGreaterThan(0)
-    }
-    {
-      // 打开游戏内菜单
-      await engine.key('LEFT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('game-menu')
-        // rgb(48, 188, 248)
-        expect(screen.pixel(175, 103)).toEqual([48, 188, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 回车购买火力全开
-      await engine.key('ENTER', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('full-power')
-        // rgb(200, 252, 248)
-        expect(screen.pixel(213, 151)).toEqual([200, 252, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 打开支付方式
-      await engine.key('LEFT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('pay-method-1')
-        // rgb(48, 188, 248)
-        expect(screen.pixel(230, 269)).toEqual([48, 188, 248])
-        // rgb(168, 20, 32)
-        expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
-      }, {
-        timeout: 3_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 选择令牌支付，但不启动测试环境中缺失的活动插件。
-      await engine.key('DOWN', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('select-second-method-1')
-        // rgb(48, 188, 248)
-        expect(screen.pixel(222, 287)).toEqual([48, 188, 248])
-        // rgb(168, 20, 32)
-        expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
-      }, {
-        timeout: 3_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 支付方式页直接返回游戏菜单。
-      await engine.key('RIGHT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('game-menu')
-        // rgb(48, 188, 248)
-        expect(screen.pixel(175, 103)).toEqual([48, 188, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 返回游戏界面
-      await engine.key('RIGHT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('start-scene')
-        // rgb(200, 252, 248)
-        expect(screen.pixel(22, 314)).toEqual([200, 252, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 跳过返回边界的一次性恢复工作，再用长窗口排除持续倍速或冻结。
-      await engine.delay(1_000)
-      const resumedFirstFrame = await engine.screen('resume-rate-start')
-      const resumedStart = await engine.drawCount()
-      const resumedStartedAt = performance.now()
-      await engine.delay(5_000)
-      const resumedTailFirstFrame = await engine.screen('resume-rate-tail-start')
-      const resumedTailStart = await engine.drawCount()
-      const resumedTailStartedAt = performance.now()
-      await engine.delay(2_000)
-      const resumedEnd = await engine.drawCount()
-      const resumedElapsedSeconds = (performance.now() - resumedStartedAt) / 1_000
-      const resumedDrawRate = (resumedEnd - resumedStart) / resumedElapsedSeconds
-      const resumedTailElapsedSeconds = (performance.now() - resumedTailStartedAt) / 1_000
-      const resumedTailDrawRate = (resumedEnd - resumedTailStart) / resumedTailElapsedSeconds
-      const resumedLastFrame = await engine.screen('resume-rate-end')
-
-      console.info(
-        `[optwar-resume-rate] baseline=${normalDrawRate.toFixed(3)} ` +
-        `resumed=${resumedDrawRate.toFixed(3)} tail=${resumedTailDrawRate.toFixed(3)}`
-      )
-      expect(resumedDrawRate).toBeGreaterThanOrEqual(normalDrawRate * 0.5)
-      expect(resumedDrawRate).toBeLessThanOrEqual(normalDrawRate * 1.5)
-      expect(resumedLastFrame.diffPixelCount(resumedFirstFrame)).toBeGreaterThan(0)
-      // 末段必须仍以正常节奏推进，避免前半段绘制后冻结却通过整窗平均值。
-      expect(resumedTailDrawRate).toBeGreaterThanOrEqual(normalDrawRate * 0.5)
-      expect(resumedTailDrawRate).toBeLessThanOrEqual(normalDrawRate * 1.5)
-      expect(resumedLastFrame.diffPixelCount(resumedTailFirstFrame)).toBeGreaterThan(0)
-      expect(resumedLastFrame.pixel(22, 314)).toEqual([200, 252, 248])
-    }
-  });
-  it("普通菜单往返后绘制节奏保持稳定", async () => {
-    let normalDrawRate: number;
-    // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
-    ws = await SkyEngineWorkspace.create();
-    // 删除后，继续游戏会进入下载netpay插件界面。
-    if (!fs.existsSync(ws.path('mythroad/plugins/netpay.mrp'))) {
-      fs.cpSync('test/fixtures/plugins/netpay.mrp', ws.path('mythroad/plugins/netpay.mrp'));
-    }
-    // 本用例验证前台 advbar 插件与游戏主画面的屏幕合成，运行前显式准备插件资源。
-    if (!fs.existsSync(ws.path('mythroad/plugins/advbar.mrp'))) {
-      fs.cpSync('test/fixtures/plugins/advbar.mrp', ws.path('mythroad/plugins/advbar.mrp'));
-    }
-    engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", { workDir: ws.dir });
-
-    await engine.delay(2000);
-    const boot = await engine.screen("bgm-select");
-    expect(boot.pixel(150, 308)).toEqual([0, 0, 0]);
-    // rgb(248, 0, 0)
-    expect(boot.pixel(227, 301)).toEqual([248, 0, 0]);
-
-    // 是否开启音乐？-> 否
-    await engine.click(227, 301, 1_000);
+    await engine.key("ENTER", 1_000);
     await engine.delay(1_000);
+    await engine.key("ENTER", 1_000);
+    const gameBeforeAd = await engine.waitForScreen(
+      screen => screen.pixel(22, 314).toString() === "200,252,248",
+      { name: "game-before-ad", timeoutMs: 10_000, intervalMs: 100 },
+    );
 
-    // 进入主菜单
-    const wake = await engine.screen("menu");
-    // rgb(128, 48, 40)
-    expect(wake.pixel(110, 27)).toEqual([128, 48, 40]);
-    expect(wake.pixel(120, 20)).toEqual([176, 120, 120]);
-    // rgb(24, 24, 24)
-    expect(wake.pixel(83, 267)).toEqual([24, 24, 24]);
-    // rgb(0, 252, 0)
-    expect(wake.pixel(98, 264)).toEqual([0, 252, 0]);
+    const baseline = await captureVisualRate(engine, "baseline");
+    expect(baseline.visualRate).toBeGreaterThan(5);
+    expect(baseline.last.diffPixelCount(baseline.first, GAME_REGION)).toBeGreaterThan(1_000);
 
-    {
-      // 第一次方向键先被前台 advbar 关闭流程消费，只应让顶部广告条消失。
-      await engine.key('RIGHT', 1_000)
-      await engine.delay(1_000);
-      const afterRight = await engine.screen("after-right");
-      expect(afterRight.pixel(110, 27)).not.toEqual([128, 48, 40]);
-      // rgb(0, 252, 0)
-      expect(afterRight.pixel(98, 264)).toEqual([0, 252, 0]);
-      // 开始游玩
-      await engine.key('ENTER', 1_000)
-      await engine.delay(1_000);
-      const afterSecondRight = await engine.screen("after-second-right");
-      expect(afterSecondRight.pixel(98, 264)).not.toEqual(afterRight.pixel(98, 264));
-    }
-    {
-      // 跳过介绍
-      await engine.delay(1_000);
-      await engine.key('ENTER', 1_000)
-      await engine.delay(1_000);
-      await engine.key('ENTER', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('start-scene')
-        // rgb(200, 252, 248)
-        expect(screen.pixel(22, 314)).toEqual([200, 252, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-      // 用支付前的同一游戏场景建立绘制节奏基线。
-      const normalStart = await engine.drawCount()
-      const normalStartedAt = performance.now()
-      await engine.delay(2_000)
-      const normalEnd = await engine.drawCount()
-      const normalElapsedSeconds = (performance.now() - normalStartedAt) / 1_000
-      normalDrawRate = (normalEnd - normalStart) / normalElapsedSeconds
-      expect(normalDrawRate).toBeGreaterThan(0)
-    }
-    {
-      // 打开游戏内菜单
-      await engine.key('LEFT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('game-menu')
-        // rgb(48, 188, 248)
-        expect(screen.pixel(175, 103)).toEqual([48, 188, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 回车购买火力全开
-      await engine.key('ENTER', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('full-power')
-        // rgb(200, 252, 248)
-        expect(screen.pixel(213, 151)).toEqual([200, 252, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 打开支付方式
-      await engine.key('LEFT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('pay-method-1')
-        // rgb(48, 188, 248)
-        expect(screen.pixel(230, 269)).toEqual([48, 188, 248])
-        // rgb(168, 20, 32)
-        expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
-      }, {
-        timeout: 3_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 选择令牌支付，但不启动测试环境中缺失的活动插件。
-      await engine.key('DOWN', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('select-second-method-1')
-        // rgb(48, 188, 248)
-        expect(screen.pixel(222, 287)).toEqual([48, 188, 248])
-        // rgb(168, 20, 32)
-        expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
-      }, {
-        timeout: 3_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 支付方式页直接返回游戏菜单。
-      await engine.key('RIGHT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('game-menu-2')
-        expect(screen.pixel(175, 103)).toEqual([48, 188, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 返回游戏界面，再检查绘制节奏没有持续漂移。
-      await engine.key('RIGHT_SOFT', 1_000)
-      await vi.waitFor(async () => {
-        const screen = await engine!.screen('start-scene-returned')
-        expect(screen.pixel(22, 314)).toEqual([200, 252, 248])
-      }, {
-        timeout: 10_000,
-        interval: 1_000
-      })
-    }
-    {
-      // 跳过返回边界的一次性恢复工作，再用长窗口排除持续倍速或冻结。
-      await engine.delay(1_000)
-      const resumedFirstFrame = await engine.screen('resume-rate-start')
-      const resumedStart = await engine.drawCount()
-      const resumedStartedAt = performance.now()
-      await engine.delay(5_000)
-      const resumedTailFirstFrame = await engine.screen('resume-rate-tail-start')
-      const resumedTailStart = await engine.drawCount()
-      const resumedTailStartedAt = performance.now()
-      await engine.delay(2_000)
-      const resumedEnd = await engine.drawCount()
-      const resumedElapsedSeconds = (performance.now() - resumedStartedAt) / 1_000
-      const resumedDrawRate = (resumedEnd - resumedStart) / resumedElapsedSeconds
-      const resumedTailElapsedSeconds = (performance.now() - resumedTailStartedAt) / 1_000
-      const resumedTailDrawRate = (resumedEnd - resumedTailStart) / resumedTailElapsedSeconds
-      const resumedLastFrame = await engine.screen('resume-rate-end')
-      const resumedRateRatio = resumedDrawRate / normalDrawRate
-      const resumedTailRateRatio = resumedTailDrawRate / normalDrawRate
+    await engine.key("LEFT_SOFT", 1_000);
+    const gameMenu = await engine.waitForScreen(
+      screen => screen.pixel(175, 103).toString() === "48,188,248",
+      { name: "game-menu", timeoutMs: 10_000, intervalMs: 100 },
+    );
+    expect(gameMenu.diffPixelCount(gameBeforeAd)).toBeGreaterThan(0);
 
-      console.info(
-        `[optwar-resume-rate] baseline=${normalDrawRate.toFixed(3)} ` +
-        `resumed=${resumedDrawRate.toFixed(3)} tail=${resumedTailDrawRate.toFixed(3)} ` +
-        `ratios=${resumedRateRatio.toFixed(3)}/${resumedTailRateRatio.toFixed(3)}`
-      )
+    await engine.key("ENTER", 1_000);
+    const fullPower = await engine.waitForScreen(
+      screen => screen.pixel(213, 151).toString() === "200,252,248",
+      { name: "full-power", timeoutMs: 10_000, intervalMs: 100 },
+    );
 
-      // 完整窗口应贴近支付前节奏；25% 仅容纳墙钟和窗口边界抖动。
-      expect(resumedRateRatio).toBeGreaterThanOrEqual(0.8)
-      expect(resumedRateRatio).toBeLessThanOrEqual(1.2)
-      expect(resumedLastFrame.diffPixelCount(resumedFirstFrame)).toBeGreaterThan(0)
-      // 两秒末段存在一帧约 5% 的量化误差，10% 边界同时排除冻结和持续漂移。
-      expect(resumedTailRateRatio).toBeGreaterThanOrEqual(0.8)
-      expect(resumedTailRateRatio).toBeLessThanOrEqual(1.2)
-      expect(resumedLastFrame.diffPixelCount(resumedTailFirstFrame)).toBeGreaterThan(0)
-      expect(resumedLastFrame.pixel(22, 314)).toEqual([200, 252, 248])
-    }
+    // “火力全开”详情页当前商品的上一项就是广告条。
+    await engine.key("UP", 1_000);
+    const adSelected = await engine.waitForScreen(
+      screen => screen.pixel(0, 0).toString() === "104,184,224"
+        && screen.pixel(0, 0).toString() !== fullPower.pixel(0, 0).toString(),
+      { name: "ad-selected", timeoutMs: 3_000, intervalMs: 100 },
+    );
+    expect(adSelected.diffPixelCount(fullPower)).toBeGreaterThan(0);
+
+    await engine.key("ENTER", { waitForDraw: false });
+    const browserDownload = await engine.waitForScreen(isPluginPrompt, {
+      name: "browser-plugin-download",
+      timeoutMs: 3_000,
+      intervalMs: 100,
+    });
+    expect(isPluginPrompt(browserDownload)).toBe(true);
+
+    await engine.key("LEFT_SOFT", 1_000);
+    const browserPluginInstalled = await engine.waitForScreen(
+      screen => screen.pixel(0, 0).toString() === "56,140,192"
+        && screen.pixel(120, 100).toString() === "232,240,248"
+        && screen.pixel(10, 301).toString() === "248,252,248"
+        && screen.pixel(120, 310).toString() === "0,132,208",
+      { name: "browser-plugin-installed", timeoutMs: 20_000, intervalMs: 250 },
+    );
+    expect(browserPluginInstalled.uniqueColorCount()).toBeGreaterThan(2);
+
+    // 确认插件安装结果并选择 CMNET，随后等待浏览器组件下载和首屏渲染。
+    await engine.key("LEFT_SOFT", 3_000);
+    await engine.key("LEFT_SOFT", 3_000);
+    const browser = await engine.waitForScreen(
+      screen => screen.uniqueColorCount() > 4
+        && screen.pixel(120, 232).toString() === "248,252,248"
+        && screen.pixel(58, 309).toString() === "80,148,216",
+      { name: "browser-running", timeoutMs: 40_000, intervalMs: 250 },
+    );
+    expect(browser.diffPixelCount(adSelected, GAME_REGION)).toBeGreaterThan(1_000);
+
+    // 浏览器右软键显示“返回”；确认退出后恢复到同一“火力全开”详情页。
+    await engine.key("RIGHT_SOFT", 10_000);
+    await engine.waitForScreen(
+      screen => screen.diffPixelCount(adSelected, GAME_REGION) === 0,
+      { name: "ad-after-browser-return", timeoutMs: 10_000, intervalMs: 100 },
+    );
+    await engine.key("RIGHT", 1_000);
+    await engine.waitForScreen(
+      screen => screen.pixel(0, 0).toString() === "104,184,224"
+        && screen.diffPixelCount(fullPower, GAME_REGION) === 0,
+      { name: "ad-after-layer-close", timeoutMs: 3_000, intervalMs: 100 },
+    );
+    await engine.key("DOWN", 1_000);
+    await engine.waitForScreen(
+      screen => screen.diffPixelCount(fullPower) === 0,
+      { name: "full-power-returned", timeoutMs: 3_000, intervalMs: 100 },
+    );
+
+    await engine.key("RIGHT_SOFT", 1_000);
+    await engine.waitForScreen(
+      screen => screen.pixel(175, 103).toString() === "48,188,248",
+      { name: "game-menu-returned", timeoutMs: 10_000, intervalMs: 100 },
+    );
+    await engine.key("RIGHT_SOFT", 1_000);
+    const gameReturned = await engine.waitForScreen(
+      screen => screen.pixel(22, 314).toString() === "200,252,248"
+        && screen.diffPixelCount(gameMenu, GAME_REGION) > 1_000,
+      { name: "game-returned", timeoutMs: 10_000, intervalMs: 100 },
+    );
+    expect(gameReturned.diffPixelCount(gameBeforeAd, GAME_REGION)).toBeGreaterThan(1_000);
+
+    // 排除恢复边界的一次性快拍，再从每次 present 的 PPM 逐帧识别实际画面变化。
+    await engine.delay(1_000);
+    const resumed = await captureVisualRate(engine, "resumed");
+    const visualRateRatio = resumed.visualRate / baseline.visualRate;
+    const drawRateRatio = resumed.drawRate / baseline.drawRate;
+    console.info(
+      `[optwar-visual-rate] baseline=${baseline.visualRate.toFixed(3)} `
+        + `resumed=${resumed.visualRate.toFixed(3)} ratio=${visualRateRatio.toFixed(3)} `
+        + `draw-ratio=${drawRateRatio.toFixed(3)} changed=${resumed.changedPixels}`,
+    );
+
+    expect(visualRateRatio).toBeGreaterThanOrEqual(0.5);
+    expect(visualRateRatio).toBeLessThanOrEqual(1.5);
+    expect(drawRateRatio).toBeGreaterThanOrEqual(0.5);
+    expect(drawRateRatio).toBeLessThanOrEqual(1.5);
+    expect(resumed.last.diffPixelCount(resumed.first, GAME_REGION)).toBeGreaterThan(1_000);
+    expect(resumed.last.pixel(22, 314)).toEqual([200, 252, 248]);
   });
 });

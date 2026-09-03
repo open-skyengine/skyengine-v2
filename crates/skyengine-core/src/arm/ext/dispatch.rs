@@ -140,6 +140,7 @@ impl ExtRuntime {
             }
             31 => {
                 let delay_ms = cpu.register(0);
+                self.discover_compact_repeating_timers();
                 let delay = Duration::from_millis(u64::from(delay_ms));
                 self.timer_deadline = Instant::now().checked_add(delay);
                 self.memory.write_u32(TIMER_ACTIVE_DATA, 1)?;
@@ -1313,6 +1314,12 @@ impl ExtRuntime {
                         None
                     };
                     let image = self.memory.read(address, len as usize)?;
+                    let module_parameter = self.registered_dynamic_image_parameter(
+                        &image,
+                        address,
+                        len,
+                        context_generation,
+                    );
                     if std::env::var_os("SKYENGINE_TRACE_ARM").is_some() {
                         eprintln!(
                             "[arm-executable] address={:#010x} len={len:#x} head={:02x?}",
@@ -1326,14 +1333,19 @@ impl ExtRuntime {
                         self.mtk_native_extension_owner = Some(context_generation);
                     }
                     if let Some((image_index, intervals)) = extended_image {
-                        self.modules[module].dynamic_executable_ranges[image_index]
+                        let image = self.modules[module].dynamic_executable_ranges[image_index]
                             .as_mut()
-                            .expect("compatible dynamic image exists")
-                            .intervals = intervals;
+                            .expect("compatible dynamic image exists");
+                        image.intervals = intervals;
+                        if image.module_parameter.is_none() {
+                            image.module_parameter = module_parameter;
+                        }
                     } else if let Some((vacant_image, id, next_id)) = new_image {
                         let dynamic_image = DynamicExecutableImage {
                             id,
                             intervals: new_intervals,
+                            module_parameter,
+                            compact_repeating_timers: Vec::new(),
                         };
                         self.modules[module].next_dynamic_executable_image_id = next_id;
                         if let Some(image_index) = vacant_image {
