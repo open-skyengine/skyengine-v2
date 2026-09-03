@@ -1452,7 +1452,7 @@ fn native_file_write_rejects_invalid_arguments_before_reading_input() {
 }
 
 #[test]
-fn native_file_open_preserves_package_failure_except_for_the_advbar_bootstrap() {
+fn native_file_open_translates_every_host_failure_to_a_null_handle() {
     let mut runtime =
         ExtRuntime::new(8, 8, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
     let name = runtime.allocate(32, 1).unwrap();
@@ -1460,31 +1460,18 @@ fn native_file_open_preserves_package_failure_except_for_the_advbar_bootstrap() 
     cpu.set_register(0, name.0);
     cpu.set_register(1, 1);
 
-    runtime.memory.write(name, b"missing.bin\0").unwrap();
-    runtime
-        .dispatch(40, 0, &mut cpu, &mut StubServices)
-        .unwrap();
-    assert_eq!(cpu.register(0), 0);
-
-    runtime
-        .memory
-        .write(name, b"C:\\mythroad\\plugins\\ADVBAR.MRP\0")
-        .unwrap();
-    cpu.set_register(0, name.0);
-    runtime
-        .dispatch(40, 0, &mut cpu, &mut StubServices)
-        .unwrap();
-    assert_eq!(cpu.register(0), 0);
-
-    runtime
-        .memory
-        .write(name, b"plugins\\missing.MRP\0")
-        .unwrap();
-    cpu.set_register(0, name.0);
-    runtime
-        .dispatch(40, 0, &mut cpu, &mut StubServices)
-        .unwrap();
-    assert_eq!(cpu.register(0), u32::MAX);
+    for missing in [
+        b"missing.bin\0".as_slice(),
+        b"plugins/missing.mrp\0".as_slice(),
+        b"C:\\data\\missing\0".as_slice(),
+    ] {
+        runtime.memory.write(name, missing).unwrap();
+        cpu.set_register(0, name.0);
+        runtime
+            .dispatch(40, 0, &mut cpu, &mut StubServices)
+            .unwrap();
+        assert_eq!(cpu.register(0), 0);
+    }
 
     runtime.memory.write(name, b"opened.bin\0").unwrap();
     cpu.set_register(0, name.0);

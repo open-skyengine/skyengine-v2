@@ -544,7 +544,7 @@ impl ExtRuntime {
                 let name = self.read_c_string(GuestAddr(cpu.register(0)), 1024)?;
                 let mode = cpu.register(1);
                 let result = services.open_file(&name, mode)?;
-                cpu.set_register(0, native_file_open_result(&name, result));
+                cpu.set_register(0, native_file_open_result(result));
             }
             41 => {
                 cpu.set_register(0, services.close_file(cpu.register(0) as i32)? as u32);

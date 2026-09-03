@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SkyEngineE2e, SkyEngineWorkspace } from "../engine-e2e.js";
+import { isPluginPrompt } from "./visual.js";
 import fs from "fs";
 
 describe("optwar", () => {
@@ -13,7 +14,7 @@ describe("optwar", () => {
     ws = undefined;
   });
 
-  it("无支付后端时重复选择令牌", async () => {
+  it("缺少活动插件时可提示并返回", async () => {
     // 每个用例使用独立的 mythroad 数据副本,避免并发执行时互相覆盖插件/缓存/存档。
     ws = await SkyEngineWorkspace.create();
     // 删除后，继续游戏会进入下载netpay插件界面。
@@ -24,6 +25,7 @@ describe("optwar", () => {
     if (!fs.existsSync(ws.path('mythroad/plugins/advbar.mrp'))) {
       fs.cpSync('test/fixtures/plugins/advbar.mrp', ws.path('mythroad/plugins/advbar.mrp'));
     }
+    fs.rmSync(ws.path('mythroad/plugins/freecurr.mrp'), { force: true });
     engine = await SkyEngineE2e.start("test/fixtures/optwar.mrp", { workDir: ws.dir });
 
     await engine.delay(2000);
@@ -116,26 +118,33 @@ describe("optwar", () => {
     {
       // 选择令牌支付
       await engine.key('DOWN', 1_000)
-      await vi.waitFor(async () => {
+      const selectedPayment = await vi.waitFor(async () => {
         const screen = await engine!.screen('select-second-method-1')
         // rgb(48, 188, 248)
         expect(screen.pixel(222, 287)).toEqual([48, 188, 248])
         // rgb(168, 20, 32)
         expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
+        return screen
       }, {
         timeout: 3_000,
         interval: 1_000
       })
-    }
-    // Headless 运行时没有支付提供者。重复确认必须快速返回，并保持令牌项选中，
-    // 不能伪造支付成功或把主线程留在一次未完成的插件回调中。
-    for (let attempt = 1; attempt <= 4; attempt++) {
-      const startedAt = performance.now()
-      await engine.key('ENTER', 1_000)
-      const screen = await engine.screen(`token-unavailable-${attempt}`)
-      expect(screen.pixel(222, 287)).toEqual([48, 188, 248])
-      expect(screen.pixel(230, 20)).toEqual([168, 20, 32])
-      expect(performance.now() - startedAt).toBeLessThan(1_000)
+
+      // 提示可能在 KEY 响应的绘图基线之后才由异步回调完成，因此由完整画面
+      // 识别等待目标状态，期间不能再发送一次确认键。
+      await engine.key('ENTER', { waitForDraw: false })
+      const activity = await engine.waitForScreen(isPluginPrompt, {
+        name: 'free-currency-activity',
+        timeoutMs: 3_000,
+        intervalMs: 100,
+      })
+      expect(isPluginPrompt(activity)).toBe(true)
+
+      await engine.key('RIGHT_SOFT', 3_000)
+      await engine.waitForScreen(
+        screen => screen.diffPixelCount(selectedPayment, { x: 0, y: 40, width: 240, height: 280 }) === 0,
+        { name: 'payment-after-activity-cancel', timeoutMs: 3_000, intervalMs: 100 },
+      )
     }
   });
   it("广告选项可选择并返回", async () => {
