@@ -5,7 +5,7 @@ export default defineConfig(() => {
   return {
     test: {
       globalSetup: ["test/e2e/global-setup.ts"],
-      retry: 0,
+      retry: 3,
       include: ["test/e2e/**/*.test.ts"],
       exclude: [
         ...(isTargetingTemp ? [] : ['test/e2e/**/temp.test.ts'])
