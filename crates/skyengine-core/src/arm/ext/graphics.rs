@@ -568,7 +568,7 @@ impl ExtRuntime {
         self.present_screen(services)
     }
 
-    fn platform_screen_byte_len(&self) -> Result<usize> {
+    pub(super) fn platform_screen_byte_len(&self) -> Result<usize> {
         let (width, height) = self.screen_dimensions()?;
         usize::try_from(width)
             .ok()
@@ -581,7 +581,10 @@ impl ExtRuntime {
             .ok_or_else(|| Error::Abi("platform UI screen size overflow".into()))
     }
 
-    fn capture_platform_screen(&self, services: &mut dyn NativeServices) -> Result<Vec<u8>> {
+    pub(super) fn capture_platform_screen(
+        &self,
+        services: &mut dyn NativeServices,
+    ) -> Result<Vec<u8>> {
         let expected_len = self.platform_screen_byte_len()?;
         let Some(screen) = services.capture_framebuffer()? else {
             return self.memory.read(self.screen_base, expected_len);
@@ -1069,7 +1072,66 @@ impl ExtRuntime {
         }
     }
 
-    pub(super) fn present_screen(&self, services: &mut dyn NativeServices) -> Result<()> {
+    fn record_presented_screen_region(&mut self, x: i32, y: i32, width: usize, height: usize) {
+        // A draw is authoritative parent output only after the top modal frame's
+        // validated suspend witnesses have all finished.
+        let returning_from_modal = self.modal_screens.last().is_some_and(|state| {
+            state
+                .active
+                .iter()
+                .all(|key| self.modal_screen_key_status(*key) != ModalScreenKeyStatus::Active)
+        });
+        if !returning_from_modal || self.presented_screen_pixels.is_none() {
+            return;
+        }
+        let (screen_width, screen_height) = (
+            i32::from(self.display_width),
+            i32::from(self.display_height),
+        );
+        let presented = self
+            .presented_screen_pixels
+            .as_mut()
+            .expect("presented pixel tracking was checked");
+        if i32::from(presented.width) != screen_width
+            || i32::from(presented.height) != screen_height
+        {
+            presented.compatible = false;
+            return;
+        }
+        let screen_width = i64::from(screen_width);
+        let screen_height = i64::from(screen_height);
+        let width = i64::try_from(width).unwrap_or(i64::MAX);
+        let height = i64::try_from(height).unwrap_or(i64::MAX);
+        let x0 = i64::from(x).clamp(0, screen_width);
+        let y0 = i64::from(y).clamp(0, screen_height);
+        let x1 = i64::from(x).saturating_add(width).clamp(0, screen_width);
+        let y1 = i64::from(y).saturating_add(height).clamp(0, screen_height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let stride = usize::from(presented.width);
+        for row in y0 as usize..y1 as usize {
+            let start = row * stride + x0 as usize;
+            let end = row * stride + x1 as usize;
+            presented.dirty[start..end].fill(true);
+        }
+    }
+
+    pub(super) fn draw_platform_bitmap(
+        &mut self,
+        pixels: &[u8],
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        services.draw_bitmap(pixels, x, y, width, height)?;
+        self.record_presented_screen_region(x, y, width, height);
+        Ok(())
+    }
+
+    pub(super) fn present_screen(&mut self, services: &mut dyn NativeServices) -> Result<()> {
         let (width, height) = self.screen_dimensions()?;
         let byte_len = usize::try_from(width)
             .ok()
@@ -1081,7 +1143,7 @@ impl ExtRuntime {
             .and_then(|pixels| pixels.checked_mul(2))
             .ok_or_else(|| Error::Abi("screen presentation size overflow".into()))?;
         let pixels = self.memory.read(self.screen_base, byte_len)?;
-        services.draw_bitmap(&pixels, 0, 0, width as usize, height as usize)
+        self.draw_platform_bitmap(&pixels, 0, 0, width as usize, height as usize, services)
     }
 
     pub(super) fn read_platform_draw_pixels(
@@ -1625,11 +1687,7 @@ impl ExtRuntime {
         landscape: bool,
         services: &mut dyn NativeServices,
     ) -> Result<()> {
-        let (width, height) = self.screen_dimensions()?;
-        let width = u16::try_from(width)
-            .map_err(|_| Error::Abi(format!("screen width {width} exceeds u16")))?;
-        let height = u16::try_from(height)
-            .map_err(|_| Error::Abi(format!("screen height {height} exceeds u16")))?;
+        let (width, height) = (self.display_width, self.display_height);
         let short = width.min(height);
         let long = width.max(height);
         let (width, height) = if landscape {
@@ -1637,9 +1695,7 @@ impl ExtRuntime {
         } else {
             (short, long)
         };
-        if self.screen_dimensions()? == (i32::from(width), i32::from(height)) {
-            return Ok(());
-        }
+        let resize_display = (self.display_width, self.display_height) != (width, height);
 
         let byte_len = usize::from(width)
             .checked_mul(usize::from(height))
@@ -1650,8 +1706,14 @@ impl ExtRuntime {
             .check_range(self.screen_base, byte_len as usize, Permissions::READ_WRITE)?;
         let bitmap_table = GuestAddr(self.memory.read_u32(table_slot_address(95))?);
         let screen_bitmap = bitmap_table.checked_add(SCREEN_BITMAP_ID * BITMAP_ENTRY_SIZE)?;
+        self.memory
+            .check_range(screen_bitmap, 8, Permissions::READ_WRITE)?;
 
-        services.resize_screen(width, height)?;
+        if resize_display {
+            services.resize_screen(width, height)?;
+            self.display_width = width;
+            self.display_height = height;
+        }
         self.memory
             .write_u32(data_slot_address(92), u32::from(width))?;
         self.memory
@@ -1661,7 +1723,10 @@ impl ExtRuntime {
             .write_u16(screen_bitmap.checked_add(2)?, height)?;
         self.memory
             .write_u32(screen_bitmap.checked_add(4)?, byte_len)?;
-        self.present_screen(services)
+        if resize_display {
+            self.present_screen(services)?;
+        }
+        Ok(())
     }
 
     pub(super) fn screen_address(&self, x: i32, y: i32, width: i32) -> Result<GuestAddr> {

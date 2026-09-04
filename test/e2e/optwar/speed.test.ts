@@ -154,7 +154,7 @@ describe("optwar", () => {
     // 不下载插件，立即取消提示并返回底层支付方式页。
     await engine.key("RIGHT_SOFT", 3_000);
     await engine.waitForScreen(
-      screen => screen.diffPixelCount(tokenPayment, GAME_REGION) === 0,
+      screen => screen.diffPixelCount(tokenPayment) === 0,
       { name: "payment-after-plugin-cancel", timeoutMs: 3_000, intervalMs: 100 },
     );
 

@@ -142,7 +142,7 @@ describe("optwar", () => {
 
       await engine.key('RIGHT_SOFT', 3_000)
       await engine.waitForScreen(
-        screen => screen.diffPixelCount(selectedPayment, { x: 0, y: 40, width: 240, height: 280 }) === 0,
+        screen => screen.diffPixelCount(selectedPayment) === 0,
         { name: 'payment-after-activity-cancel', timeoutMs: 3_000, intervalMs: 100 },
       )
     }

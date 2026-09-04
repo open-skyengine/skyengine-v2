@@ -1043,6 +1043,7 @@ fn platform_screen_mode_updates_dimensions_and_screen_bitmap() {
         .unwrap();
     assert_eq!(cpu.register(0), 0);
     assert_eq!(runtime.screen_dimensions().unwrap(), (480, 320));
+    assert_eq!((runtime.display_width, runtime.display_height), (480, 320));
     assert_eq!(runtime.memory.read_u16(screen_bitmap).unwrap(), 480);
     assert_eq!(
         runtime
@@ -1059,6 +1060,32 @@ fn platform_screen_mode_updates_dimensions_and_screen_bitmap() {
         320 * 480 * 2
     );
 
+    // Some legacy apps reuse the guest-visible dimension slots for layout state.
+    // Reasserting the current orientation must use the host display geometry and
+    // repair the ABI slots instead of resizing the host to those transient values.
+    runtime.memory.write_u32(data_slot_address(92), 19).unwrap();
+    runtime.memory.write_u32(data_slot_address(93), 21).unwrap();
+    runtime.memory.write_u16(screen_bitmap, 19).unwrap();
+    runtime
+        .memory
+        .write_u16(screen_bitmap.checked_add(2).unwrap(), 21)
+        .unwrap();
+    cpu.set_register(0, 101);
+    cpu.set_register(1, 3);
+    runtime
+        .dispatch(37, 0, &mut cpu, &mut StubServices)
+        .unwrap();
+    assert_eq!(runtime.screen_dimensions().unwrap(), (480, 320));
+    assert_eq!((runtime.display_width, runtime.display_height), (480, 320));
+    assert_eq!(runtime.memory.read_u16(screen_bitmap).unwrap(), 480);
+    assert_eq!(
+        runtime
+            .memory
+            .read_u16(screen_bitmap.checked_add(2).unwrap())
+            .unwrap(),
+        320
+    );
+
     cpu.set_register(0, 101);
     cpu.set_register(1, 0);
     runtime
@@ -1066,6 +1093,7 @@ fn platform_screen_mode_updates_dimensions_and_screen_bitmap() {
         .unwrap();
     assert_eq!(cpu.register(0), 0);
     assert_eq!(runtime.screen_dimensions().unwrap(), (320, 480));
+    assert_eq!((runtime.display_width, runtime.display_height), (320, 480));
     assert_eq!(runtime.memory.read_u16(screen_bitmap).unwrap(), 320);
     assert_eq!(
         runtime

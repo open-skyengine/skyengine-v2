@@ -68,6 +68,7 @@ const COMPACT_TIMER_TAIL_OFFSET: u32 = 0x18;
 const COMPACT_TIMER_NODE_LEN: usize = 0x1c;
 const MAX_COMPACT_TIMER_POINTER_SCAN_LEN: usize = 1024 * 1024;
 const MAX_TRACKED_COMPACT_TIMERS: usize = 1024;
+const MAX_MODAL_SCREEN_DEPTH: usize = 16;
 const APPLICATION_STATE_NORMAL: u32 = 1;
 const APPLICATION_STATE_RESTART_PENDING: u32 = 3;
 const PLATFORM_SIM_INFO_DATA: GuestAddr = GuestAddr(0x0100_1a00);
@@ -364,6 +365,43 @@ struct ModalTimerObservation {
     timers: ModalRepeatingTimers,
 }
 
+type ModalStateKey = (u64, u64, GuestAddr);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ModalTimerTransitions {
+    entered: BTreeSet<ModalStateKey>,
+    left: BTreeSet<ModalStateKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModalScreenState {
+    active: BTreeSet<ModalStateKey>,
+    previous_screen: PlatformScreenSnapshot,
+    pending_return_screen: Option<PlatformScreenSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlatformScreenSnapshot {
+    width: u16,
+    height: u16,
+    pixels: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PresentedScreenPixels {
+    width: u16,
+    height: u16,
+    dirty: Vec<bool>,
+    compatible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModalScreenKeyStatus {
+    Active,
+    Finished,
+    Unavailable,
+}
+
 impl PartialEq<Option<ExecutableRange>> for DynamicExecutableImageSlot {
     fn eq(&self, other: &Option<ExecutableRange>) -> bool {
         match (self.as_ref(), other) {
@@ -643,6 +681,8 @@ pub(crate) struct ExtRuntime {
     heap_len: usize,
     screen_base: GuestAddr,
     screen_memory_len: usize,
+    display_width: u16,
+    display_height: u16,
     guest_allocations: BTreeMap<u32, u32>,
     guest_allocation_owners: BTreeMap<u32, u64>,
     guest_allocation_views: BTreeMap<u32, GuestAllocationView>,
@@ -681,6 +721,8 @@ pub(crate) struct ExtRuntime {
     timer_deadline: Option<Instant>,
     compact_timer_scan_cursor: usize,
     modal_repeating_timers: Vec<ModalRepeatingTimers>,
+    modal_screens: Vec<ModalScreenState>,
+    presented_screen_pixels: Option<PresentedScreenPixels>,
     motion_active: bool,
 }
 
@@ -875,6 +917,8 @@ impl ExtRuntime {
             heap_len,
             screen_base,
             screen_memory_len,
+            display_width: screen_width,
+            display_height: screen_height,
             guest_allocations: BTreeMap::new(),
             guest_allocation_owners: BTreeMap::new(),
             guest_allocation_views: BTreeMap::new(),
@@ -913,6 +957,8 @@ impl ExtRuntime {
             timer_deadline: None,
             compact_timer_scan_cursor: 0,
             modal_repeating_timers: Vec::new(),
+            modal_screens: Vec::new(),
+            presented_screen_pixels: None,
             motion_active: false,
         })
     }
@@ -1555,7 +1601,7 @@ impl ExtRuntime {
         states
     }
 
-    fn modal_timer_key(timers: &ModalRepeatingTimers) -> (u64, u64, GuestAddr) {
+    fn modal_timer_key(timers: &ModalRepeatingTimers) -> ModalStateKey {
         (timers.owner_generation, timers.image_id, timers.parameter)
     }
 
@@ -1625,11 +1671,15 @@ impl ExtRuntime {
     fn finish_modal_timer_observations(
         &mut self,
         before: Vec<ModalTimerObservation>,
-    ) -> Result<()> {
+    ) -> Result<ModalTimerTransitions> {
+        let mut transitions = ModalTimerTransitions::default();
         for before in before {
             let key = Self::modal_timer_key(&before.timers);
             if !self.modal_timer_state_is_live(&before.timers) {
                 self.remove_modal_timer_state(key);
+                if before.depth > 0 {
+                    transitions.left.insert(key);
+                }
                 continue;
             }
             let Some(depth_after) = self.compact_timer_suspend_depth(
@@ -1642,6 +1692,7 @@ impl ExtRuntime {
                 continue;
             };
             if before.depth == 0 && depth_after > 0 {
+                transitions.entered.insert(key);
                 if !self
                     .modal_repeating_timers
                     .iter()
@@ -1650,15 +1701,268 @@ impl ExtRuntime {
                 {
                     self.modal_repeating_timers.push(before.timers);
                 }
-            } else if before.depth > 0
-                && depth_after == 0
-                && let Some(timers) = self.remove_modal_timer_state(key)
-                && self.modal_timer_state_is_live(&timers)
-            {
-                self.restore_compact_repeating_timers(&timers)?;
+            } else if before.depth > 0 && depth_after == 0 {
+                transitions.left.insert(key);
+                if let Some(timers) = self.remove_modal_timer_state(key)
+                    && self.modal_timer_state_is_live(&timers)
+                {
+                    self.restore_compact_repeating_timers(&timers)?;
+                }
             }
         }
-        Ok(())
+        Ok(transitions)
+    }
+
+    fn compose_modal_return_screen(
+        mut previous_screen: PlatformScreenSnapshot,
+        screen_after_call: PlatformScreenSnapshot,
+        presented: Option<&PresentedScreenPixels>,
+    ) -> PlatformScreenSnapshot {
+        let compatible = presented.is_some_and(|presented| {
+            presented.compatible
+                && previous_screen.width == screen_after_call.width
+                && previous_screen.height == screen_after_call.height
+                && presented.width == screen_after_call.width
+                && presented.height == screen_after_call.height
+                && presented.dirty.len()
+                    == usize::from(screen_after_call.width)
+                        .saturating_mul(usize::from(screen_after_call.height))
+                && previous_screen.pixels.len() == screen_after_call.pixels.len()
+        });
+        if !compatible {
+            return screen_after_call;
+        }
+        let presented = presented.expect("compatible presented pixels were checked");
+        if !previous_screen.pixels.len().is_multiple_of(2) {
+            return screen_after_call;
+        }
+        for (index, dirty) in presented.dirty.iter().copied().enumerate() {
+            if dirty {
+                let offset = index * 2;
+                previous_screen.pixels[offset..offset + 2]
+                    .copy_from_slice(&screen_after_call.pixels[offset..offset + 2]);
+            }
+        }
+        previous_screen
+    }
+
+    fn capture_modal_screen_snapshot(
+        &self,
+        services: &mut dyn NativeServices,
+    ) -> Result<PlatformScreenSnapshot> {
+        let (width, height) = (self.display_width, self.display_height);
+        let expected_len = self.display_screen_byte_len()?;
+        let pixels = match services.capture_framebuffer()? {
+            Some(screen) if screen.len() == expected_len => screen,
+            Some(screen) => {
+                return Err(Error::Abi(format!(
+                    "captured framebuffer is {} bytes, expected {expected_len} for host display {width}x{height}",
+                    screen.len(),
+                )));
+            }
+            None => self.memory.read(self.screen_base, expected_len)?,
+        };
+        Ok(PlatformScreenSnapshot {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    fn display_screen_byte_len(&self) -> Result<usize> {
+        usize::from(self.display_width)
+            .checked_mul(usize::from(self.display_height))
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or_else(|| Error::Abi("host display buffer size overflow".into()))
+    }
+
+    fn modal_screen_key_status(&self, key: ModalStateKey) -> ModalScreenKeyStatus {
+        let (owner_generation, image_id, parameter) = key;
+        let Some(image) = self
+            .modules
+            .iter()
+            .find(|module| module.generation == owner_generation)
+            .and_then(|module| {
+                module
+                    .dynamic_executable_ranges
+                    .iter()
+                    .filter_map(DynamicExecutableImageSlot::as_ref)
+                    .find(|image| image.id == image_id)
+            })
+        else {
+            return ModalScreenKeyStatus::Finished;
+        };
+        if image.module_parameter != Some(parameter) {
+            return ModalScreenKeyStatus::Finished;
+        }
+        match self.compact_timer_suspend_depth(parameter, owner_generation) {
+            Some(0) => ModalScreenKeyStatus::Finished,
+            Some(_) => ModalScreenKeyStatus::Active,
+            None => ModalScreenKeyStatus::Unavailable,
+        }
+    }
+
+    fn restore_modal_screen(
+        &mut self,
+        screen: PlatformScreenSnapshot,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        if screen.width != self.display_width
+            || screen.height != self.display_height
+            || screen.pixels.len() != self.display_screen_byte_len()?
+        {
+            return Ok(());
+        }
+        self.memory.write(self.screen_base, &screen.pixels)?;
+        self.draw_platform_bitmap(
+            &screen.pixels,
+            0,
+            0,
+            usize::from(screen.width),
+            usize::from(screen.height),
+            services,
+        )
+    }
+
+    fn refresh_modal_screen_states(&mut self, services: &mut dyn NativeServices) -> Result<()> {
+        let active = self
+            .modal_screens
+            .iter()
+            .enumerate()
+            .flat_map(|(index, state)| state.active.iter().copied().map(move |key| (index, key)))
+            .collect::<Vec<_>>();
+        let finished = active
+            .iter()
+            .copied()
+            .filter(|(_, key)| self.modal_screen_key_status(*key) == ModalScreenKeyStatus::Finished)
+            .collect::<Vec<_>>();
+        let resumed = active
+            .into_iter()
+            .filter(|(_, key)| self.modal_screen_key_status(*key) == ModalScreenKeyStatus::Active)
+            .map(|(index, _)| index)
+            .collect::<BTreeSet<_>>();
+        for index in resumed {
+            if let Some(state) = self.modal_screens.get_mut(index) {
+                state.pending_return_screen = None;
+            }
+        }
+        for (index, key) in finished {
+            if let Some(state) = self.modal_screens.get_mut(index) {
+                state.active.remove(&key);
+            }
+        }
+        let mut restore = None;
+        while self
+            .modal_screens
+            .last()
+            .is_some_and(|state| state.active.is_empty())
+        {
+            restore = self
+                .modal_screens
+                .pop()
+                .map(|state| state.pending_return_screen.unwrap_or(state.previous_screen));
+        }
+        match restore {
+            Some(screen) => self.restore_modal_screen(screen, services),
+            None => Ok(()),
+        }
+    }
+
+    fn finish_modal_screen_transition(
+        &mut self,
+        transitions: ModalTimerTransitions,
+        screen_before_modal: Option<PlatformScreenSnapshot>,
+        presented: Option<PresentedScreenPixels>,
+        services: &mut dyn NativeServices,
+    ) -> Result<()> {
+        let tracked = self
+            .modal_screens
+            .iter()
+            .flat_map(|state| state.active.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let entered = transitions
+            .entered
+            .difference(&tracked)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if !entered.is_empty()
+            && self.modal_screens.len() < MAX_MODAL_SCREEN_DEPTH
+            && let Some(previous_screen) = screen_before_modal
+        {
+            self.modal_screens.push(ModalScreenState {
+                active: entered,
+                previous_screen,
+                pending_return_screen: None,
+            });
+        }
+        for key in transitions.left {
+            for state in &mut self.modal_screens {
+                state.active.remove(&key);
+            }
+        }
+        if !self
+            .modal_screens
+            .last()
+            .is_some_and(|state| state.active.is_empty())
+        {
+            let statuses = self
+                .modal_screens
+                .last()
+                .map(|state| {
+                    state
+                        .active
+                        .iter()
+                        .copied()
+                        .map(|key| self.modal_screen_key_status(key))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if statuses.contains(&ModalScreenKeyStatus::Active) {
+                if let Some(state) = self.modal_screens.last_mut() {
+                    state.pending_return_screen = None;
+                }
+            } else if presented.as_ref().is_some_and(|presented| {
+                !presented.compatible || presented.dirty.iter().any(|dirty| *dirty)
+            }) {
+                let screen_after_call = self.capture_modal_screen_snapshot(services)?;
+                let state = self
+                    .modal_screens
+                    .last_mut()
+                    .expect("active modal screen state was checked");
+                let previous_screen = state
+                    .pending_return_screen
+                    .take()
+                    .unwrap_or_else(|| state.previous_screen.clone());
+                state.pending_return_screen = Some(Self::compose_modal_return_screen(
+                    previous_screen,
+                    screen_after_call,
+                    presented.as_ref(),
+                ));
+            }
+            return Ok(());
+        }
+        let screen_after_call = self.capture_modal_screen_snapshot(services)?;
+        let mut restore = None;
+        while self
+            .modal_screens
+            .last()
+            .is_some_and(|state| state.active.is_empty())
+        {
+            let state = self
+                .modal_screens
+                .pop()
+                .expect("empty modal screen state was checked");
+            let previous_screen = state.pending_return_screen.unwrap_or(state.previous_screen);
+            restore = Some(Self::compose_modal_return_screen(
+                previous_screen,
+                screen_after_call.clone(),
+                presented.as_ref(),
+            ));
+        }
+        match restore {
+            Some(screen) => self.restore_modal_screen(screen, services),
+            None => Ok(()),
+        }
     }
 
     fn active_helper_output(
@@ -2446,9 +2750,42 @@ impl ExtRuntime {
         services: &mut dyn NativeServices,
     ) -> Result<u32> {
         let modal_timer_before = self.modal_timer_observations()?;
+        self.refresh_modal_screen_states(services)?;
+        let tracked = self
+            .modal_screens
+            .iter()
+            .flat_map(|state| state.active.iter().copied())
+            .collect::<BTreeSet<_>>();
+        // Depth lives in guest memory, so this is a candidate captured at the
+        // host-call boundary and is committed only after observing a 0 -> N change.
+        let modal_screen_candidate = modal_timer_before.iter().any(|observation| {
+            observation.depth == 0
+                && !tracked.contains(&Self::modal_timer_key(&observation.timers))
+                && self.modal_screens.len() < MAX_MODAL_SCREEN_DEPTH
+        });
+        let screen_before_modal = modal_screen_candidate
+            .then(|| self.capture_modal_screen_snapshot(services))
+            .transpose()?;
         let execution = self.prepare_guest_execution(function, registers, stack_arguments)?;
-        let return_value = self.run_guest_execution(execution, services)?;
-        self.finish_modal_timer_observations(modal_timer_before)?;
+        self.presented_screen_pixels = if self.modal_screens.is_empty() {
+            None
+        } else {
+            let (width, height) = (self.display_width, self.display_height);
+            let pixel_count = usize::from(width)
+                .checked_mul(usize::from(height))
+                .ok_or_else(|| Error::Abi("presented screen mask size overflow".into()))?;
+            Some(PresentedScreenPixels {
+                width,
+                height,
+                dirty: vec![false; pixel_count],
+                compatible: true,
+            })
+        };
+        let result = self.run_guest_execution(execution, services);
+        let presented = self.presented_screen_pixels.take();
+        let return_value = result?;
+        let transitions = self.finish_modal_timer_observations(modal_timer_before)?;
+        self.finish_modal_screen_transition(transitions, screen_before_modal, presented, services)?;
         Ok(return_value)
     }
 

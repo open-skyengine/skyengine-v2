@@ -898,6 +898,199 @@ fn modal_return_restores_only_the_repeating_timer_period() {
 }
 
 #[test]
+fn modal_screen_composition_preserves_exactly_the_pixels_presented_on_return() {
+    let pixels = |values: &[u16]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let previous = PlatformScreenSnapshot {
+        width: 3,
+        height: 2,
+        pixels: pixels(&[1, 2, 3, 4, 5, 6]),
+    };
+    let returned = PlatformScreenSnapshot {
+        width: 3,
+        height: 2,
+        pixels: pixels(&[9, 8, 7, 6, 5, 4]),
+    };
+    let presented = PresentedScreenPixels {
+        width: 3,
+        height: 2,
+        // Pixel 0 models a same-color write: a before/after diff could miss it,
+        // while the platform presentation boundary records it authoritatively.
+        dirty: vec![true, true, false, false, true, false],
+        compatible: true,
+    };
+
+    let composed = ExtRuntime::compose_modal_return_screen(
+        previous.clone(),
+        returned.clone(),
+        Some(&presented),
+    );
+    assert_eq!(composed.pixels, pixels(&[9, 8, 3, 4, 5, 6]));
+
+    let rotated = PlatformScreenSnapshot {
+        width: 2,
+        height: 3,
+        pixels: previous.pixels,
+    };
+    assert_eq!(
+        ExtRuntime::compose_modal_return_screen(rotated, returned.clone(), Some(&presented)),
+        returned
+    );
+}
+
+#[test]
+fn modal_screen_capture_uses_host_geometry_when_guest_reuses_dimension_slots() {
+    let mut runtime =
+        ExtRuntime::new(240, 320, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    runtime.memory.write_u32(data_slot_address(92), 19).unwrap();
+    runtime.memory.write_u32(data_slot_address(93), 21).unwrap();
+    let host_screen = vec![0x5a; 240 * 320 * 2];
+    let _capture = capture_stub_framebuffer(host_screen.clone());
+
+    let snapshot = runtime
+        .capture_modal_screen_snapshot(&mut StubServices)
+        .unwrap();
+
+    assert_eq!((snapshot.width, snapshot.height), (240, 320));
+    assert_eq!(snapshot.pixels, host_screen);
+    assert_eq!(runtime.screen_dimensions().unwrap(), (19, 21));
+
+    let restored_screen = vec![0xa5; 240 * 320 * 2];
+    runtime
+        .restore_modal_screen(
+            PlatformScreenSnapshot {
+                width: 240,
+                height: 320,
+                pixels: restored_screen.clone(),
+            },
+            &mut StubServices,
+        )
+        .unwrap();
+    assert_eq!(
+        STUB_FRAMEBUFFER.with(|framebuffer| framebuffer.borrow().clone()),
+        Some(restored_screen.clone())
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read(runtime.screen_base, restored_screen.len())
+            .unwrap(),
+        restored_screen
+    );
+    assert_eq!(runtime.screen_dimensions().unwrap(), (19, 21));
+}
+
+#[test]
+fn modal_screen_keeps_return_draws_while_suspend_state_is_temporarily_unavailable() {
+    let pixels = |values: &[u16]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let mut runtime =
+        ExtRuntime::new(2, 2, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
+    load_test_module(&mut runtime);
+    let owner_generation = runtime.modules[0].generation;
+    let parameter = runtime
+        .allocate_guest_block_for_module(MODULE_PARAMETER_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let ext_chunk = runtime
+        .allocate_guest_block_for_module(EXT_CHUNK_TIMER_STATE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write(parameter, &[0; MODULE_PARAMETER_LEN])
+        .unwrap();
+    runtime
+        .memory
+        .write(ext_chunk, &[0; EXT_CHUNK_TIMER_STATE_LEN])
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            parameter
+                .checked_add(MODULE_PARAMETER_EXT_CHUNK_OFFSET)
+                .unwrap(),
+            ext_chunk.0,
+        )
+        .unwrap();
+    runtime.modules[0]
+        .dynamic_executable_ranges
+        .push(DynamicExecutableImageSlot(Some(DynamicExecutableImage {
+            id: 7,
+            intervals: Vec::new(),
+            module_parameter: Some(parameter),
+            compact_repeating_timers: Vec::new(),
+        })));
+    let key = (owner_generation, 7, parameter);
+    runtime.modal_screens.push(ModalScreenState {
+        active: [key].into_iter().collect(),
+        previous_screen: PlatformScreenSnapshot {
+            width: 2,
+            height: 2,
+            pixels: pixels(&[1, 2, 3, 4]),
+        },
+        pending_return_screen: None,
+    });
+
+    // The image remains registered but its extChunk magic is temporarily hidden.
+    // Preserve the one pixel actually presented by this uncertain return call.
+    let returned = pixels(&[9, 8, 9, 9]);
+    let _capture = capture_stub_framebuffer(returned);
+    runtime
+        .finish_modal_screen_transition(
+            ModalTimerTransitions::default(),
+            None,
+            Some(PresentedScreenPixels {
+                width: 2,
+                height: 2,
+                dirty: vec![false, true, false, false],
+                compatible: true,
+            }),
+            &mut StubServices,
+        )
+        .unwrap();
+    assert_eq!(runtime.modal_screens.len(), 1);
+    assert_eq!(
+        runtime.modal_screens[0]
+            .pending_return_screen
+            .as_ref()
+            .unwrap()
+            .pixels,
+        pixels(&[1, 8, 3, 4])
+    );
+
+    runtime
+        .memory
+        .write_u32(ext_chunk, EXT_CHUNK_MAGIC)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(
+            ext_chunk
+                .checked_add(EXT_CHUNK_SUSPEND_DEPTH_OFFSET)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+    runtime
+        .refresh_modal_screen_states(&mut StubServices)
+        .unwrap();
+    assert!(runtime.modal_screens.is_empty());
+    assert_eq!(
+        runtime.memory.read(SCREEN_BASE, 2 * 2 * 2).unwrap(),
+        pixels(&[1, 8, 3, 4])
+    );
+}
+
+#[test]
 fn gzip_guest_call_recovers_the_platform_screen_buffer_capacity_from_abi_data() {
     let mut runtime =
         ExtRuntime::new(13, 9, b"test.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32).unwrap();
