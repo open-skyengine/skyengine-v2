@@ -13,6 +13,7 @@ impl ExtRuntime {
         }
         self.memory
             .write(context.checked_add(MD5_BUFFER_OFFSET)?, &[0; 64])
+            .map_err(Error::from)
     }
 
     pub(super) fn md5_append(&mut self, context: GuestAddr, input: &[u8]) -> Result<()> {
@@ -43,6 +44,7 @@ impl ExtRuntime {
         }
         self.memory
             .write(context.checked_add(MD5_BUFFER_OFFSET)?, &buffer)
+            .map_err(Error::from)
     }
 
     pub(super) fn md5_finish(&mut self, context: GuestAddr, output: GuestAddr) -> Result<()> {
@@ -75,7 +77,7 @@ impl ExtRuntime {
         for (chunk, value) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
-        self.memory.write(output, &digest)
+        self.memory.write(output, &digest).map_err(Error::from)
     }
 }
 

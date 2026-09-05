@@ -222,6 +222,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "skyengine-arm"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "skyengine-core"
 version = "0.1.0"
 dependencies = [
@@ -231,6 +238,7 @@ dependencies = [
  "midly",
  "rustysynth",
  "serde",
+ "skyengine-arm",
  "symphonia",
  "thiserror",
 ]

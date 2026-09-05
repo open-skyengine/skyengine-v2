@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+skyengine-arm = { path = "../skyengine-arm" }
 encoding_rs.workspace = true
 flate2.workspace = true
 jpeg-decoder.workspace = true

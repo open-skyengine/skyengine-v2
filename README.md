@@ -31,6 +31,22 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## ARM 模拟模块
+
+`crates/skyengine-arm` 是可独立使用的 ARM/Thumb CPU 模拟 crate，包含寄存器状态、
+指令执行、guest 内存映射和权限检查，不依赖 `skyengine-core` 或 SDL2。宿主通过
+`ArmCpu::step` 驱动执行；MRP EXT 装载、ABI 平台调用和生命周期由 `skyengine-core` 管理。
+独立使用示例见 [`lib.rs`](crates/skyengine-arm/src/lib.rs)。
+
+```bash
+cargo build -p skyengine-arm
+cargo test -p skyengine-arm
+```
+
+原有的 `skyengine_core::arm::{ArmCpu, GuestAddr, GuestMemory, Permissions}` 路径继续可用。
+这些类型的方法现在返回 `skyengine_arm::Result`，可通过 `?` 转换为 core 的错误；直接匹配
+CPU 或内存错误时应使用 `skyengine_arm::Error`。运行时对外仍返回 `skyengine_core::Error::ArmFault`。
+
 ## 发布
 
 GitHub Actions 会在每次分支推送后执行检查，并构建 Linux x86_64 和 Windows x86_64

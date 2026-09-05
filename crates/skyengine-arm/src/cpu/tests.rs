@@ -1,5 +1,5 @@
 use super::*;
-use crate::arm::Permissions;
+use crate::Permissions;
 
 fn code_memory(instructions: &[u32]) -> GuestMemory {
     let bytes = instructions

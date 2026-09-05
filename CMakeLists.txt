@@ -90,6 +90,7 @@ else()
 endif()
 
 file(GLOB_RECURSE SKYENGINE_RUST_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/crates/skyengine-arm/src/*.rs"
   "${CMAKE_CURRENT_SOURCE_DIR}/crates/skyengine-core/src/*.rs"
   "${CMAKE_CURRENT_SOURCE_DIR}/crates/skyengine-ffi/src/*.rs"
 )
@@ -103,6 +104,7 @@ add_custom_command(
     ${SKYENGINE_RUST_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.lock"
+    "${CMAKE_CURRENT_SOURCE_DIR}/crates/skyengine-arm/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/crates/skyengine-core/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/crates/skyengine-ffi/Cargo.toml"
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"

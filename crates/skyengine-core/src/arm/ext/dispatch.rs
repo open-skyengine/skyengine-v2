@@ -533,7 +533,7 @@ impl ExtRuntime {
                             self.memory
                                 .read_u32(GuestAddr(cpu.register(13).wrapping_add(index * 4)))
                         })
-                        .collect::<Result<Vec<_>>>()
+                        .collect::<skyengine_arm::Result<Vec<_>>>()
                         .map(|words| format!("{words:08x?}"))
                         .unwrap_or_else(|error| format!("unavailable: {error}"));
                     return Err(Error::Abi(format!(
@@ -1379,7 +1379,7 @@ impl ExtRuntime {
                         self.memory
                             .read_u32(GuestAddr(cpu.register(13).wrapping_add(index * 4)))
                     })
-                    .collect::<Result<Vec<_>>>()
+                    .collect::<skyengine_arm::Result<Vec<_>>>()
                     .map(|words| format!("{words:08x?}"))
                     .unwrap_or_else(|error| format!("unavailable: {error}"));
                 let argument_bytes = self

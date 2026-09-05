@@ -92,7 +92,7 @@ flowchart TB
         Runtime["Runtime<br/>状态机与事件调度"]
         Package["MRP Package<br/>校验、目录、受限解压"]
         MR["MR 子系统<br/>文本前端 / chunk 前端 / VM"]
-        ARM["ARM 子系统<br/>CPU / 内存 / EXT loader"]
+        ARM["ARM 宿主<br/>EXT loader / guest 调度"]
         ABI["ABI Bridge<br/>平台表与 MR/native 桥接"]
         Platform["PlatformServices<br/>宿主能力抽象"]
         Debug
@@ -108,6 +108,7 @@ flowchart TB
         Debug --> ARM
     end
 
+    ARM --> ArmCpu["skyengine-arm<br/>ARM/Thumb CPU / guest 内存"]
     CLI --> Runtime
     Platform --> SDL["SDL2 backend"]
     Platform --> Headless["Headless backend"]
@@ -115,19 +116,22 @@ flowchart TB
 
 ### 4.1 目标工程边界
 
-项目初期采用精简的 Cargo workspace：
+项目采用按职责划分的 Cargo workspace：
 
 ```text
 crates/
-  skyengine-core/    MRP、MR VM、ARM、ABI、运行时、平台 trait、调试核心
+  skyengine-arm/     ARM/Thumb CPU、guest 内存、内存权限与独立错误类型
+  skyengine-core/    MRP、MR VM、EXT loader、ABI、运行时、平台 trait、调试核心
   skyengine-sdl/     SDL2 平台实现
 apps/
   skyengine/         inspect/run 命令行程序
   skydbg/            调试客户端
 ```
 
-`skyengine-core` 内部先按职责分成模块，而不是立即拆成大量 crate。只有当依赖方向、
-独立测试或多宿主复用确实需要时，才把模块提升为独立 crate。
+`skyengine-core` 单向依赖 `skyengine-arm`。CPU 指令解码、寄存器状态和 guest 内存
+可独立构建与测试，不依赖 MRP、MR VM、显示、音频或平台服务。EXT 装载、平台表分派、
+执行预算和应用生命周期仍由 core 管理。core 保留 `arm` 下的 CPU 与内存类型导出，
+并把独立模块的错误转换为运行时原有的 `Error::ArmFault`。
 
 ### 4.2 核心不变量
 

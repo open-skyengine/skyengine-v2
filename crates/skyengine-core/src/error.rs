@@ -36,6 +36,14 @@ pub enum Error {
     Config(String),
 }
 
+impl From<skyengine_arm::Error> for Error {
+    fn from(error: skyengine_arm::Error) -> Self {
+        match error {
+            skyengine_arm::Error::ArmFault(message) => Self::ArmFault(message),
+        }
+    }
+}
+
 impl Error {
     pub(crate) fn mr_load(offset: usize, message: impl Into<String>) -> Self {
         Self::MrLoad {

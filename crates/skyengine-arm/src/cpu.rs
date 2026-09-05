@@ -61,11 +61,14 @@ impl ArmCpu {
         };
     }
 
-    pub(crate) fn take_semihosting_exit_reason(&mut self) -> Option<u32> {
+    /// Consume the pending semihosting exit reason, if any.
+    pub fn take_semihosting_exit_reason(&mut self) -> Option<u32> {
         self.semihosting_exit_reason.take()
     }
 
-    pub(crate) fn allow_legacy_null_data_accesses(&mut self) {
+    /// Enable private scratch data at unmapped addresses 0..8 for legacy code.
+    /// Instruction fetches and host memory accesses remain permission checked.
+    pub fn allow_legacy_null_data_accesses(&mut self) {
         // Keep legacy low-address scratch state inside the CPU so NULL remains
         // unmapped to host services and instruction fetches.
         self.legacy_null_data = Some([0; LEGACY_NULL_DATA_LEN as usize]);

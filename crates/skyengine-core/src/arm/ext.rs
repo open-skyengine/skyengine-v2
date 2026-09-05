@@ -2028,6 +2028,7 @@ impl ExtRuntime {
         self.memory.write_u32(LIFECYCLE_CALLBACK_DATA, 0)?;
         self.memory
             .write_u32(APPLICATION_STATE_DATA, APPLICATION_STATE_NORMAL)
+            .map_err(Error::from)
     }
 
     pub fn set_previous_application(&mut self, package: &[u8], entry: &[u8]) -> Result<()> {
@@ -2046,7 +2047,9 @@ impl ExtRuntime {
         &mut self,
         parameter: &[u8; START_FILE_PARAMETER_LEN],
     ) -> Result<()> {
-        self.memory.write(START_FILE_PARAMETER_DATA, parameter)
+        self.memory
+            .write(START_FILE_PARAMETER_DATA, parameter)
+            .map_err(Error::from)
     }
 
     pub fn set_native_extension_profile(&mut self, profile: NativeExtensionProfile) -> Result<()> {
@@ -2179,6 +2182,7 @@ impl ExtRuntime {
         let value = self.memory.read_u16(register)?;
         self.memory
             .write_u16(register, if pressed { value & !mask } else { value | mask })
+            .map_err(Error::from)
     }
 
     pub fn route_text_input(&mut self, text: &str) -> Result<Option<(i32, i32, i32)>> {
@@ -2616,7 +2620,7 @@ impl ExtRuntime {
                     self.guest_allocation_views
                         .retain(|_, view| view.backing_base != base);
                 }
-                Err(error) if rollback_error.is_none() => rollback_error = Some(error),
+                Err(error) if rollback_error.is_none() => rollback_error = Some(error.into()),
                 Err(_) => {}
             }
         }
@@ -2644,7 +2648,7 @@ impl ExtRuntime {
             Ok(()) => {
                 self.modules.pop();
             }
-            Err(error) if rollback_error.is_none() => rollback_error = Some(error),
+            Err(error) if rollback_error.is_none() => rollback_error = Some(error.into()),
             Err(_) => {}
         }
 
@@ -3014,7 +3018,7 @@ impl ExtRuntime {
             let previous_thumb = cpu.is_thumb();
             let sequential_pc = pc.wrapping_add(if previous_thumb { 2 } else { 4 });
             if let Err(error) = cpu.step(&mut self.memory) {
-                return Err(match error {
+                return Err(match Error::from(error) {
                     Error::ArmFault(message) => {
                         let instruction = self
                             .memory
@@ -3112,7 +3116,7 @@ impl ExtRuntime {
 
     fn read_platform_data_slot(&self, slot: u32) -> Result<u32> {
         let variable = self.platform_data_slot_address(slot)?;
-        self.memory.read_u32(variable)
+        self.memory.read_u32(variable).map_err(Error::from)
     }
 
     fn read_c_string(&self, address: GuestAddr, limit: usize) -> Result<Vec<u8>> {
@@ -3231,7 +3235,9 @@ fn write_platform_string(memory: &mut GuestMemory, address: GuestAddr, value: &[
         )));
     }
     memory.write(address, value)?;
-    memory.write_u8(address.checked_add(value.len() as u32)?, 0)
+    memory
+        .write_u8(address.checked_add(value.len() as u32)?, 0)
+        .map_err(Error::from)
 }
 
 fn native_file_open_result(result: i32) -> u32 {

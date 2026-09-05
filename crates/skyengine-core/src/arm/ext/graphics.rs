@@ -131,7 +131,7 @@ impl ExtRuntime {
             encoded.extend_from_slice(&unit.to_be_bytes());
         }
         encoded.extend_from_slice(&[0, 0]);
-        self.memory.write(buffer, &encoded)
+        self.memory.write(buffer, &encoded).map_err(Error::from)
     }
 
     pub(super) fn create_native_window(&mut self, module: usize) -> Result<u32> {
@@ -587,7 +587,10 @@ impl ExtRuntime {
     ) -> Result<Vec<u8>> {
         let expected_len = self.platform_screen_byte_len()?;
         let Some(screen) = services.capture_framebuffer()? else {
-            return self.memory.read(self.screen_base, expected_len);
+            return self
+                .memory
+                .read(self.screen_base, expected_len)
+                .map_err(Error::from);
         };
         if screen.len() != expected_len {
             return Err(Error::Abi(format!(
@@ -1164,7 +1167,7 @@ impl ExtRuntime {
             )));
         }
         if source != self.screen_base {
-            return self.memory.read(source, byte_len);
+            return self.memory.read(source, byte_len).map_err(Error::from);
         }
 
         let (screen_width, screen_height) = self.screen_dimensions()?;
@@ -1668,7 +1671,7 @@ impl ExtRuntime {
             return Ok(());
         }
         let address = self.screen_address(x, y, width)?;
-        self.memory.write_u16(address, color)
+        self.memory.write_u16(address, color).map_err(Error::from)
     }
 
     pub(super) fn screen_dimensions(&self) -> Result<(i32, i32)> {
@@ -1746,7 +1749,7 @@ fn screen_pixel_address(screen: GuestAddr, x: i32, y: i32, width: i32) -> Result
         .and_then(|offset| offset.checked_mul(2))
         .and_then(|offset| u32::try_from(offset).ok())
         .ok_or_else(|| Error::Abi("screen pixel offset overflow".into()))?;
-    screen.checked_add(offset)
+    screen.checked_add(offset).map_err(Error::from)
 }
 
 fn grayscale_rgb565(color: u16) -> u16 {
@@ -1778,5 +1781,5 @@ fn bitmap_pixel_address(pixels: GuestAddr, stride: usize, x: usize, y: usize) ->
         .and_then(|offset| offset.checked_mul(2))
         .and_then(|offset| u32::try_from(offset).ok())
         .ok_or_else(|| Error::Abi("bitmap pixel offset overflow".into()))?;
-    pixels.checked_add(byte_offset)
+    pixels.checked_add(byte_offset).map_err(Error::from)
 }
