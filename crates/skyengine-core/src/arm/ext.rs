@@ -3101,7 +3101,7 @@ impl ExtRuntime {
                         continue;
                     }
                     Ok(false) => {}
-                    Err(rom_error) => return Err(Error::from(rom_error)),
+                    Err(rom_error) => return Err(rom_error),
                 }
                 return Err(match Error::from(error) {
                     Error::ArmFault(message) => {
