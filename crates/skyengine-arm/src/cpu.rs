@@ -948,8 +948,7 @@ impl ArmCpu {
             let mut address = self.registers[13];
             for register in 0..8 {
                 if register_list & (1 << register) != 0 {
-                    self.registers[register] =
-                        self.read_data_word(memory, GuestAddr(address))?;
+                    self.registers[register] = self.read_data_word(memory, GuestAddr(address))?;
                     address = address.wrapping_add(4);
                 }
             }

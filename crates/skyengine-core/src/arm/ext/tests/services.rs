@@ -993,9 +993,14 @@ fn mtk_profile_reserves_an_extension_window_until_slot_131_marks_code_executable
 
 #[test]
 fn mtk_legacy_float_formatter_is_allowlisted_for_dynamic_callers() {
-    let mut runtime =
-        ExtRuntime::new(8, 8, b"any-package.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32)
-            .unwrap();
+    let mut runtime = ExtRuntime::new(
+        8,
+        8,
+        b"any-package.mrp",
+        b"start.mr",
+        DEFAULT_HEAP_LEN as u32,
+    )
+    .unwrap();
     runtime
         .set_native_extension_profile(NativeExtensionProfile::Mtk)
         .unwrap();
@@ -1020,10 +1025,12 @@ fn mtk_legacy_float_formatter_is_allowlisted_for_dynamic_callers() {
     runtime
         .dispatch(131, 0, &mut registration, &mut StubServices)
         .unwrap();
-    assert!(runtime.modules[0]
-        .dynamic_executable_ranges
-        .iter()
-        .any(|slot| slot.0.is_some()));
+    assert!(
+        runtime.modules[0]
+            .dynamic_executable_ranges
+            .iter()
+            .any(|slot| slot.0.is_some())
+    );
 
     let output = runtime
         .allocate_guest_block_for_module(64, 0)
@@ -1034,7 +1041,10 @@ fn mtk_legacy_float_formatter_is_allowlisted_for_dynamic_callers() {
         .unwrap()
         .unwrap();
     let mut state_bytes = [0u8; ROM_FLOAT_FORMATTER_STATE_LEN];
-    state_bytes[0] = 0; state_bytes[1] = 0; state_bytes[6] = 6; state_bytes[4..12].copy_from_slice(&f64::to_le_bytes(1.5_f64));
+    state_bytes[0] = 0;
+    state_bytes[1] = 0;
+    state_bytes[6] = 6;
+    state_bytes[4..12].copy_from_slice(&f64::to_le_bytes(1.5_f64));
     state_bytes[4..12].copy_from_slice(&1.5f64.to_le_bytes());
     runtime.memory.write(state, &state_bytes).unwrap();
 
@@ -1092,9 +1102,14 @@ fn mtk_legacy_float_formatter_is_allowlisted_for_dynamic_callers() {
 
 #[test]
 fn baseline_profile_never_dispatches_the_legacy_rom_stub() {
-    let mut runtime =
-        ExtRuntime::new(8, 8, b"any-package.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32)
-            .unwrap();
+    let mut runtime = ExtRuntime::new(
+        8,
+        8,
+        b"any-package.mrp",
+        b"start.mr",
+        DEFAULT_HEAP_LEN as u32,
+    )
+    .unwrap();
     load_test_module(&mut runtime);
     let dynamic_code = runtime
         .allocate_guest_block_for_module(16, 0)
@@ -1102,7 +1117,10 @@ fn baseline_profile_never_dispatches_the_legacy_rom_stub() {
         .unwrap();
     runtime
         .memory
-        .write(dynamic_code, &[0x70, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .write(
+            dynamic_code,
+            &[0x70, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
         .unwrap();
     let mut registration = ArmCpu::new();
     registration.set_register(0, 0);

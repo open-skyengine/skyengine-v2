@@ -131,11 +131,7 @@ fn legacy_rom_float_formatter_pc(pc: u32, memory: &GuestMemory) -> bool {
     pc != 0 && pc < HEAP_BASE.0 && !memory.is_mapped(GuestAddr(pc), 2)
 }
 
-fn reconstruct_legacy_double(
-    mantissa_hi: u32,
-    mantissa_lo: u32,
-    exponent: i32,
-) -> Result<f64> {
+fn reconstruct_legacy_double(mantissa_hi: u32, mantissa_lo: u32, exponent: i32) -> Result<f64> {
     let mantissa = ((u64::from(mantissa_hi) << 32) | u64::from(mantissa_lo))
         .checked_shl(exponent.max(0) as u32)
         .ok_or_else(|| {
@@ -3228,11 +3224,7 @@ impl ExtRuntime {
         cpu.set_data_address_aliases(&aliases).map_err(Into::into)
     }
 
-    fn try_dispatch_legacy_rom_call(
-        &mut self,
-        module: usize,
-        cpu: &mut ArmCpu,
-    ) -> Result<bool> {
+    fn try_dispatch_legacy_rom_call(&mut self, module: usize, cpu: &mut ArmCpu) -> Result<bool> {
         if self.native_extension_profile != NativeExtensionProfile::Mtk || !cpu.is_thumb() {
             return Ok(false);
         }
@@ -3271,9 +3263,7 @@ impl ExtRuntime {
         {
             return Err(Error::Abi(format!(
                 "MTK legacy float formatter output/state {:#010x}/{:#010x} are not owned by module {}",
-                output.0,
-                state.0,
-                module
+                output.0, state.0, module
             )));
         }
         let capacity = ROM_FLOAT_FORMATTER_MAX_OUTPUT;
@@ -3294,13 +3284,22 @@ impl ExtRuntime {
             )));
         }
         let mantissa_hi = u32::from_le_bytes([
-            state_bytes[4], state_bytes[5], state_bytes[6], state_bytes[7],
+            state_bytes[4],
+            state_bytes[5],
+            state_bytes[6],
+            state_bytes[7],
         ]);
         let mantissa_lo = u32::from_le_bytes([
-            state_bytes[8], state_bytes[9], state_bytes[10], state_bytes[11],
+            state_bytes[8],
+            state_bytes[9],
+            state_bytes[10],
+            state_bytes[11],
         ]);
         let exponent_bits = u32::from_le_bytes([
-            state_bytes[12], state_bytes[13], state_bytes[14], state_bytes[15],
+            state_bytes[12],
+            state_bytes[13],
+            state_bytes[14],
+            state_bytes[15],
         ]);
         let exponent = i32::from_be_bytes(exponent_bits.to_be_bytes());
         let value = reconstruct_legacy_double(mantissa_hi, mantissa_lo, exponent)?;
