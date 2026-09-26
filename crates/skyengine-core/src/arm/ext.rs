@@ -118,6 +118,60 @@ const BITMAP_ENTRY_SIZE: u32 = 16;
 const SCREEN_BITMAP_ID: u32 = 30;
 const TRAP_BASE: u32 = 0xff00_0000;
 const RETURN_SENTINEL: u32 = 0xffff_ff00;
+const ROM_FLOAT_FORMATTER_KIND: [u32; 2] = [0x65, 0x66];
+const ROM_FLOAT_FORMATTER_STATE_LEN: usize = 32;
+const ROM_FLOAT_FORMATTER_MAX_PRECISION: u32 = 18;
+const ROM_FLOAT_FORMATTER_MAX_OUTPUT: usize = 64;
+
+/// Recognise a candidate low-address Thumb PC for the legacy MTK float
+/// formatter ROM call. The helper thunk itself lives outside of any mapped
+/// region. Recognition is based on the MTK memory profile and mapping state,
+/// never a package name or one ROM address.
+fn legacy_rom_float_formatter_pc(pc: u32, memory: &GuestMemory) -> bool {
+    pc != 0 && pc < HEAP_BASE.0 && !memory.is_mapped(GuestAddr(pc), 2)
+}
+
+fn reconstruct_legacy_double(
+    mantissa_hi: u32,
+    mantissa_lo: u32,
+    exponent: i32,
+) -> Result<f64> {
+    let mantissa = ((u64::from(mantissa_hi) << 32) | u64::from(mantissa_lo))
+        .checked_shl(exponent.max(0) as u32)
+        .ok_or_else(|| {
+            Error::Abi(format!(
+                "MTK legacy float formatter mantissa shift overflowed: hi {mantissa_hi:#010x} lo {mantissa_lo:#010x} exponent {exponent}"
+            ))
+        })?;
+    if exponent < 0 {
+        let magnitude = mantissa
+            .checked_shr((-exponent) as u32)
+            .ok_or_else(|| {
+                Error::Abi(format!(
+                    "MTK legacy float formatter mantissa underflowed: hi {mantissa_hi:#010x} lo {mantissa_lo:#010x} exponent {exponent}"
+                ))
+            })?;
+        Ok(f64::from_bits(magnitude))
+    } else {
+        Ok(f64::from_bits(mantissa))
+    }
+}
+
+fn format_legacy_float(value: f64, precision: usize, scientific: bool) -> Result<Vec<u8>> {
+    if !value.is_finite() {
+        return Err(Error::Abi(format!(
+            "MTK legacy float formatter cannot encode {value}"
+        )));
+    }
+    let text = if scientific {
+        format!("{value:.precision$e}")
+    } else {
+        format!("{value:.precision$}")
+    };
+    let mut bytes = text.into_bytes();
+    bytes.push(0);
+    Ok(bytes)
+}
 const PLATFORM_SLOT_COUNT: u32 = 150;
 const INSTRUCTION_BUDGET: u64 = 200_000_000;
 const MD5_BUFFER_OFFSET: u32 = 24;
@@ -717,6 +771,7 @@ pub(crate) struct ExtRuntime {
     next_native_socket_handle: i32,
     exit_requested: bool,
     native_extension_profile: NativeExtensionProfile,
+    legacy_mtk_compatibility: bool,
     clock_origin: Instant,
     timer_deadline: Option<Instant>,
     compact_timer_scan_cursor: usize,
@@ -953,6 +1008,7 @@ impl ExtRuntime {
             next_native_socket_handle: 1,
             exit_requested: false,
             native_extension_profile: NativeExtensionProfile::Baseline,
+            legacy_mtk_compatibility: false,
             clock_origin: Instant::now(),
             timer_deadline: None,
             compact_timer_scan_cursor: 0,
@@ -2076,6 +2132,7 @@ impl ExtRuntime {
                 .checked_add(0xfff)
                 .map(|address| address & !0xfff)
                 .ok_or_else(|| Error::ArmFault("platform memory cursor overflow".into()))?;
+            self.legacy_mtk_compatibility = true;
         }
         self.native_extension_profile = profile;
         Ok(())
@@ -2821,6 +2878,7 @@ impl ExtRuntime {
         let static_base_r9 = module.static_base_r9;
         let mut cpu = ArmCpu::new();
         cpu.allow_legacy_null_data_accesses();
+        self.refresh_legacy_heap_aliases(function.module, &mut cpu)?;
         for (index, value) in registers.into_iter().enumerate() {
             cpu.set_register(index, value);
         }
@@ -2976,6 +3034,10 @@ impl ExtRuntime {
             if pc == RETURN_SENTINEL {
                 return Ok(cpu.register(0));
             }
+            if self.try_dispatch_legacy_rom_call(function.module, &mut cpu)? {
+                instruction_count += 1;
+                continue;
+            }
             if let Some(slot) = trap_slot(pc) {
                 if let Err(error) = self.dispatch(slot, function.module, &mut cpu, services) {
                     let context = format!(
@@ -2995,13 +3057,29 @@ impl ExtRuntime {
                     });
                 }
                 let return_address = cpu.register(14);
+                self.refresh_legacy_heap_aliases(function.module, &mut cpu)?;
                 cpu.set_pc(return_address);
+                if self.try_dispatch_legacy_rom_call(function.module, &mut cpu)? {
+                    instruction_count += 1;
+                    continue;
+                }
                 instruction_count += 1;
                 continue;
             }
             if trace_arm {
+                let instruction_len = if cpu.is_thumb() { 2 } else { 4 };
+                let instruction = self
+                    .memory
+                    .read(GuestAddr(pc), instruction_len)
+                    .map(|bytes| {
+                        bytes
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    })
+                    .unwrap_or_else(|_| "unavailable".into());
                 eprintln!(
-                    "[arm-step] module={} n={} pc={pc:#010x} cpsr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r9={:#010x} sp={:#010x} lr={:#010x}",
+                    "[arm-step] module={} n={} pc={pc:#010x} insn={instruction} cpsr={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r9={:#010x} sp={:#010x} lr={:#010x}",
                     function.module,
                     instruction_count,
                     cpu.cpsr(),
@@ -3018,6 +3096,17 @@ impl ExtRuntime {
             let previous_thumb = cpu.is_thumb();
             let sequential_pc = pc.wrapping_add(if previous_thumb { 2 } else { 4 });
             if let Err(error) = cpu.step(&mut self.memory) {
+                // Recover the rare legacy MTK ROM stubs that sit in an
+                // unmapped region by replaying the dispatch before bubbling
+                // up the ARM fault.
+                match self.try_dispatch_legacy_rom_call(function.module, &mut cpu) {
+                    Ok(true) => {
+                        instruction_count += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(rom_error) => return Err(Error::from(rom_error)),
+                }
                 return Err(match Error::from(error) {
                     Error::ArmFault(message) => {
                         let instruction = self
@@ -3102,6 +3191,130 @@ impl ExtRuntime {
             cpu.register(13),
             cpu.register(14),
         )))
+    }
+
+    fn refresh_legacy_heap_aliases(&self, module: usize, cpu: &mut ArmCpu) -> Result<()> {
+        if self.native_extension_profile != NativeExtensionProfile::Mtk
+            || !self.legacy_mtk_compatibility
+        {
+            return cpu.set_data_address_aliases(&[]).map_err(Into::into);
+        }
+        let generation = self
+            .modules
+            .get(module)
+            .map(|module| module.generation)
+            .ok_or_else(|| Error::Abi(format!("address aliases for missing module {module}")))?;
+        let legacy_ram_end = HEAP_BASE
+            .0
+            .checked_add(self.heap_len.max(MIN_GUEST_RAM_LEN) as u32)
+            .ok_or_else(|| Error::ArmFault("legacy guest RAM alias end overflow".into()))?;
+        let aliases = self
+            .guest_allocations
+            .iter()
+            .filter_map(|(&address, &len)| {
+                let end = u64::from(address) + u64::from(len);
+                (self.guest_allocation_owners.get(&address) == Some(&generation)
+                    && address >= HEAP_BASE.0
+                    && end <= u64::from(legacy_ram_end))
+                .then(|| {
+                    (
+                        GuestAddr(address - HEAP_BASE.0),
+                        GuestAddr(address),
+                        len as usize,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        cpu.set_data_address_aliases(&aliases).map_err(Into::into)
+    }
+
+    fn try_dispatch_legacy_rom_call(
+        &mut self,
+        module: usize,
+        cpu: &mut ArmCpu,
+    ) -> Result<bool> {
+        if self.native_extension_profile != NativeExtensionProfile::Mtk || !cpu.is_thumb() {
+            return Ok(false);
+        }
+        if !legacy_rom_float_formatter_pc(cpu.pc().0, &self.memory) {
+            return Ok(false);
+        }
+        let return_address = cpu.register(14);
+        let Some(context) = self.modules.get(module) else {
+            return Ok(false);
+        };
+        let module_generation = context.generation;
+        let caller_kind = return_address | u32::from(return_address & 1 != 0);
+        let Some((image, _)) = context.executable_image(caller_kind) else {
+            return Ok(false);
+        };
+        if !matches!(image, ExecutableImage::Dynamic(_)) {
+            return Ok(false);
+        }
+        let kind = cpu.register(0);
+        if !ROM_FLOAT_FORMATTER_KIND.contains(&kind) {
+            return Err(Error::Abi(format!(
+                "MTK legacy float formatter received unsupported mode {:#010x}",
+                kind
+            )));
+        }
+        let output = GuestAddr(cpu.register(1));
+        let state = GuestAddr(cpu.register(2));
+        if output.0 == 0 || output.0 & 3 != 0 || state.0 == 0 || state.0 & 3 != 0 {
+            return Err(Error::Abi(format!(
+                "MTK legacy float formatter received misaligned output {:#010x} or state {:#010x}",
+                output.0, state.0
+            )));
+        }
+        if !self.range_is_owned_by(output, 0, module_generation)
+            || !self.range_is_owned_by(state, ROM_FLOAT_FORMATTER_STATE_LEN, module_generation)
+        {
+            return Err(Error::Abi(format!(
+                "MTK legacy float formatter output/state {:#010x}/{:#010x} are not owned by module {}",
+                output.0,
+                state.0,
+                module
+            )));
+        }
+        let capacity = ROM_FLOAT_FORMATTER_MAX_OUTPUT;
+        if self
+            .memory
+            .check_range(output, capacity, Permissions::READ_WRITE)
+            .is_err()
+        {
+            return Err(Error::Abi(
+                "MTK legacy float formatter output buffer is not fully writable".into(),
+            ));
+        }
+        let state_bytes = self.memory.read(state, ROM_FLOAT_FORMATTER_STATE_LEN)?;
+        let precision = u32::from(state_bytes[6]);
+        if precision > ROM_FLOAT_FORMATTER_MAX_PRECISION {
+            return Err(Error::Abi(format!(
+                "MTK legacy float formatter precision {precision} exceeds {ROM_FLOAT_FORMATTER_MAX_PRECISION}"
+            )));
+        }
+        let mantissa_hi = u32::from_le_bytes([
+            state_bytes[4], state_bytes[5], state_bytes[6], state_bytes[7],
+        ]);
+        let mantissa_lo = u32::from_le_bytes([
+            state_bytes[8], state_bytes[9], state_bytes[10], state_bytes[11],
+        ]);
+        let exponent_bits = u32::from_le_bytes([
+            state_bytes[12], state_bytes[13], state_bytes[14], state_bytes[15],
+        ]);
+        let exponent = i32::from_be_bytes(exponent_bits.to_be_bytes());
+        let value = reconstruct_legacy_double(mantissa_hi, mantissa_lo, exponent)?;
+        let formatted = format_legacy_float(value, precision as usize, kind == 0x65)?;
+        let written = formatted.len();
+        if written > capacity {
+            return Err(Error::Abi(format!(
+                "MTK legacy float formatter output {written} bytes exceeds capacity {capacity}"
+            )));
+        }
+        self.memory.write(output, &formatted)?;
+        cpu.set_register(0, written.saturating_sub(1) as u32);
+        cpu.set_pc(return_address);
+        Ok(true)
     }
 
     fn platform_data_slot_address(&self, slot: u32) -> Result<GuestAddr> {

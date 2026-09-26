@@ -73,6 +73,11 @@ flag、宽度、精度或长度修饰的 `%m` 没有 ABI 证据，因此保持 U
 设备/用户信息记录并返回 `0`；空输出指针返回 `-1`。该基础 ABI 与可选的 MTK
 native extension 固定内存窗口相互独立。
 
+MTK profile 同时启用 legacy 兼容：运行时会为当前 module generation 的堆分配
+建立零基址视图（`source = target - HEAP_BASE`），并对未映射的低地址 Thumb PC 调
+度 SDK ROM 的 `%e`/`%f` 浮点格式化 thunk（仅当 `lr` 来自动态映像、output/state 落在该
+module 的 tracked allocation 内、精度 ≤ 18 时生效）。
+
 基线 profile 已验证的 `mr_plat` 命令包括：
 
 - `101` 的参数 `3` 选择横向屏幕模式，参数 `0` 恢复纵向模式，成功返回 `0`。模式

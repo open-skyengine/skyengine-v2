@@ -248,6 +248,59 @@ fn legacy_null_data_accesses_are_narrow_and_opt_in() {
 }
 
 #[test]
+fn data_address_aliases_translate_scalar_and_multiple_data_accesses() {
+    let mut memory = code_memory(&[0xe590_1000, 0xe580_2004, 0xe8b0_0006]);
+    memory
+        .map(
+            GuestAddr(0x2000_3000),
+            8,
+            Permissions::READ_WRITE,
+            "aliased data",
+        )
+        .unwrap();
+    memory
+        .write_u32(GuestAddr(0x2000_3000), 0x1122_3344)
+        .unwrap();
+    memory
+        .write_u32(GuestAddr(0x2000_3004), 0x5566_7788)
+        .unwrap();
+
+    let mut cpu = ArmCpu::new();
+    cpu.set_data_address_aliases(&[(GuestAddr(0x3000), GuestAddr(0x2000_3000), 8)])
+        .unwrap();
+    cpu.set_pc(0x1000);
+    cpu.set_register(0, 0x3000);
+    cpu.set_register(2, 0xaabb_ccdd);
+
+    cpu.step(&mut memory).unwrap();
+    assert_eq!(cpu.register(1), 0x1122_3344);
+    cpu.step(&mut memory).unwrap();
+    assert_eq!(
+        memory.read_u32(GuestAddr(0x2000_3004)).unwrap(),
+        0xaabb_ccdd
+    );
+    cpu.set_register(0, 0x3000);
+    cpu.step(&mut memory).unwrap();
+    assert_eq!(cpu.register(1), 0x1122_3344);
+    assert_eq!(cpu.register(2), 0xaabb_ccdd);
+    assert_eq!(cpu.register(0), 0x3008);
+    assert!(!memory.is_mapped(GuestAddr(0x3000), 8));
+}
+
+#[test]
+fn data_address_aliases_reject_overlapping_source_ranges() {
+    let mut cpu = ArmCpu::new();
+    let error = cpu
+        .set_data_address_aliases(&[
+            (GuestAddr(0x1000), GuestAddr(0x2000_1000), 8),
+            (GuestAddr(0x1004), GuestAddr(0x2000_2000), 8),
+        ])
+        .unwrap_err();
+
+    assert!(error.to_string().contains("aliases overlap"));
+}
+
+#[test]
 fn thumb_semihosting_character_write_validates_its_input() {
     let mut memory = thumb_code_memory(&[0xdfab, 0xdfab, 0xdf00]);
     memory

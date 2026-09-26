@@ -931,6 +931,7 @@ fn mtk_profile_reserves_an_extension_window_until_slot_131_marks_code_executable
     runtime
         .set_native_extension_profile(NativeExtensionProfile::Mtk)
         .unwrap();
+    assert!(runtime.legacy_mtk_compatibility);
     let mut module = b"MRPGCMAP".to_vec();
     module.extend_from_slice(&0xe12f_ff1e_u32.to_le_bytes());
     runtime
@@ -988,6 +989,134 @@ fn mtk_profile_reserves_an_extension_window_until_slot_131_marks_code_executable
         Err(Error::Abi(message)) if message.contains("another module")
     ));
     assert!(runtime.modules[1].dynamic_executable_ranges.is_empty());
+}
+
+#[test]
+fn mtk_legacy_float_formatter_is_allowlisted_for_dynamic_callers() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"any-package.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32)
+            .unwrap();
+    runtime
+        .set_native_extension_profile(NativeExtensionProfile::Mtk)
+        .unwrap();
+    assert!(runtime.legacy_mtk_compatibility);
+    load_test_module(&mut runtime);
+    let dynamic_code = runtime
+        .allocate_guest_block_for_module(16, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write(
+            dynamic_code,
+            &[0x70, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+    let mut registration = ArmCpu::new();
+    registration.set_register(0, 0);
+    registration.set_register(1, 9);
+    registration.set_register(2, dynamic_code.0);
+    registration.set_register(3, 16);
+    runtime
+        .dispatch(131, 0, &mut registration, &mut StubServices)
+        .unwrap();
+    assert!(runtime.modules[0]
+        .dynamic_executable_ranges
+        .iter()
+        .any(|slot| slot.0.is_some()));
+
+    let output = runtime
+        .allocate_guest_block_for_module(64, 0)
+        .unwrap()
+        .unwrap();
+    let state = runtime
+        .allocate_guest_block_for_module(ROM_FLOAT_FORMATTER_STATE_LEN, 0)
+        .unwrap()
+        .unwrap();
+    let mut state_bytes = [0u8; ROM_FLOAT_FORMATTER_STATE_LEN];
+    state_bytes[0] = 0; state_bytes[1] = 0; state_bytes[6] = 6; state_bytes[4..12].copy_from_slice(&f64::to_le_bytes(1.5_f64));
+    state_bytes[4..12].copy_from_slice(&1.5f64.to_le_bytes());
+    runtime.memory.write(state, &state_bytes).unwrap();
+
+    let stub = 0x800 | 1;
+    let mut cpu = ArmCpu::new();
+    cpu.set_pc(stub);
+    cpu.set_register(0, u32::from(b'f'));
+    cpu.set_register(1, output.0);
+    cpu.set_register(2, state.0);
+    cpu.set_register(14, dynamic_code.0 | 1);
+
+    let len = runtime.try_dispatch_legacy_rom_call(0, &mut cpu).unwrap();
+    assert!(len);
+    let produced = runtime.memory.read(output, 16).unwrap();
+    assert!(produced.starts_with(b"0 "));
+    assert!(cpu.is_thumb());
+    assert_eq!(cpu.pc().0, dynamic_code.0);
+    assert!(cpu.register(0) > 0);
+
+    // Static callers must not be honoured.
+    cpu.set_pc(stub);
+    cpu.set_register(14, MODULE_BASE + 9);
+    assert!(!runtime.try_dispatch_legacy_rom_call(0, &mut cpu).unwrap());
+
+    cpu.set_pc(stub);
+    cpu.set_register(0, u32::from(b'g'));
+    cpu.set_register(14, dynamic_code.0 | 1);
+    assert!(matches!(
+        runtime.try_dispatch_legacy_rom_call(0, &mut cpu),
+        Err(Error::Abi(message)) if message.contains("unsupported mode")
+    ));
+
+    // Output/state outside the current module's allocations are rejected.
+    cpu.set_pc(stub);
+    cpu.set_register(0, u32::from(b'f'));
+    cpu.set_register(1, MODULE_BASE + 4);
+    cpu.set_register(2, state.0);
+    cpu.set_register(14, dynamic_code.0 | 1);
+    assert!(matches!(
+        runtime.try_dispatch_legacy_rom_call(0, &mut cpu),
+        Err(Error::Abi(message)) if message.contains("not owned")
+    ));
+
+    // Precision beyond the documented limit is rejected.
+    state_bytes[6] = 20;
+    runtime.memory.write(state, &state_bytes).unwrap();
+    cpu.set_pc(stub);
+    cpu.set_register(1, output.0);
+    cpu.set_register(2, state.0);
+    assert!(matches!(
+        runtime.try_dispatch_legacy_rom_call(0, &mut cpu),
+        Err(Error::Abi(message)) if message.contains("precision")
+    ));
+}
+
+#[test]
+fn baseline_profile_never_dispatches_the_legacy_rom_stub() {
+    let mut runtime =
+        ExtRuntime::new(8, 8, b"any-package.mrp", b"start.mr", DEFAULT_HEAP_LEN as u32)
+            .unwrap();
+    load_test_module(&mut runtime);
+    let dynamic_code = runtime
+        .allocate_guest_block_for_module(16, 0)
+        .unwrap()
+        .unwrap();
+    runtime
+        .memory
+        .write(dynamic_code, &[0x70, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let mut registration = ArmCpu::new();
+    registration.set_register(0, 0);
+    registration.set_register(1, 9);
+    registration.set_register(2, dynamic_code.0);
+    registration.set_register(3, 16);
+    runtime
+        .dispatch(131, 0, &mut registration, &mut StubServices)
+        .unwrap();
+    let mut cpu = ArmCpu::new();
+    cpu.set_pc(0x800);
+    cpu.set_register(0, u32::from(b'f'));
+    cpu.set_register(14, dynamic_code.0 | 1);
+    assert!(!runtime.try_dispatch_legacy_rom_call(0, &mut cpu).unwrap());
 }
 
 #[test]

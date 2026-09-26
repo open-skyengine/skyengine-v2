@@ -4,6 +4,13 @@ use super::{GuestAddr, GuestMemory};
 
 const LEGACY_NULL_DATA_LEN: u32 = 8;
 
+#[derive(Clone, Copy, Debug)]
+struct DataAddressAlias {
+    source: GuestAddr,
+    target: GuestAddr,
+    len: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct ArmCpu {
     registers: [u32; 16],
@@ -14,6 +21,7 @@ pub struct ArmCpu {
     thumb: bool,
     semihosting_exit_reason: Option<u32>,
     legacy_null_data: Option<[u8; LEGACY_NULL_DATA_LEN as usize]>,
+    data_address_aliases: Vec<DataAddressAlias>,
 }
 
 impl Default for ArmCpu {
@@ -33,6 +41,7 @@ impl ArmCpu {
             thumb: false,
             semihosting_exit_reason: None,
             legacy_null_data: None,
+            data_address_aliases: Vec::new(),
         }
     }
 
@@ -72,6 +81,47 @@ impl ArmCpu {
         // Keep legacy low-address scratch state inside the CPU so NULL remains
         // unmapped to host services and instruction fetches.
         self.legacy_null_data = Some([0; LEGACY_NULL_DATA_LEN as usize]);
+    }
+
+    /// Replace the allowlist of aliases used by guest data accesses.
+    ///
+    /// Aliases are consulted only when the source address is otherwise unmapped.
+    /// Each tuple is `(source, target, length)` and maps a bounded source range
+    /// onto the corresponding bytes in the target range. Instruction fetches do
+    /// not use these aliases, and the opt-in null scratch range takes precedence.
+    pub fn set_data_address_aliases(
+        &mut self,
+        aliases: &[(GuestAddr, GuestAddr, usize)],
+    ) -> Result<()> {
+        let mut validated = Vec::with_capacity(aliases.len());
+        for &(source, target, len) in aliases {
+            if len == 0 {
+                return Err(Error::ArmFault(
+                    "legacy address alias cannot be empty".into(),
+                ));
+            }
+            let source_end = u64::from(source.0) + len as u64;
+            let target_end = u64::from(target.0) + len as u64;
+            if source_end > u64::from(u32::MAX) + 1 || target_end > u64::from(u32::MAX) + 1 {
+                return Err(Error::ArmFault(
+                    "legacy address alias exceeds the 32-bit address space".into(),
+                ));
+            }
+            validated.push(DataAddressAlias {
+                source,
+                target,
+                len,
+            });
+        }
+        validated.sort_unstable_by_key(|alias| alias.source.0);
+        for pair in validated.windows(2) {
+            let previous_end = u64::from(pair[0].source.0) + pair[0].len as u64;
+            if previous_end > u64::from(pair[1].source.0) {
+                return Err(Error::ArmFault("legacy address aliases overlap".into()));
+            }
+        }
+        self.data_address_aliases = validated;
+        Ok(())
     }
 
     pub fn cpsr(&self) -> u32 {
@@ -524,7 +574,7 @@ impl ArmCpu {
                 continue;
             }
             if load {
-                let value = memory.read_u32(GuestAddr(transfer_address))?;
+                let value = self.read_data_word(memory, GuestAddr(transfer_address))?;
                 if register == 15 {
                     loaded_pc = Some(value);
                 } else {
@@ -536,7 +586,7 @@ impl ArmCpu {
                 } else {
                     self.registers[register]
                 };
-                memory.write_u32(GuestAddr(transfer_address), value)?;
+                self.write_data_word(memory, GuestAddr(transfer_address), value)?;
             }
             transfer_address = transfer_address.wrapping_add(4);
         }
@@ -583,7 +633,7 @@ impl ArmCpu {
                 let offset = u32::from(instruction & 0xff) * 4;
                 let base = address.wrapping_add(4) & !3;
                 self.registers[destination] =
-                    memory.read_u32(GuestAddr(base.wrapping_add(offset)))?;
+                    self.read_data_word(memory, GuestAddr(base.wrapping_add(offset)))?;
                 Ok(())
             }
             0x6000 | 0x6800 | 0x7000 | 0x7800 => self.thumb_immediate_transfer(memory, instruction),
@@ -879,9 +929,9 @@ impl ArmCpu {
         let destination = usize::from((instruction >> 8) & 7);
         let address = GuestAddr(self.registers[13].wrapping_add(u32::from(instruction & 0xff) * 4));
         if load {
-            self.registers[destination] = memory.read_u32(address)?;
+            self.registers[destination] = self.read_data_word(memory, address)?;
         } else {
-            memory.write_u32(address, self.registers[destination])?;
+            self.write_data_word(memory, address, self.registers[destination])?;
         }
         Ok(())
     }
@@ -898,12 +948,13 @@ impl ArmCpu {
             let mut address = self.registers[13];
             for register in 0..8 {
                 if register_list & (1 << register) != 0 {
-                    self.registers[register] = memory.read_u32(GuestAddr(address))?;
+                    self.registers[register] =
+                        self.read_data_word(memory, GuestAddr(address))?;
                     address = address.wrapping_add(4);
                 }
             }
             let loaded_pc = if extra {
-                let value = memory.read_u32(GuestAddr(address))?;
+                let value = self.read_data_word(memory, GuestAddr(address))?;
                 address = address.wrapping_add(4);
                 Some(value)
             } else {
@@ -918,12 +969,12 @@ impl ArmCpu {
             let mut address = start;
             for register in 0..8 {
                 if register_list & (1 << register) != 0 {
-                    memory.write_u32(GuestAddr(address), self.registers[register])?;
+                    self.write_data_word(memory, GuestAddr(address), self.registers[register])?;
                     address = address.wrapping_add(4);
                 }
             }
             if extra {
-                memory.write_u32(GuestAddr(address), self.registers[14])?;
+                self.write_data_word(memory, GuestAddr(address), self.registers[14])?;
             }
             self.registers[13] = start;
         }
@@ -950,9 +1001,9 @@ impl ArmCpu {
                 continue;
             }
             if load {
-                self.registers[register] = memory.read_u32(GuestAddr(address))?;
+                self.registers[register] = self.read_data_word(memory, GuestAddr(address))?;
             } else {
-                memory.write_u32(GuestAddr(address), self.registers[register])?;
+                self.write_data_word(memory, GuestAddr(address), self.registers[register])?;
             }
             address = address.wrapping_add(4);
         }
@@ -994,7 +1045,7 @@ impl ArmCpu {
         if let Some(offset) = self.legacy_null_data_offset(memory, address, 1) {
             return Ok(self.legacy_null_data.as_ref().unwrap()[offset]);
         }
-        memory.read_u8(address)
+        memory.read_u8(self.aliased_data_address(memory, address, 1))
     }
 
     fn write_data_byte(
@@ -1007,7 +1058,7 @@ impl ArmCpu {
             self.legacy_null_data.as_mut().unwrap()[offset] = value;
             return Ok(());
         }
-        memory.write_u8(address, value)
+        memory.write_u8(self.aliased_data_address(memory, address, 1), value)
     }
 
     fn read_data_halfword(&self, memory: &GuestMemory, address: GuestAddr) -> Result<u16> {
@@ -1015,7 +1066,7 @@ impl ArmCpu {
             let data = self.legacy_null_data.as_ref().unwrap();
             return Ok(u16::from_le_bytes([data[offset], data[offset + 1]]));
         }
-        memory.read_u16(address)
+        memory.read_u16(self.aliased_data_address(memory, address, 2))
     }
 
     fn write_data_halfword(
@@ -1029,7 +1080,7 @@ impl ArmCpu {
                 .copy_from_slice(&value.to_le_bytes());
             return Ok(());
         }
-        memory.write_u16(address, value)
+        memory.write_u16(self.aliased_data_address(memory, address, 2), value)
     }
 
     fn read_data_word(&self, memory: &GuestMemory, address: GuestAddr) -> Result<u32> {
@@ -1039,7 +1090,7 @@ impl ArmCpu {
                 data[offset..offset + 4].try_into().unwrap(),
             ));
         }
-        memory.read_u32(address)
+        memory.read_u32(self.aliased_data_address(memory, address, 4))
     }
 
     fn write_data_word(
@@ -1053,7 +1104,37 @@ impl ArmCpu {
                 .copy_from_slice(&value.to_le_bytes());
             return Ok(());
         }
-        memory.write_u32(address, value)
+        memory.write_u32(self.aliased_data_address(memory, address, 4), value)
+    }
+
+    fn aliased_data_address(
+        &self,
+        memory: &GuestMemory,
+        address: GuestAddr,
+        len: usize,
+    ) -> GuestAddr {
+        if self.data_address_aliases.is_empty() || memory.is_mapped(address, len) {
+            return address;
+        }
+        let start = u64::from(address.0);
+        let Some(end) = start.checked_add(len as u64) else {
+            return address;
+        };
+        self.data_address_aliases
+            .iter()
+            .find_map(|alias| {
+                let alias_start = u64::from(alias.source.0);
+                let alias_end = alias_start + alias.len as u64;
+                (start >= alias_start && end <= alias_end).then(|| {
+                    GuestAddr(
+                        alias
+                            .target
+                            .0
+                            .wrapping_add(u32::try_from(start - alias_start).unwrap()),
+                    )
+                })
+            })
+            .unwrap_or(address)
     }
 
     fn legacy_null_data_offset(
