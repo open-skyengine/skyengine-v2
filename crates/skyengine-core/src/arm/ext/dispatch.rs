@@ -78,7 +78,14 @@ impl ExtRuntime {
                 let y = cpu.register(2) as i32;
                 let width = cpu.register(3) as usize;
                 let height = self.memory.read_u32(GuestAddr(cpu.register(13)))? as usize;
-                let pixels = self.read_platform_draw_pixels(source, x, y, width, height)?;
+                // let pixels = self.read_platform_draw_pixels(source, x, y, width, height)?;
+                let BitmapPixels {
+                    pixels,
+                    width,
+                    height,
+                    x,
+                    y,
+                } = self.read_platform_draw_bitmap_pixels(source, x, y, width, height)?;
                 self.draw_platform_bitmap(&pixels, x, y, width, height, services)?;
                 cpu.set_register(0, 0);
             }

@@ -1200,6 +1200,81 @@ impl ExtRuntime {
         Ok(pixels)
     }
 
+    pub(super) fn read_platform_draw_bitmap_pixels(
+        &self,
+        source: GuestAddr,
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+    ) -> Result<BitmapPixels> {
+        if source != self.screen_base {
+            let byte_len = width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(2))
+                .ok_or_else(|| Error::Abi("mr_drawBitmap dimensions overflow".into()))?;
+            if byte_len > self.heap_len {
+                return Err(Error::Abi(format!(
+                    "mr_drawBitmap source is {byte_len} bytes"
+                )));
+            }
+            return match self.memory.read(source, byte_len) {
+                Ok(pixels) => Ok(BitmapPixels {
+                    pixels,
+                    width,
+                    height,
+                    x,
+                    y,
+                }),
+                Err(e) => Err(e.into()),
+            };
+        }
+
+        let (screen_width, screen_height) = self.screen_dimensions()?;
+        let Some(((x, width), (y, height))) = Option::zip(
+            if x >= screen_width || width == 0 {
+                None
+            } else if x >= 0 {
+                Some((x, width))
+            } else {
+                Some(0).zip(width.checked_sub(x.abs() as usize))
+            }
+            .map(|(x, width)| (x, width.min((screen_width - x) as usize))),
+            if y >= screen_height || height == 0 {
+                None
+            } else if y >= 0 {
+                Some((y, height))
+            } else {
+                Some(0).zip(height.checked_sub(y.abs() as usize))
+            }
+            .map(|(y, height)| (y, height.min((screen_height - y) as usize))),
+        ) else {
+            return Ok(BitmapPixels::default());
+        };
+
+        let byte_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(2))
+            .ok_or_else(|| Error::Abi("mr_drawBitmap dimensions overflow".into()))?;
+        let row_byte_len = width
+            .checked_mul(2)
+            .ok_or_else(|| Error::Abi("mr_drawBitmap row size overflow".into()))?;
+        let mut pixels = Vec::with_capacity(byte_len);
+        for row in 0..height {
+            let row = i32::try_from(row)
+                .map_err(|_| Error::Abi("mr_drawBitmap row exceeds i32".into()))?;
+            let row_address = self.screen_address(x, y + row, screen_width)?;
+            pixels.extend(self.memory.read(row_address, row_byte_len)?);
+        }
+        Ok(BitmapPixels {
+            pixels,
+            width,
+            height,
+            x,
+            y,
+        })
+    }
+
     pub(super) fn compact_ram_output_target(
         &mut self,
         package_address: GuestAddr,
