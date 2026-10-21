@@ -634,6 +634,15 @@ struct BitmapDescriptor {
     y: i32,
 }
 
+#[derive(Debug, Default, Clone)]
+struct BitmapPixels {
+    pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BitmapDrawMode {
     Or,

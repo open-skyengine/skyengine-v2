@@ -1,3 +1,5 @@
 /build/
 /node_modules/
 target
+SDL2.*
+mythroad
